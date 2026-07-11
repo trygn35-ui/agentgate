@@ -1,0 +1,365 @@
+const { z } = require('zod')
+
+const TARGET = Object.freeze({
+  CLAUDE: 'claude',
+  CODEX: 'codex',
+  OPENCODE: 'opencode',
+  GEMINI: 'gemini',
+})
+const PROTOCOL = Object.freeze({
+  ANTHROPIC: 'anthropic',
+  OPENAI_RESPONSES: 'openai-responses',
+  OPENAI_CHAT: 'openai-chat',
+  GEMINI: 'gemini',
+})
+const AUTH_MODE = Object.freeze({
+  API_KEY: 'api-key',
+  BEARER: 'bearer',
+})
+const DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES = 2
+const MAX_PROFILE_ENDPOINTS = 20
+const MAX_DISCOVERED_MODELS = 1_000
+const MAX_HEALTH_HISTORY = 30
+const MAX_HEALTH_TIMELINE = 60
+const TARGETS = Object.freeze(Object.values(TARGET))
+const PROTOCOLS = Object.freeze(Object.values(PROTOCOL))
+
+const TargetSchema = z.enum(TARGETS)
+const ProtocolSchema = z.enum(PROTOCOLS)
+const AuthModeSchema = z.enum(Object.values(AUTH_MODE))
+
+/**
+ * 规范化 HTTP(S) URL，同时保留查询参数和值中的尾斜杠。
+ *
+ * @param {string} value 已通过基础 URL 校验的字符串。
+ * @returns {string} 主机名和 pathname 尾斜杠已规范化的 URL。
+ */
+function normalizeHttpUrl(value) {
+  const url = new URL(value.trim())
+  url.pathname = url.pathname.replace(/\/+$/, '') || '/'
+  url.hash = ''
+  const normalized = url.toString()
+  return url.pathname === '/' && !url.search ? normalized.replace(/\/$/, '') : normalized
+}
+
+const HttpUrlSchema = z
+  .string()
+  .trim()
+  .min(1, 'Base URL is required')
+  .max(2048, 'Base URL is too long')
+  .url('Base URL must be a valid URL')
+  .refine((value) => {
+    try {
+      const protocol = new URL(value).protocol
+      return protocol === 'http:' || protocol === 'https:'
+    } catch {
+      return false
+    }
+  }, 'Base URL must use HTTP or HTTPS')
+
+const HealthSchema = z.object({
+  status: z.enum(['healthy', 'limited', 'unhealthy']),
+  latencyMs: z.number().int().nonnegative(),
+  checkedAt: z.string(),
+  reachable: z.boolean().optional(),
+  statusCode: z.number().int().optional(),
+  errorType: z.enum(['timeout', 'tls', 'network']).optional(),
+  message: z.string().max(240),
+})
+
+const HealthHistorySchema = z.array(HealthSchema).max(MAX_HEALTH_HISTORY)
+const HealthTimelineSchema = z.array(HealthSchema).max(MAX_HEALTH_TIMELINE)
+
+const EndpointInputSchema = z.object({
+  url: HttpUrlSchema,
+})
+
+const StoredEndpointSchema = EndpointInputSchema.extend({
+  health: HealthSchema.optional(),
+  healthHistory: HealthHistorySchema.optional().default([]),
+  healthTimeline: HealthTimelineSchema.optional().default([]),
+  models: z.array(z.string().trim().min(1).max(240))
+    .max(MAX_DISCOVERED_MODELS)
+    .optional()
+    .default([]),
+})
+
+const AutoSwitchSettingsSchema = z.object({
+  enabled: z.boolean().optional().default(false),
+  intervalMinutes: z.number().int().min(1).max(1_440)
+    .optional()
+    .default(DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES),
+})
+
+const SaveProfileSchema = z.object({
+  id: z.string().uuid().optional(),
+  name: z.string().trim().min(1, 'Name is required').max(80),
+  protocol: ProtocolSchema,
+  baseUrl: HttpUrlSchema,
+  endpoints: z.array(EndpointInputSchema).min(1).max(MAX_PROFILE_ENDPOINTS).optional(),
+  apiKey: z.string().max(32768).optional(),
+  model: z.string().trim().max(240),
+  authMode: AuthModeSchema,
+  targets: z.array(TargetSchema).max(TARGETS.length).default([]),
+  enableToolSearch: z.boolean().optional().default(false),
+  autoSwitch: AutoSwitchSettingsSchema.optional().default({
+    enabled: false,
+    intervalMinutes: DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES,
+  }),
+}).superRefine((value, context) => {
+  const compatibleTargets = {
+    [PROTOCOL.ANTHROPIC]: [TARGET.CLAUDE, TARGET.OPENCODE],
+    [PROTOCOL.OPENAI_RESPONSES]: [TARGET.CODEX, TARGET.OPENCODE],
+    [PROTOCOL.OPENAI_CHAT]: [TARGET.CODEX, TARGET.OPENCODE],
+    [PROTOCOL.GEMINI]: [TARGET.GEMINI, TARGET.OPENCODE],
+  }[value.protocol]
+
+  if (!value.id && !value.apiKey?.trim()) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['apiKey'],
+      message: 'API key is required for a new profile',
+    })
+  }
+  if (value.targets.length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['targets'],
+      message: 'Select at least one client',
+    })
+  }
+  for (const target of value.targets) {
+    if (!compatibleTargets.includes(target)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['targets'],
+        message: `${target} is not compatible with ${value.protocol}`,
+      })
+    }
+  }
+
+  const connectionUrls = [value.baseUrl, ...(value.endpoints || []).map((endpoint) => endpoint.url)]
+  for (const [index, rawUrl] of connectionUrls.entries()) {
+    const url = new URL(rawUrl)
+    if (url.username || url.password || url.hash) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: index === 0 ? ['baseUrl'] : ['endpoints', index - 1, 'url'],
+        message: 'Endpoint URLs cannot contain credentials or fragments',
+      })
+    }
+  }
+
+  const normalizedEndpoints = (value.endpoints || [{ url: value.baseUrl }])
+    .map((endpoint) => normalizeHttpUrl(endpoint.url))
+  if (new Set(normalizedEndpoints).size !== normalizedEndpoints.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['endpoints'],
+      message: 'Endpoint URLs must be unique',
+    })
+  }
+})
+
+const LegacyStoredProfileSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  protocol: ProtocolSchema,
+  baseUrl: HttpUrlSchema,
+  model: z.string(),
+  authMode: AuthModeSchema,
+  targets: z.array(TargetSchema),
+  enableToolSearch: z.boolean().default(false),
+  keyHint: z.string(),
+  encryptedKey: z.string().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  lastAppliedAt: z.string().optional(),
+  health: HealthSchema.optional(),
+})
+
+const StoredProfileSchema = LegacyStoredProfileSchema.extend({
+  endpoints: z.array(StoredEndpointSchema).min(1).max(MAX_PROFILE_ENDPOINTS),
+  autoSwitch: AutoSwitchSettingsSchema,
+  connectionRevision: z.number().int().positive(),
+  modelsCheckedAt: z.string().optional(),
+  tokenUsageTotal: z.number().int().nonnegative().optional(),
+})
+
+const LegacyProfileStoreSchema = z.object({
+  version: z.literal(1),
+  profiles: z.array(LegacyStoredProfileSchema),
+})
+
+const CurrentProfileStoreSchema = z.object({
+  version: z.literal(2),
+  profiles: z.array(StoredProfileSchema),
+})
+
+const ProfileStoreSchema = z.union([
+  CurrentProfileStoreSchema,
+  LegacyProfileStoreSchema.transform((store) => ({
+    version: 2,
+    profiles: store.profiles.map((profile) => ({
+      ...profile,
+      endpoints: [{
+        url: profile.baseUrl,
+        models: [],
+        healthHistory: [],
+        healthTimeline: [],
+        ...(profile.health ? { health: profile.health } : {}),
+      }],
+      autoSwitch: {
+        enabled: false,
+        intervalMinutes: DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES,
+      },
+      connectionRevision: 1,
+    })),
+  })),
+])
+
+const HistoryChangeSchema = z.object({
+  target: TargetSchema,
+  path: z.string(),
+  existed: z.boolean(),
+  beforeHash: z.string(),
+  afterHash: z.string(),
+})
+
+const HistoryEntrySchema = z.object({
+  id: z.string().uuid(),
+  profileId: z.string().uuid(),
+  profileName: z.string(),
+  appliedConnectionRevision: z.number().int().positive().optional(),
+  targets: z.array(TargetSchema),
+  createdAt: z.string(),
+  status: z.enum(['applied', 'undone', 'superseded', 'rolled-back', 'failed']),
+  source: z.enum(['manual', 'auto']).optional().default('manual'),
+  connectionMode: z.enum(['direct', 'gateway']).optional().default('direct'),
+  changes: z.array(HistoryChangeSchema),
+  backupFile: z.string(),
+  undoneAt: z.string().optional(),
+  failureMessage: z.string().max(240).optional(),
+})
+
+const HistoryStoreSchema = z.object({
+  version: z.literal(1),
+  entries: z.array(HistoryEntrySchema),
+})
+
+const BackupFileSchema = z.object({
+  version: z.literal(1),
+  id: z.string().uuid(),
+  createdAt: z.string(),
+  files: z.array(z.object({
+    path: z.string(),
+    existed: z.boolean(),
+    encryptedContent: z.string(),
+  })),
+})
+
+/**
+ * 移除仅允许主进程持有的密钥密文。
+ *
+ * @param {object} profile 持久化方案。
+ * @returns {object} 可安全返回渲染进程的方案。
+ */
+function toPublicProfile(profile) {
+  const {
+    encryptedKey,
+    connectionRevision,
+    health: storedHealth,
+    ...publicProfile
+  } = profile
+  const endpoints = profile.endpoints?.length
+    ? profile.endpoints
+    : [{
+        url: profile.baseUrl,
+        models: [],
+        healthHistory: [],
+        healthTimeline: [],
+        ...(storedHealth ? { health: storedHealth } : {}),
+      }]
+  const activeEndpoint = endpoints.find((endpoint) => (
+    endpoint.url.replace(/\/+$/, '') === profile.baseUrl.replace(/\/+$/, '')
+  )) || endpoints[0]
+
+  return {
+    ...publicProfile,
+    baseUrl: activeEndpoint.url,
+    endpoints,
+    autoSwitch: profile.autoSwitch || {
+      enabled: false,
+      intervalMinutes: DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES,
+    },
+    availableModels: activeEndpoint.models || [],
+    ...(activeEndpoint.health ? { health: activeEndpoint.health } : {}),
+  }
+}
+
+/**
+ * 将内部事务记录投影为不含路径和备份位置的公开历史。
+ *
+ * @param {object} entry 内部历史记录。
+ * @returns {object} 可安全返回渲染进程的历史摘要。
+ */
+function toPublicHistory(entry) {
+  const success = !['rolled-back', 'failed'].includes(entry.status)
+  const message = entry.failureMessage
+    || (entry.status === 'undone' ? 'The configuration change was undone' : undefined)
+    || (entry.status === 'superseded' ? 'A newer write replaced this configuration state' : undefined)
+  return {
+    id: entry.id,
+    profileId: entry.profileId,
+    profileName: entry.profileName,
+    targets: entry.targets,
+    createdAt: entry.createdAt,
+    source: entry.source || 'manual',
+    success,
+    canUndo: entry.status === 'applied' && entry.connectionMode !== 'gateway',
+    ...(entry.connectionMode === 'gateway' ? { connectionMode: 'gateway' } : {}),
+    ...(message ? { message } : {}),
+  }
+}
+
+/**
+ * 将 Zod 结构化问题合并为适合 IPC 展示的单行错误。
+ *
+ * @param {object} error Zod 错误。
+ * @returns {string} 包含字段路径的错误文本。
+ */
+function validationMessage(error) {
+  if (!error || !Array.isArray(error.issues)) return 'Invalid input'
+  return error.issues
+    .map((issue) => `${issue.path.join('.') || 'input'}: ${issue.message}`)
+    .join('; ')
+}
+
+module.exports = {
+  TARGET,
+  PROTOCOL,
+  AUTH_MODE,
+  DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES,
+  MAX_PROFILE_ENDPOINTS,
+  MAX_HEALTH_HISTORY,
+  MAX_HEALTH_TIMELINE,
+  TARGETS,
+  PROTOCOLS,
+  TargetSchema,
+  ProtocolSchema,
+  HttpUrlSchema,
+  HealthSchema,
+  HealthHistorySchema,
+  StoredEndpointSchema,
+  AutoSwitchSettingsSchema,
+  normalizeHttpUrl,
+  SaveProfileSchema,
+  StoredProfileSchema,
+  ProfileStoreSchema,
+  HistoryEntrySchema,
+  HistoryStoreSchema,
+  BackupFileSchema,
+  toPublicProfile,
+  toPublicHistory,
+  validationMessage,
+}

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+release/
+deliverables/
+output/
+.claude/
+coverage/
+.smoke/
+.test-runtime/
+test-artifacts/
+.ruff_cache/
+*.log
+.DS_Store

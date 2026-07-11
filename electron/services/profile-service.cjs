@@ -1,0 +1,719 @@
+const crypto = require('node:crypto')
+const { z } = require('zod')
+const {
+  DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES,
+  HealthSchema,
+  HttpUrlSchema,
+  MAX_PROFILE_ENDPOINTS,
+  SaveProfileSchema,
+  normalizeHttpUrl,
+  toPublicProfile,
+  validationMessage,
+} = require('./schemas.cjs')
+const { SerialExecutor } = require('./storage.cjs')
+
+const ProfileIdSchema = z.string().uuid()
+const ConnectionRevisionSchema = z.number().int().positive()
+const EMPTY_KEY_HINT = 'Not set'
+const MAX_DISCOVERED_MODELS = 1_000
+const HEALTH_HISTORY_WINDOW_MS = 60 * 60_000
+const HEALTH_TIMELINE_WINDOW_MS = 2 * 60 * 60_000
+const MAX_HEALTH_HISTORY = 30
+const MAX_HEALTH_TIMELINE = 60
+
+const EndpointProbeResultSchema = z.object({
+  url: HttpUrlSchema,
+  health: HealthSchema,
+  models: z.array(z.string().trim().min(1).max(240)).max(MAX_DISCOVERED_MODELS),
+})
+
+const EndpointHealthProbeResultSchema = z.object({
+  url: HttpUrlSchema,
+  health: HealthSchema,
+})
+
+function appendHealthSample(history, health, now = Date.now()) {
+  const minimumTimestamp = now - HEALTH_HISTORY_WINDOW_MS
+  return [...(history || []), health]
+    .filter((sample) => {
+      const timestamp = Date.parse(sample.checkedAt)
+      return Number.isFinite(timestamp) && timestamp >= minimumTimestamp && timestamp <= now + 60_000
+    })
+    .sort((left, right) => Date.parse(left.checkedAt) - Date.parse(right.checkedAt))
+    .slice(-MAX_HEALTH_HISTORY)
+}
+
+function appendHealthTimeline(history, health, now = Date.now()) {
+  const minimumTimestamp = now - HEALTH_TIMELINE_WINDOW_MS
+  return [...(history || []), health]
+    .filter((sample) => {
+      const timestamp = Date.parse(sample.checkedAt)
+      return Number.isFinite(timestamp) && timestamp >= minimumTimestamp && timestamp <= now + 60_000
+    })
+    .sort((left, right) => Date.parse(left.checkedAt) - Date.parse(right.checkedAt))
+    .slice(-MAX_HEALTH_TIMELINE)
+}
+
+function profileId(value) {
+  const result = ProfileIdSchema.safeParse(value)
+  if (!result.success) throw new Error(validationMessage(result.error))
+  return result.data
+}
+
+function normalizeBaseUrl(value) {
+  return normalizeHttpUrl(value)
+}
+
+function comparableUrl(value) {
+  return normalizeHttpUrl(value)
+}
+
+function sameUrl(left, right) {
+  return comparableUrl(left) === comparableUrl(right)
+}
+
+function endpointUrlsFromInput(input) {
+  const requestedBaseUrl = normalizeBaseUrl(input.baseUrl)
+  const source = input.endpoints?.length
+    ? input.endpoints.map((endpoint) => normalizeBaseUrl(endpoint.url))
+    : [requestedBaseUrl]
+  const seen = new Set()
+  const endpoints = []
+
+  for (const url of source) {
+    const comparable = comparableUrl(url)
+    if (seen.has(comparable)) throw new Error('Endpoint URLs must be unique')
+    seen.add(comparable)
+    endpoints.push(url)
+  }
+
+  const activeEndpoint = endpoints.find((url) => sameUrl(url, requestedBaseUrl))
+  if (activeEndpoint) return { baseUrl: activeEndpoint, endpoints }
+  if (endpoints.length >= MAX_PROFILE_ENDPOINTS) {
+    throw new Error(`A profile can contain at most ${MAX_PROFILE_ENDPOINTS} endpoints`)
+  }
+  return { baseUrl: requestedBaseUrl, endpoints: [requestedBaseUrl, ...endpoints] }
+}
+
+function stringSetsDiffer(left, right) {
+  const leftSet = new Set(left)
+  const rightSet = new Set(right)
+  return leftSet.size !== rightSet.size || [...leftSet].some((value) => !rightSet.has(value))
+}
+
+function decisionShapeChanged(existing, input, baseUrl, endpointUrls, suppliedKey) {
+  if (!existing) return true
+  if (suppliedKey) return true
+  if (existing.protocol !== input.protocol || existing.authMode !== input.authMode) return true
+  if (!sameUrl(existing.baseUrl, baseUrl)) return true
+  if (existing.model !== input.model) return true
+  if (existing.enableToolSearch !== input.enableToolSearch) return true
+  if (stringSetsDiffer(existing.targets, input.targets)) return true
+  const previous = new Set(existing.endpoints.map((endpoint) => comparableUrl(endpoint.url)))
+  const next = new Set(endpointUrls.map(comparableUrl))
+  if (previous.size !== next.size) return true
+  return [...previous].some((url) => !next.has(url))
+}
+
+function endpointFor(profile, url) {
+  return profile.endpoints.find((endpoint) => sameUrl(endpoint.url, url))
+}
+
+function copyName(name, profiles) {
+  const usedNames = new Set(profiles.map((profile) => profile.name.toLocaleLowerCase()))
+  const baseName = `${name} 副本`
+  if (!usedNames.has(baseName.toLocaleLowerCase())) return baseName
+
+  let suffix = 2
+  while (usedNames.has(`${baseName} ${suffix}`.toLocaleLowerCase())) suffix += 1
+  return `${baseName} ${suffix}`
+}
+
+/**
+ * 在检测结果事务内确认调度仍允许提交。
+ *
+ * @param {{signal?: AbortSignal, shouldContinue?: () => boolean}} options 提交取消条件。
+ * @throws 外部信号已中止或继续条件不成立时抛出 AbortError。
+ */
+function assertEndpointCommitActive(options) {
+  const canContinue = !options.signal?.aborted
+    && (typeof options.shouldContinue !== 'function' || options.shouldContinue())
+  if (canContinue) return
+
+  const error = new Error('Endpoint test was stopped')
+  error.name = 'AbortError'
+  throw error
+}
+
+/**
+ * 管理方案元数据、URL 池和 DPAPI 密钥密文。
+ *
+ * 服务层只返回公开方案；所有连接变更都递增 revision，使较早发出的网络检测
+ * 无法覆盖较新的 URL、协议或 Key。解密后的 Key 只在主进程调用栈内短暂存在。
+ */
+class ProfileService {
+  constructor(store, vault) {
+    this.store = store
+    this.vault = vault
+    this.serial = new SerialExecutor()
+  }
+
+  /**
+   * 列出全部公开方案。
+   *
+   * @returns {Promise<object[]>} 不含密文和明文 Key 的方案列表。
+   */
+  async list() {
+    const data = await this.store.read()
+    return data.profiles.map(toPublicProfile)
+  }
+
+  /**
+   * 读取内部持久化方案。
+   *
+   * @param {string} id 方案 UUID。
+   * @returns {Promise<object>} 含密文和连接 revision 的内部方案。
+   * @throws UUID 无效或方案不存在时抛出错误。
+   */
+  async getStored(id) {
+    const validatedId = profileId(id)
+    const data = await this.store.read()
+    const profile = data.profiles.find((item) => item.id === validatedId)
+    if (!profile) throw new Error('Profile not found')
+    return profile
+  }
+
+  /**
+   * 读取同一 revision 的方案和明文 Key，供主进程网络或写入服务使用。
+   *
+   * @param {string} id 方案 UUID。
+   * @returns {Promise<{profile: object, apiKey: string}>} 同一存储快照中的连接数据。
+   * @throws 方案不存在、密文缺失或当前 Windows 用户无法解密时抛出错误。
+   */
+  async getConnection(id) {
+    const profile = await this.getStored(id)
+    return {
+      profile,
+      apiKey: this.vault.decrypt(profile.encryptedKey),
+    }
+  }
+
+  /**
+   * 解锁指定方案的 Key。
+   *
+   * @param {string} id 方案 UUID。
+   * @returns {Promise<string>} 明文 Key；调用方不得记录或返回渲染进程。
+   * @throws 方案不存在或当前 Windows 用户无法解密时抛出错误。
+   */
+  async getSecret(id) {
+    const { apiKey } = await this.getConnection(id)
+    return apiKey
+  }
+
+  /**
+   * 新建或更新方案，并规范化活动 URL 与端点池。
+   *
+   * 编辑时空白 Key 表示保留原密文。连接参数变化会使旧检测结果失效；仅修改
+   * 名称、模型、目标或活动 URL 时保留仍然适用的端点状态。
+   *
+   * @param {object} rawInput 未信任的渲染进程输入。
+   * @returns {Promise<object>} 不含密文的公开方案。
+   * @throws 参数无效、方案不存在、加密或持久化失败时抛出错误。
+   */
+  async save(rawInput) {
+    const result = SaveProfileSchema.safeParse(rawInput)
+    if (!result.success) throw new Error(validationMessage(result.error))
+    const input = result.data
+
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const existingIndex = input.id
+        ? data.profiles.findIndex((profile) => profile.id === input.id)
+        : -1
+      if (input.id && existingIndex === -1) throw new Error('Profile not found')
+
+      const existing = existingIndex >= 0 ? data.profiles[existingIndex] : undefined
+      const now = new Date().toISOString()
+      const suppliedKey = input.apiKey?.trim() || ''
+      const normalized = endpointUrlsFromInput(input)
+      const connectionChanged = decisionShapeChanged(
+        existing,
+        input,
+        normalized.baseUrl,
+        normalized.endpoints,
+        suppliedKey,
+      )
+      const encryptedKey = suppliedKey
+        ? this.vault.encrypt(suppliedKey)
+        : existing?.encryptedKey
+      const keyHint = suppliedKey
+        ? this.vault.hint(suppliedKey)
+        : existing?.keyHint || EMPTY_KEY_HINT
+
+      const endpoints = normalized.endpoints.map((url) => {
+        const previous = existing ? endpointFor(existing, url) : undefined
+        if (previous && !suppliedKey
+          && existing.protocol === input.protocol
+          && existing.authMode === input.authMode) {
+          return { ...previous, url }
+        }
+        return { url, models: [], healthHistory: [], healthTimeline: [] }
+      })
+      const activeEndpoint = endpoints.find((endpoint) => sameUrl(endpoint.url, normalized.baseUrl))
+        || endpoints[0]
+      const profile = {
+        id: existing?.id || crypto.randomUUID(),
+        name: input.name,
+        protocol: input.protocol,
+        baseUrl: activeEndpoint.url,
+        endpoints,
+        model: input.model,
+        authMode: input.authMode,
+        targets: [...new Set(input.targets)],
+        enableToolSearch: input.enableToolSearch,
+        autoSwitch: input.autoSwitch || {
+          enabled: false,
+          intervalMinutes: DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES,
+        },
+        connectionRevision: existing
+          ? existing.connectionRevision + (connectionChanged ? 1 : 0)
+          : 1,
+        keyHint,
+        ...(encryptedKey ? { encryptedKey } : {}),
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+        ...(existing?.lastAppliedAt ? { lastAppliedAt: existing.lastAppliedAt } : {}),
+        ...(!connectionChanged && existing?.modelsCheckedAt
+          ? { modelsCheckedAt: existing.modelsCheckedAt }
+          : {}),
+        ...(activeEndpoint.health ? { health: activeEndpoint.health } : {}),
+      }
+
+      if (existingIndex >= 0) data.profiles[existingIndex] = profile
+      else data.profiles.unshift(profile)
+      await this.store.write(data)
+      return toPublicProfile(profile)
+    })
+  }
+
+  /**
+   * 复制方案及其 Key，不继承运行时检测和已写入状态。
+   *
+   * 副本保留协议、URL、模型、目标和检测周期，但默认关闭自动切换，避免复制
+   * 操作本身触发后台写配置。Key 在主进程内解密后立即重新加密。
+   *
+   * @param {string} id 来源方案 UUID。
+   * @returns {Promise<object>} 新副本的公开方案。
+   * @throws 来源不存在或 Key 无法解密/重新加密时抛出错误。
+   */
+  async duplicate(id) {
+    const validatedId = profileId(id)
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const sourceIndex = data.profiles.findIndex((profile) => profile.id === validatedId)
+      if (sourceIndex === -1) throw new Error('Profile not found')
+      const source = data.profiles[sourceIndex]
+      const now = new Date().toISOString()
+      const apiKey = this.vault.decrypt(source.encryptedKey)
+      const duplicate = {
+        id: crypto.randomUUID(),
+        name: copyName(source.name, data.profiles),
+        protocol: source.protocol,
+        baseUrl: source.baseUrl,
+        endpoints: source.endpoints.map((endpoint) => ({
+          url: endpoint.url,
+          models: [],
+          healthHistory: [],
+          healthTimeline: [],
+        })),
+        model: source.model,
+        authMode: source.authMode,
+        targets: [...source.targets],
+        enableToolSearch: source.enableToolSearch,
+        autoSwitch: {
+          enabled: false,
+          intervalMinutes: source.autoSwitch.intervalMinutes,
+        },
+        connectionRevision: 1,
+        keyHint: source.keyHint,
+        encryptedKey: this.vault.encrypt(apiKey),
+        createdAt: now,
+        updatedAt: now,
+      }
+      data.profiles.splice(sourceIndex + 1, 0, duplicate)
+      await this.store.write(data)
+      return toPublicProfile(duplicate)
+    })
+  }
+
+  /**
+   * 从管理库删除方案，不修改已写入客户端的配置。
+   *
+   * @param {string} id 方案 UUID。
+   * @returns {Promise<{ok: boolean}>} 删除结果。
+   * @throws UUID 无效或方案不存在时抛出错误。
+   */
+  async delete(id) {
+    const validatedId = profileId(id)
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const next = data.profiles.filter((profile) => profile.id !== validatedId)
+      if (next.length === data.profiles.length) throw new Error('Profile not found')
+      data.profiles = next
+      await this.store.write(data)
+      return { ok: true }
+    })
+  }
+
+  /**
+   * 原子提交一次全端点检测结果。
+   *
+   * @param {string} id 方案 UUID。
+   * @param {object[]} rawResults 每个 URL 的健康状态和模型列表。
+   * @param {number} expectedRevision 发起检测时的连接 revision。
+   * @param {{signal?: AbortSignal, shouldContinue?: () => boolean}} options 可选的提交取消条件。
+   * @returns {Promise<{profile: object, connectionRevision: number}>} 公开方案和提交后的 revision。
+   * @throws 检测期间连接参数变化或提交被停止时拒绝写入旧结果。
+   */
+  async commitEndpointResults(id, rawResults, expectedRevision, options = {}) {
+    const validatedId = profileId(id)
+    const revisionResult = ConnectionRevisionSchema.safeParse(expectedRevision)
+    if (!revisionResult.success) throw new Error(validationMessage(revisionResult.error))
+    const resultsResult = z.array(EndpointProbeResultSchema).max(MAX_PROFILE_ENDPOINTS)
+      .safeParse(rawResults)
+    if (!resultsResult.success) throw new Error(validationMessage(resultsResult.error))
+
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const index = data.profiles.findIndex((profile) => profile.id === validatedId)
+      if (index === -1) throw new Error('Profile not found')
+      const current = data.profiles[index]
+      if (current.connectionRevision !== revisionResult.data) {
+        throw new Error('Profile connection changed while endpoints were being tested')
+      }
+      assertEndpointCommitActive(options)
+
+      const resultMap = new Map(resultsResult.data.map((result) => [
+        comparableUrl(result.url),
+        result,
+      ]))
+      const endpoints = current.endpoints.map((endpoint) => {
+        const probe = resultMap.get(comparableUrl(endpoint.url))
+        return probe
+          ? {
+              ...endpoint,
+              url: endpoint.url,
+              health: probe.health,
+              models: [...new Set(probe.models)],
+            }
+          : endpoint
+      })
+      const activeEndpoint = endpoints.find((endpoint) => sameUrl(endpoint.url, current.baseUrl))
+        || endpoints[0]
+      const fallbackEndpoint = activeEndpoint.health?.status === 'unhealthy'
+        ? endpoints
+          .filter((endpoint) => endpoint.health?.status === 'healthy' && endpoint.models.length > 0)
+          .sort((left, right) => left.health.latencyMs - right.health.latencyMs)[0]
+        : undefined
+      const now = new Date().toISOString()
+      const nextModel = current.model
+        || activeEndpoint.models[0]
+        || fallbackEndpoint?.models[0]
+        || ''
+      const next = {
+        ...current,
+        baseUrl: activeEndpoint.url,
+        endpoints,
+        model: nextModel,
+        connectionRevision: current.connectionRevision + (nextModel !== current.model ? 1 : 0),
+        modelsCheckedAt: now,
+        updatedAt: now,
+      }
+      if (activeEndpoint.health) next.health = activeEndpoint.health
+      else delete next.health
+      data.profiles[index] = next
+      assertEndpointCommitActive(options)
+      await this.store.write(data)
+      return {
+        profile: toPublicProfile(next),
+        connectionRevision: next.connectionRevision,
+      }
+    })
+  }
+
+  /**
+   * 原子提交检测结果并仅返回公开方案。
+   *
+   * @param {string} id 方案 UUID。
+   * @param {object[]} rawResults 每个 URL 的健康状态和模型列表。
+   * @param {number} expectedRevision 发起检测时的连接 revision。
+   * @returns {Promise<object>} 更新后的公开方案。
+   */
+  async updateEndpointResults(id, rawResults, expectedRevision) {
+    const committed = await this.commitEndpointResults(id, rawResults, expectedRevision)
+    return committed.profile
+  }
+
+  /**
+   * 原子提交无凭据 URL 健康探测，并维护每个端点最近一小时的滚动样本。
+   *
+   * 此路径不会修改模型列表、modelsCheckedAt 或连接 revision。这样后台测速不会
+   * 冒充手动模型识别，也不会使正在进行的网关连接快照失效。
+   *
+   * @param {string} id 方案 UUID。
+   * @param {object[]} rawResults 每个 URL 的健康探测结果。
+   * @param {number} expectedRevision 发起探测时的连接 revision。
+   * @param {{signal?: AbortSignal, shouldContinue?: () => boolean}} options 可选提交取消条件。
+   * @returns {Promise<{profile: object, connectionRevision: number}>} 公开方案与原 revision。
+   */
+  async commitEndpointHealthResults(id, rawResults, expectedRevision, options = {}) {
+    const validatedId = profileId(id)
+    const revisionResult = ConnectionRevisionSchema.safeParse(expectedRevision)
+    if (!revisionResult.success) throw new Error(validationMessage(revisionResult.error))
+    const resultsResult = z.array(EndpointHealthProbeResultSchema).max(MAX_PROFILE_ENDPOINTS)
+      .safeParse(rawResults)
+    if (!resultsResult.success) throw new Error(validationMessage(resultsResult.error))
+
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const index = data.profiles.findIndex((profile) => profile.id === validatedId)
+      if (index === -1) throw new Error('Profile not found')
+      const current = data.profiles[index]
+      if (current.connectionRevision !== revisionResult.data) {
+        throw new Error('Profile connection changed while endpoints were being tested')
+      }
+      assertEndpointCommitActive(options)
+
+      const now = Date.now()
+      const resultMap = new Map(resultsResult.data.map((result) => [
+        comparableUrl(result.url),
+        result,
+      ]))
+      const endpoints = current.endpoints.map((endpoint) => {
+        const probe = resultMap.get(comparableUrl(endpoint.url))
+        if (!probe) return endpoint
+        return {
+          ...endpoint,
+          health: probe.health,
+          healthHistory: appendHealthSample(endpoint.healthHistory, probe.health, now),
+          healthTimeline: appendHealthTimeline(
+            endpoint.healthTimeline?.length ? endpoint.healthTimeline : endpoint.healthHistory,
+            probe.health,
+            now,
+          ),
+        }
+      })
+      const activeEndpoint = endpoints.find((endpoint) => sameUrl(endpoint.url, current.baseUrl))
+        || endpoints[0]
+      const next = {
+        ...current,
+        endpoints,
+        updatedAt: new Date(now).toISOString(),
+      }
+      if (activeEndpoint.health) next.health = activeEndpoint.health
+      else delete next.health
+      data.profiles[index] = next
+      assertEndpointCommitActive(options)
+      await this.store.write(data)
+      return {
+        profile: toPublicProfile(next),
+        connectionRevision: next.connectionRevision,
+      }
+    })
+  }
+
+  /**
+   * 保存活动 URL 的单次健康状态，兼容仅测试一个端点的内部调用。
+   *
+   * @param {string} id 方案 UUID。
+   * @param {object} health 已规范化的检测结果。
+   * @returns {Promise<object>} 更新后的公开方案。
+   */
+  async updateHealth(id, health) {
+    const profile = await this.getStored(id)
+    const committed = await this.commitEndpointHealthResults(id, [{
+      url: profile.baseUrl,
+      health,
+    }], profile.connectionRevision)
+    return committed.profile
+  }
+
+  /**
+   * 条件式切换当前活动 URL。
+   *
+   * @param {string} id 方案 UUID。
+   * @param {string} rawUrl 必须已存在于方案 URL 池中的地址。
+   * @param {{expectedBaseUrl?: string, expectedRevision?: number}} conditions 并发保护条件。
+   * @returns {Promise<{profile: object, connectionRevision: number}>} 切换后的公开方案和 revision。
+   * @throws 条件不再成立或 URL 不属于方案时拒绝切换。
+   */
+  async setActiveEndpoint(id, rawUrl, conditions = {}) {
+    const validatedId = profileId(id)
+    const urlResult = HttpUrlSchema.safeParse(rawUrl)
+    if (!urlResult.success) throw new Error(validationMessage(urlResult.error))
+
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const index = data.profiles.findIndex((profile) => profile.id === validatedId)
+      if (index === -1) throw new Error('Profile not found')
+      const current = data.profiles[index]
+      if (conditions.expectedRevision !== undefined
+        && current.connectionRevision !== conditions.expectedRevision) {
+        throw new Error('Profile connection changed before the endpoint switch')
+      }
+      if (conditions.expectedBaseUrl
+        && !sameUrl(current.baseUrl, conditions.expectedBaseUrl)) {
+        throw new Error('The active endpoint changed before the endpoint switch')
+      }
+      const endpoint = endpointFor(current, urlResult.data)
+      if (!endpoint) throw new Error('Endpoint does not belong to this profile')
+
+      const next = {
+        ...current,
+        baseUrl: endpoint.url,
+        connectionRevision: current.connectionRevision + (sameUrl(current.baseUrl, endpoint.url) ? 0 : 1),
+        updatedAt: new Date().toISOString(),
+      }
+      if (endpoint.health) next.health = endpoint.health
+      else delete next.health
+      data.profiles[index] = next
+      await this.store.write(data)
+      return {
+        profile: toPublicProfile(next),
+        connectionRevision: next.connectionRevision,
+      }
+    })
+  }
+
+  /**
+   * 在方案修改互斥区内读取并使用稳定连接快照。
+   *
+   * operation 执行期间保存、删除、检测提交和活动 URL 切换都会等待。调用方必须
+   * 使用传入的 markApplied 更新最近写入时间，不得在 operation 内再次调用本服务
+   * 的修改方法，避免同一串行器重入。
+   *
+   * @param {string} id 方案 UUID。
+   * @param {number | undefined} expectedRevision 可选的决策 revision。
+   * @param {(context: {profile: object, apiKey: string, markApplied: (appliedAt: string) => Promise<void>}) => Promise<unknown>} operation 受保护操作。
+   * @returns {Promise<unknown>} operation 的返回值。
+   */
+  async withConnectionLock(id, expectedRevision, operation) {
+    const validatedId = profileId(id)
+    if (expectedRevision !== undefined) {
+      const revisionResult = ConnectionRevisionSchema.safeParse(expectedRevision)
+      if (!revisionResult.success) throw new Error(validationMessage(revisionResult.error))
+    }
+    if (typeof operation !== 'function') throw new Error('Connection operation must be a function')
+
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const index = data.profiles.findIndex((profile) => profile.id === validatedId)
+      if (index === -1) throw new Error('Profile not found')
+      const profile = data.profiles[index]
+      if (expectedRevision !== undefined && profile.connectionRevision !== expectedRevision) {
+        throw new Error('Profile connection changed before configuration could be written')
+      }
+      const apiKey = this.vault.decrypt(profile.encryptedKey)
+      const markApplied = async (appliedAt) => {
+        data.profiles[index] = {
+          ...data.profiles[index],
+          lastAppliedAt: appliedAt,
+          updatedAt: appliedAt,
+        }
+        await this.store.write(data)
+      }
+      return operation({ profile, apiKey, markApplied })
+    })
+  }
+
+  /**
+   * 按给定顺序重排方案列表。
+   *
+   * 未出现在 ids 中的方案保持原有相对顺序追加在末尾，重排不修改任何方案内容。
+   *
+   * @param {string[]} rawIds 期望的方案 UUID 顺序。
+   * @returns {Promise<object[]>} 重排后的公开方案列表。
+   */
+  async reorder(rawIds) {
+    const idsResult = z.array(ProfileIdSchema).max(500).safeParse(rawIds)
+    if (!idsResult.success) throw new Error(validationMessage(idsResult.error))
+    const ids = idsResult.data
+
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const byId = new Map(data.profiles.map((profile) => [profile.id, profile]))
+      const ordered = []
+      for (const id of ids) {
+        const profile = byId.get(id)
+        if (!profile) continue
+        byId.delete(id)
+        ordered.push(profile)
+      }
+      for (const profile of data.profiles) {
+        if (byId.has(profile.id)) ordered.push(profile)
+      }
+      data.profiles = ordered
+      await this.store.write(data)
+      return ordered.map(toPublicProfile)
+    })
+  }
+
+  /**
+   * 累加方案的历史 Token 用量。
+   *
+   * 由请求监控在每次请求结束时调用；方案不存在或增量无效时静默忽略，
+   * 统计失败不得影响网关转发。
+   *
+   * @param {string} id 方案 UUID。
+   * @param {number} tokens 本次请求消耗的 Token 总数。
+   * @returns {Promise<void>} 持久化完成后的 Promise。
+   */
+  async addTokenUsage(id, tokens) {
+    const idResult = ProfileIdSchema.safeParse(id)
+    const amount = Number(tokens)
+    if (!idResult.success || !Number.isFinite(amount) || amount <= 0) return
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const index = data.profiles.findIndex((profile) => profile.id === idResult.data)
+      if (index === -1) return
+      const current = data.profiles[index]
+      data.profiles[index] = {
+        ...current,
+        tokenUsageTotal: Math.round((current.tokenUsageTotal || 0) + amount),
+      }
+      await this.store.write(data)
+    })
+  }
+
+  /**
+   * 记录方案最近一次成功写入时间。
+   *
+   * @param {string} id 方案 UUID。
+   * @param {string} appliedAt ISO 时间。
+   * @returns {Promise<void>} 持久化完成后的 Promise。
+   */
+  async markApplied(id, appliedAt) {
+    const validatedId = profileId(id)
+    return this.serial.run(async () => {
+      const data = await this.store.read()
+      const index = data.profiles.findIndex((profile) => profile.id === validatedId)
+      if (index === -1) return
+      data.profiles[index] = {
+        ...data.profiles[index],
+        lastAppliedAt: appliedAt,
+        updatedAt: appliedAt,
+      }
+      await this.store.write(data)
+    })
+  }
+}
+
+module.exports = {
+  HEALTH_HISTORY_WINDOW_MS,
+  HEALTH_TIMELINE_WINDOW_MS,
+  MAX_HEALTH_HISTORY,
+  MAX_HEALTH_TIMELINE,
+  ProfileService,
+  appendHealthSample,
+  comparableUrl,
+}
