@@ -224,7 +224,7 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
                     <small>{m.stream.cache}</small>
                   </span>
                   <span className="request-timing">
-                    <RollingNumber value={formatDuration(elapsed)} />
+                    <RollingNumber ticker value={formatDuration(elapsed)} />
                     <small className={latencyTier(firstLatency)}>{firstLabel} {formatDuration(firstLatency)}</small>
                   </span>
                   <strong className={`request-state-label ${state.tint}`}>{state.label}</strong>

@@ -726,8 +726,8 @@ code, .num, [data-num] { font-variant-numeric: tabular-nums; }
   height: 32px;          /* = 管高 34px − 上下各 1px 边框 */
   line-height: 32px;
 }
-/* 落位时点一次火：滚筒在滚的这一刻辉光过冲，然后收回常亮 */
-.tube .reel[data-rolling] { animation: tube-ignite 420ms ease-out; }
+/* 滚动全程点火：辉光过冲的时长与滚动一致（--roll-ms 由 RollingChar 写入） */
+.tube .reel[data-rolling] { animation: tube-ignite var(--roll-ms, 420ms) ease-out; }
 
 /* 未点亮的阴极——辉光管的头号特征 */
 .tube::before {
