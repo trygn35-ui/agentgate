@@ -52,9 +52,9 @@ interface Reel {
 /**
  * 单个字位的滚筒。
  *
- * 每次变化随机决定向上还是向下滚，随机滚过 5–12 个中间数字，时长与起步延迟
- * 也各自随机——同一读数里的各位不齐步，先后落定。落位前略微冲过头再弹回来
- * （纸带在停靠格之外多垫了一格，回弹时露出它的边）。
+ * 每次变化随机决定向上还是向下滚，随机滚过若干中间数字，时长与起步延迟
+ * 也各自随机——同一读数里的各位不齐步，先后落定。落位是一条纯粹的减速
+ * 曲线，速度渐近归零；辉光管没有机械结构，不冲头、不回弹。
  *
  * 落位后把纸带收回单帧，否则每个字位会常驻十几个节点，请求流里成百上千。
  */
@@ -112,14 +112,12 @@ export function RollingChar({ char, ticker }: { char: string; ticker?: boolean }
     const up = Math.random() < 0.5;
     const steps = SPIN_MIN + Math.floor(Math.random() * (SPIN_MAX - SPIN_MIN + 1));
     const mid = Array.from({ length: steps }, randomDigit);
-    // 停靠格之外的垫格：回弹时露它的边。落在空位上就垫空位，弹出个数字来很怪。
-    const pad = char === " " ? " " : randomDigit();
 
     setReel({
       // 向上滚：新字从下方来，纸带顺排；向下滚：新字从上方来，纸带倒排
-      frames: up ? [from, ...mid, char, pad] : [pad, char, ...mid, from],
-      fromIndex: up ? 0 : steps + 2,
-      targetIndex: up ? steps + 1 : 1,
+      frames: up ? [from, ...mid, char] : [char, ...mid, from],
+      fromIndex: up ? 0 : steps + 1,
+      targetIndex: up ? steps + 1 : 0,
       spin: true,
       // 2.1–3.4s：这不是给赶时间的人看的仪表，慢滚本身就是内容
       duration: 1400 + steps * 110 + Math.random() * 400,
@@ -135,23 +133,17 @@ export function RollingChar({ char, ticker }: { char: string; ticker?: boolean }
 
     const cell = 100 / count;
     const ty = (index: number) => `translateY(${-(index * cell)}%)`;
-    const fromTy = -(reel.fromIndex * cell);
-    const endTy = -(reel.targetIndex * cell);
-    // 轻轻冲过头再落回；方向跟着行进方向走
-    const overTy = endTy + Math.sign(endTy - fromTy) * cell * 0.3;
 
     const move = strip.animate(
-      reel.spin
-        ? [
-          // 前段疾速掠过中间数字，后段用一半以上的时间缓缓滑进停靠格
-          { transform: `translateY(${fromTy}%)`, easing: "cubic-bezier(.14, .6, .16, 1)" },
-          { transform: `translateY(${overTy}%)`, offset: .84, easing: "cubic-bezier(.34, 0, .32, 1)" },
-          { transform: `translateY(${endTy}%)` },
-        ]
-        : [
-          { transform: ty(reel.fromIndex), easing: "cubic-bezier(.2, .9, .3, 1)" },
-          { transform: ty(reel.targetIndex) },
-        ],
+      [
+        // 一条纯粹的减速曲线：前段疾速掠过中间数字，速度渐近归零、滑进停靠格
+        // 就停。辉光管是气体放电管，没有机械结构——不冲头、不回弹。
+        {
+          transform: ty(reel.fromIndex),
+          easing: reel.spin ? "cubic-bezier(.12, .55, .12, 1)" : "cubic-bezier(.2, .9, .3, 1)",
+        },
+        { transform: ty(reel.targetIndex) },
+      ],
       { duration: reel.duration, delay: reel.delay, fill: "both" },
     );
 
