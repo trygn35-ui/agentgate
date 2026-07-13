@@ -44,6 +44,7 @@ const {
   defaultGatewayStore,
 } = require('./services/gateway-service.cjs')
 const { UpdateService } = require('./services/update-service.cjs')
+const { migrateLegacyUserData } = require('./services/migration-service.cjs')
 const { CHANNELS, registerIpcHandlers } = require('./services/ipc.cjs')
 
 const APP_NAME = 'agentgate'
@@ -82,35 +83,6 @@ const WindowStateSchema = z.object({
 
 app.setName(APP_NAME)
 
-/**
- * 把旧版数据目录整体迁移到当前目录。
- *
- * 只在当前目录尚无数据时执行，避免覆盖新数据。Key 密文由 DPAPI 加密并绑定当前
- * Windows 用户，与目录位置无关，因此直接复制即可解密。迁移失败时保留旧目录不动，
- * 以空配置启动，用户仍可手动复制。
- *
- * @returns {Promise<string | undefined>} 迁移来源目录；无需迁移时返回 undefined。
- */
-async function migrateLegacyUserData() {
-  const fsp = require('node:fs/promises')
-  const current = app.getPath('userData')
-  const currentData = path.join(current, DATA_DIRECTORY_NAME)
-  if (await fsp.stat(currentData).catch(() => undefined)) return undefined
-
-  const parent = path.dirname(current)
-  for (const legacyName of LEGACY_APP_NAMES) {
-    const legacyData = path.join(parent, legacyName, DATA_DIRECTORY_NAME)
-    if (!await fsp.stat(legacyData).catch(() => undefined)) continue
-    try {
-      await fsp.mkdir(current, { recursive: true })
-      await fsp.cp(legacyData, currentData, { recursive: true })
-      return path.join(parent, legacyName)
-    } catch {
-      return undefined
-    }
-  }
-  return undefined
-}
 
 let mainWindow
 let tray
@@ -427,7 +399,7 @@ if (!hasSingleInstanceLock) {
     app.setAppUserModelId(APP_USER_MODEL_ID)
     Menu.setApplicationMenu(null)
     // 必须早于任何数据读取，否则会以空配置覆盖旧版数据。
-    await migrateLegacyUserData()
+    await migrateLegacyUserData(app.getPath('userData'), LEGACY_APP_NAMES)
     services = createServices()
     const settings = await services.settingsService.initialize()
     await services.requestMonitor.initialize()

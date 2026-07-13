@@ -1,6 +1,6 @@
 {
   "name": "agentgate",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "private": true,
   "description": "A local API profile manager and loopback gateway for Claude Code, Codex, OpenCode and Gemini CLI.",
   "main": "electron/main.cjs",
