@@ -1,6 +1,6 @@
 {
   "name": "keydeck",
-  "version": "0.7.7",
+  "version": "0.7.8",
   "private": true,
   "description": "A local API endpoint, key, and optional loopback gateway manager for coding clients.",
   "main": "electron/main.cjs",

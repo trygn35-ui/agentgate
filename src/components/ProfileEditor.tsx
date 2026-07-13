@@ -162,16 +162,19 @@ export function ProfileEditor({
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [models, setModels] = useState<string[]>(() => profile?.availableModels ?? []);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  /** 用户在模型框里主动键入的搜索词；undefined 表示未搜索，此时列出全部模型。 */
+  const [modelQuery, setModelQuery] = useState<string>();
   const dialogRef = useRef<HTMLFormElement>(null);
   const modelFieldRef = useRef<HTMLDivElement>(null);
   const compatibleTargets = PROTOCOL_META[form.protocol].compatible;
   const hasUnsavedChanges = JSON.stringify(form) !== JSON.stringify(initialForm.current);
-  // 已选模型也留在列表里，选过之后仍能换成其他模型。
-  const modelOptions = models.filter((model) => (
-    !form.model.trim()
-    || model === form.model
-    || model.toLocaleLowerCase().includes(form.model.trim().toLocaleLowerCase())
-  ));
+  // 展开时始终列出全部模型；只有用户主动键入才按搜索词过滤，
+  // 这样已选中的模型不会把列表过滤成只剩它自己。
+  const modelOptions = modelQuery?.trim()
+    ? models.filter((model) => (
+        model.toLocaleLowerCase().includes(modelQuery.trim().toLocaleLowerCase())
+      ))
+    : models;
 
   useEffect(() => {
     if (!modelMenuOpen) return undefined;
@@ -189,6 +192,7 @@ export function ProfileEditor({
     const discovered = await onDiscoverModels();
     if (!discovered) return;
     setModels(discovered);
+    setModelQuery(undefined);
     setModelMenuOpen(discovered.length > 0);
   }
 
@@ -548,9 +552,13 @@ export function ProfileEditor({
                     value={form.model}
                     onChange={(event) => {
                       update("model", event.target.value);
+                      setModelQuery(event.target.value);
                       setModelMenuOpen(true);
                     }}
-                    onFocus={() => setModelMenuOpen(true)}
+                    onFocus={() => {
+                      setModelQuery(undefined);
+                      setModelMenuOpen(true);
+                    }}
                     onKeyDown={(event) => {
                       if (event.key === "Escape" && modelMenuOpen) {
                         event.preventDefault();
@@ -567,7 +575,10 @@ export function ProfileEditor({
                     className="model-toggle"
                     aria-label={modelMenuOpen ? "收起模型列表" : "展开模型列表"}
                     title={models.length > 0 ? `${models.length} 个可用模型` : "先点击识别模型"}
-                    onClick={() => setModelMenuOpen((open) => !open)}
+                    onClick={() => {
+                      setModelQuery(undefined);
+                      setModelMenuOpen((open) => !open);
+                    }}
                   >
                     <ChevronsUpDown size={13} />
                   </button>
@@ -582,6 +593,7 @@ export function ProfileEditor({
                           key={model}
                           onClick={() => {
                             update("model", model);
+                            setModelQuery(undefined);
                             setModelMenuOpen(false);
                           }}
                         >
@@ -592,7 +604,7 @@ export function ProfileEditor({
                         <p className="model-menu-empty">
                           {models.length === 0
                             ? "还没有识别到模型，点击上方“识别模型”。"
-                            : "没有匹配的模型，清空输入查看全部。"}
+                            : "没有匹配的模型，点右侧箭头查看全部。"}
                         </p>
                       )}
                     </div>

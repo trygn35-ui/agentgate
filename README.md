@@ -111,10 +111,10 @@ pnpm dist
 执行 `pnpm dist` 后，最终交付文件整理在 `deliverables/`：
 
 ```text
-Keydeck-Portable-0.7.7-x64.exe
-Keydeck-Setup-0.7.7-x64.exe
-Keydeck-0.7.7-source.zip
-SHA256SUMS-0.7.7.txt
+Keydeck-Portable-0.7.8-x64.exe
+Keydeck-Setup-0.7.8-x64.exe
+Keydeck-0.7.8-source.zip
+SHA256SUMS-0.7.8.txt
 ```
 
 当前构建没有商业代码签名证书，Windows SmartScreen 首次运行可能显示未知发布者。
