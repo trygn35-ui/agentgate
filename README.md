@@ -1,136 +1,264 @@
-# Keydeck
+<div align="center">
 
-Keydeck 是一个纯本地的 API 方案与回环网关管理器。方案中的真实 URL 和 Key 只交给 Keydeck 网关；客户端连接固定的 `127.0.0.1` 地址，因此切换兼容方案时无需反复改写客户端配置。
+<img src="docs/images/logo.svg" width="112" alt="Key Core">
 
-## 工作方式
+# Key Core
 
-1. 创建方案，保存协议、URL 池、Key、模型和适用客户端。
-2. 在方案列表把方案分配给一个或多个客户端。网关关闭时，这只是保存下次启动要使用的路由，不修改客户端文件。
-3. 打开顶部“本地网关”开关。Keydeck 启动回环监听，并定点写入本地 URL。
-4. 网关运行时再次分配方案：
-   - URL 和 Key 切换只更新内存路由，客户端配置字节不变。
-   - 已经发出的请求固定使用开始时的上游；新请求使用新方案。
-5. 关闭网关时，Keydeck 只恢复首次接管前的受管字段；已分配路由会保留，供下次开启继续使用。
+**纯本地的 API 方案管理器与回环网关**
 
-方案不会把真实上游 URL 或 Key 直接写入客户端。真实上游 Key 只存在于 DPAPI 密文和网关运行期间的主进程内存中。
+换中转不用改客户端配置 · Key 加密不落地 · 请求实时可观测
 
-## 客户端
+[![Release](https://img.shields.io/github/v/release/trygn35-ui/keydeck?style=flat-square&color=D97757)](https://github.com/trygn35-ui/keydeck/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/trygn35-ui/keydeck/total?style=flat-square&color=3E9067)](https://github.com/trygn35-ui/keydeck/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-2F78D0?style=flat-square)](#下载与安装)
+[![License](https://img.shields.io/github/license/trygn35-ui/keydeck?style=flat-square)](LICENSE)
 
-| 客户端 | 接入位置 | Keydeck 管理的字段 |
+[下载与安装](#下载与安装) · [快速开始](#快速开始) · [工作原理](#工作原理) · [安全与隐私](#安全与隐私) · [FAQ](#faq)
+
+<img src="docs/images/overview.png" width="820" alt="Key Core 概览">
+
+</div>
+
+---
+
+## 为什么需要 Key Core
+
+如果你同时用 Claude Code、Codex、OpenCode 或 Gemini CLI，并且手上不止一家中转，大概率遇到过这些事：
+
+- **换一家中转要翻配置文件**。`settings.json`、`config.toml`、环境变量各改一遍，改错了还得回滚。
+- **API Key 明文躺在各处**。客户端配置、`.env`、shell 历史里到处都是你的 Key。
+- **同一个 Key 填很多遍**。四个客户端四种配置格式，加一个方案就要重复四次。
+- **请求出问题看不到现场**。是自己配错了、Key 过期了，还是上游在限流？只能靠猜。
+
+Key Core 把这些收敛到一处：**方案存在本地，客户端只认一个固定的回环地址，换方案在界面上点一下就好。**
+
+|  | 手动改配置 | 环境变量脚本 | **Key Core** |
+| --- | --- | --- | --- |
+| 切换方案 | 改多个文件，易出错 | 需重开终端 | **点一下，客户端零改动** |
+| Key 存放 | 明文散落各处 | 明文在脚本里 | **DPAPI 加密，不写入客户端** |
+| 多客户端同步 | 每个都要改 | 每个都要导 | **一次分配，同时生效** |
+| 请求可观测 | 无 | 无 | **实时首字、Token、缓存率** |
+| 上游故障 | 手动排查再切 | 手动切 | **自动择优切到可用线路** |
+
+## 核心特性
+
+- **一键切换方案** — 网关运行时切换只更新内存路由，客户端配置一个字节都不动，已发出的请求不受影响。
+- **本地回环网关** — 只监听 `127.0.0.1`，为四个客户端提供独立路径槽，不是任意目标的开放代理。
+- **Key 不落客户端** — 真实 URL 与 Key 只交给网关；客户端里只有本地地址和随机本地令牌。
+- **请求实时监控** — 首字/首包时延、Token 用量、缓存命中率、推理强度，按色阶一眼看出异常。
+- **URL 池与自动择优** — 一个方案最多 20 条线路，按 1 小时可用率与平均延迟自动切到最优；当前线路失败立即让路。
+- **渠道实测** — 用真实 Key 发一条最小消息，量真实可用性与时延，并回显上游计量的 Token 用量。
+- **纯本地运行** — 没有服务端、没有账号、没有遥测，断网也能管理方案。
+
+## 工作原理
+
+```text
+Claude Code ─┐                                       ┌─ 方案 A：主力中转
+Codex ───────┤                                       ├─ 方案 B：备用中转
+OpenCode ────┼──▶  127.0.0.1:17863（Key Core 网关）──┼─ 方案 C：官方直连
+Gemini CLI ──┘         注入真实 URL 与 Key           └─ …
+```
+
+1. 客户端里**只写一次** `http://127.0.0.1:17863/...`，之后再也不用改。
+2. 网关收到请求后剥离本地令牌，按当前方案注入真实的上游地址与 Key，再原样转发。
+3. 在界面上换方案 = 换网关的内存路由。**客户端毫无察觉，不需要重启。**
+4. 关闭网关时，Key Core 只把接管前的那几个字段还原回去，你在此期间新增的 MCP、插件、注释都会保留。
+
+## 截图
+
+<details open>
+<summary><b>密钥管理</b> — 拖动排序、累计用量、健康时间线、一键切换与实测</summary>
+<br>
+<img src="docs/images/keyring.png" width="820" alt="密钥页">
+</details>
+
+<details>
+<summary><b>请求监控</b> — 首字时延、Token、缓存率实时刷新</summary>
+<br>
+<img src="docs/images/activity.png" width="820" alt="动态页">
+</details>
+
+<details>
+<summary><b>设置</b> — 静默自启、托盘驻留、主题与自动更新</summary>
+<br>
+<img src="docs/images/settings.png" width="820" alt="设置页">
+</details>
+
+<details>
+<summary><b>深色主题</b></summary>
+<br>
+<img src="docs/images/overview-dark.png" width="820" alt="深色主题">
+</details>
+
+## 下载与安装
+
+前往 **[Releases](https://github.com/trygn35-ui/keydeck/releases/latest)** 下载：
+
+| 文件 | 说明 |
+| --- | --- |
+| `Keydeck-Setup-<版本>-x64.exe` | 安装版，**支持自动更新**，推荐 |
+| `Keydeck-Portable-<版本>-x64.exe` | 便携版，免安装，不支持自动更新 |
+| `SHA256SUMS-<版本>.txt` | 校验和，可核对安装包完整性 |
+
+**系统要求**：Windows 10 (1809+) 或 Windows 11，x64。无需额外运行时。
+
+> [!NOTE]
+> 当前构建没有商业代码签名证书，首次运行时 Windows SmartScreen 会提示“未知发布者”。
+> 点击 **更多信息 → 仍要运行** 即可。介意的话可以先用 `SHA256SUMS` 核对安装包，或直接从源码构建。
+
+## 快速开始
+
+1. **新建方案** — 在「密钥」页点新建，填入方案名、API 协议、上游 URL 和 Key。Key 输入后立即加密保存。
+2. **勾选适用客户端** — 一个方案可以同时供多个协议兼容的客户端使用。
+3. **分配给客户端** — 在「概览」页点客户端卡片选择方案，或在密钥行点 ⚡ 一键切换。
+4. **打开网关** — 点右上角「网关」开关，Key Core 会把客户端的 Base URL 指向本地回环地址。
+5. **照常使用客户端** — 请求经网关转发，在「动态」页实时查看时延与用量。
+
+之后再换方案只需重复第 3 步——**不用碰任何配置文件，不用重启客户端。**
+
+## 客户端支持
+
+| 客户端 | 接入位置 | Key Core 管理的字段 |
 | --- | --- | --- |
 | Claude Code | `~/.claude/settings.json` | 本地 Base URL、本地认证、可选模型与 Tool Search |
 | Codex | `~/.codex/config.toml` | 仅当前 provider 的 `base_url` |
-| OpenCode | `~/.config/opencode/opencode.json(c)`、`~/.local/share/opencode/auth.json` | `provider.keydeck_gateway`、模型选择与本地认证 |
+| OpenCode | `~/.config/opencode/opencode.json(c)` | `provider.keydeck_gateway`、模型选择与本地认证 |
 | Gemini CLI | `~/.gemini/.env`、`~/.gemini/settings.json` | 本地 Base URL、本地认证、可选模型与认证类型 |
 
-支持 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`GEMINI_CLI_HOME`、`OPENCODE_CONFIG`、`XDG_CONFIG_HOME` 和 `XDG_DATA_HOME` 路径覆盖。
+支持 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`GEMINI_CLI_HOME`、`OPENCODE_CONFIG`、`XDG_CONFIG_HOME` 与 `XDG_DATA_HOME` 路径覆盖。
 
-## URL 池与自动择优
-
-- 一个方案最多保存 20 个 API URL。
-- 后台每 2 分钟对原 URL 发起不带 Key 的 `HEAD` 探测，不访问 `/models`。
-- 每个 URL 持久保存最近 1 小时、最多 30 个统计样本；另保留最近 60 次检测用于红黄绿时间线展示。
-- `2xx` 至 `4xx` 视为可达，`429` 显示受限；`5xx`、超时、TLS 和网络错误视为失败。
-- 自动择优先比较 1 小时可用率，再比较可达样本的中位延迟；新 URL 至少预热 3 个样本。
-- 当前 URL 失败时立即选择可达线路，不等待预热完成。
-- 模型列表只在用户点击“识别模型”时请求，不会被后台检测改写。
-- 方案卡主体用于立即切换网关路由，右下角“配置”进入详情；“检测端点”只检查 URL 可达性，不识别模型。
-- 密钥行的“实测”按钮会用方案真实 Key 按协议发送一条最小消息（hi），报告 HTTP 状态、首包、总耗时和上游计量的 Token 用量；实测流量直连上游，不经过本地网关。实测请求本身只有约 10 个输入 Token，若结果显示大量输入或缓存 Token，说明中转在转发前注入了自己的前缀。
-- OpenAI/Anthropic 兼容接口读取 `data[].id`，Gemini 接口读取 `models[].name`。
-- 自动切换只更新方案活动 URL 和网关连接缓存，不把真实 URL/Key 写入客户端。
-
-复制方案会复制协议、URL 池、模型、适用客户端、检测周期和同一 Key；副本默认关闭自动切换，并清空运行时健康状态。
-
-## 本地网关
-
-- 默认端口 `17863`，只绑定 `127.0.0.1`，不会监听局域网地址。
-- Claude、Codex、OpenCode 和 Gemini 使用独立路径槽，不是任意目标的开放代理。
-- 默认请求正文、工具字段、二进制内容和 SSE 响应使用 Node 流式管道原样转发。
-- 入站使用随机本地令牌；网关移除本地认证后，再按当前方案注入真实上游 Key。
-- Codex 使用随机且持久的 URL 路径令牌，本地网关忽略传入凭据并注入当前方案 Key。
-- 路由分配与监听状态分离：关闭网关不会丢失下次启动方案。
-- 真实 Key 的内存缓存只包含当前活动路由，路由切换、停止或退出时会清理。
-- “动态”页显示当前请求与最近 100 条记录，包括首字/首包、Token、模型、推理强度和实时耗时；记录持久保存在本地 `requests.json`，新请求顶掉最旧记录，任何时候都不保存请求正文。
-
-设置中的“Codex 工具兼容模式”是默认关闭的实验功能。它只在 Codex Responses 请求中将 `custom exec` 与标准 `function exec` 双向转换，不能修复上游裁剪上下文，也不会把正文中的伪工具语法当作命令执行。
-
-## 配置保护
+<details>
+<summary>Key Core 如何保护你已有的配置</summary>
+<br>
 
 - JSON/JSONC 使用结构化定点编辑，保留注释、未知字段、插件、Hooks 和权限设置。
-- Codex 只修改接管时活跃 provider 的 `base_url`，不创建 `keydeck_gateway` provider。
-- Codex 的 `model_provider`、`model`、`wire_api`、认证字段和 `auth.json` 均不修改。
-- 不读取或覆盖 Codex `auth.json`、MCP、审批策略、沙箱、features、projects、其他 provider 或未知字段。
+- Codex 只修改接管时活跃 provider 的 `base_url`，不创建新 provider，不碰 `model`、`wire_api`、认证字段和 `auth.json`。
 - 首次接管时捕获字段级基线，并保存一份 DPAPI 加密的完整原文件作为紧急恢复依据。
-- 关闭网关时只恢复这些受管字段，不整文件回滚，因此运行期间新增的 MCP、project、注释和其他设置继续保留。
-- 如果用户主动切走 provider 或本地 URL，Keydeck 视为已解除接管并跳过恢复。
-- 如果客户端仍选择本地网关但受管 URL 被外部修改，Keydeck 会拒绝停止并保持网关运行。
-- 多文件配置写入先预检再原子替换，失败时恢复已写文件；启停、分配和自动切换共用同一生命周期锁。
+- 关闭网关时只恢复这些受管字段，**不做整文件回滚**，运行期间新增的 MCP、project、注释继续保留。
+- 如果你手动把 provider 切走了，Key Core 视为已解除接管并跳过恢复。
+- 多文件写入先预检再原子替换，失败时回滚已写文件。
 
-## 密钥安全
+</details>
 
-方案 Key 使用 Electron `safeStorage` 加密，Windows 下由当前用户的 DPAPI 保护。列表、历史和状态 IPC 不返回明文 Key；复制操作直接由主进程写入系统剪贴板。
+## 安全与隐私
 
-接管前的字段基线和完整文件备份保存在 `gateway-recovery.json`，内容使用 DPAPI 加密。正常关闭只执行字段级恢复；完整文件只作为紧急恢复依据。恢复验证成功后，对应备份会被销毁。
+这是一个处理 API Key 的工具，所以下面每一条都写成**可验证的事实**，而不是承诺：
 
-## 后台与设置
+- **没有服务端、没有账号、没有遥测。** 除了你自己配置的上游地址，Key Core 不向任何服务器发起请求，你可以用抓包工具自行确认。
+- **Key 用 Windows DPAPI 加密**（Electron `safeStorage`，绑定当前 Windows 用户），密文存在 `%APPDATA%\Keydeck\data\profiles.json`。换个用户或换台机器都解不开。
+- **真实 Key 永不写入客户端配置文件。** 客户端里只有 `127.0.0.1` 地址和一个随机本地令牌。列表与状态 IPC 不返回明文 Key；复制操作由主进程直接写入系统剪贴板。
+- **不保存请求正文。** 请求监控只记录时延、Token 计数、模型名等元数据，任何时候都不落盘请求或响应内容。
+- **网关只绑定回环地址**，不监听局域网，且只为四个客户端提供固定路径槽，不是通用代理。
+- **可校验的安装包** — 每个 Release 附带 `SHA256SUMS`，源码完全开放，可自行构建比对。
 
-- 默认关闭 Windows 开机自启，可在设置中开启；开机自启的实例直接驻留托盘，不弹出窗口。
-- 默认关闭窗口后驻留托盘；网关运行时始终驻留，防止请求被意外中断。
-- 可选择是否在 Keydeck 启动时恢复上次启用的网关。
-- 支持跟随系统、浅色和深色主题。
-
-## 开发
-
-需要 Node.js 22 和 pnpm。
-
-```powershell
-pnpm install --frozen-lockfile
-pnpm test
-pnpm build
-pnpm dist
-```
-
-自动测试使用临时目录，不读取或修改真实用户配置。
+> [!IMPORTANT]
+> 你需要自行以合法方式获取上游或中转服务的 API Key，并遵守其服务条款与所在地法律法规。
+> Key Core 只是本地工具，不提供任何 API 服务，也不对你使用的上游服务负责。
 
 ## 数据目录
 
 ```text
 %APPDATA%\Keydeck\data\
+├── profiles.json           方案与 DPAPI 加密的 Key 密文
+├── gateway.json            监听设置、持久化路由与加密本地令牌
+├── gateway-recovery.json   接管前的受管字段基线（DPAPI 加密）
+├── settings.json           自启、托盘、主题与实验功能
+├── requests.json           最近 100 条请求元数据（不含正文）
+└── window-state.json       窗口位置与大小
 ```
 
-- `profiles.json`：方案与 DPAPI Key 密文。
-- `gateway.json`：监听设置、持久化路由和加密本地令牌。
-- `gateway-recovery.json`：DPAPI 加密的接管前受管字段基线。
-- `settings.json`：自启、托盘、主题和实验功能设置。
-- `requests.json`：最近 100 条请求记录摘要（不含请求正文）。
-- `window-state.json`：窗口位置、大小与最大化状态。
-- `backups/`：旧版事务写入的加密回滚快照。
-
-## Windows 产物
-
-执行 `pnpm dist` 后，最终交付文件整理在 `deliverables/`：
-
-```text
-Keydeck-Portable-0.8.0-x64.exe
-Keydeck-Setup-0.8.0-x64.exe
-Keydeck-Setup-0.8.0-x64.exe.blockmap
-Keydeck-0.8.0-source.zip
-latest.yml
-SHA256SUMS-0.8.0.txt
-```
-
-当前构建没有商业代码签名证书，Windows SmartScreen 首次运行可能显示未知发布者。
+卸载后如需彻底清理，删除上面整个目录即可。
 
 ## 自动更新
 
-安装版（NSIS）通过 GitHub Releases 自动更新：设置页可检查更新、后台下载并重启安装。
-安装前会先停止网关并恢复客户端配置，因此更新不会把客户端留在失效的本地地址上。
+安装版通过 GitHub Releases 自动更新：在设置页检查更新、后台下载，重启即可安装。
+**安装前会先停止网关并恢复客户端配置**，因此更新不会把客户端留在失效的本地地址上。
 便携版无法就地替换自身，只提示新版本并引导到下载页。
 
-发布新版本时，Release 必须同时上传 `Keydeck-Setup-<版本>-x64.exe`、`latest.yml` 和
-`.blockmap`；缺少 `latest.yml` 时已安装的客户端无法发现新版本。
+## FAQ
+
+<details>
+<summary><b>Windows 提示“未知发布者”或被杀软拦截？</b></summary>
+<br>
+
+没有购买代码签名证书（一年数千元），所有未签名的 Electron 应用都会这样。
+点击 **更多信息 → 仍要运行**。介意的话请核对 `SHA256SUMS`，或从源码自行构建。
+
+</details>
+
+<details>
+<summary><b>端口 17863 被占用了怎么办？</b></summary>
+<br>
+
+网关会报错并保持关闭。端口目前存在数据目录的 `gateway.json` 里，关闭应用后修改 `port` 字段再启动即可。
+
+</details>
+
+<details>
+<summary><b>切换方案需要重启客户端吗？</b></summary>
+<br>
+
+不需要。网关运行时切换只改内存路由，客户端配置字节不变。
+已经发出的请求继续使用开始时的上游，新请求走新方案。
+
+</details>
+
+<details>
+<summary><b>Key 存在哪里？换电脑怎么迁移？</b></summary>
+<br>
+
+存在 `%APPDATA%\Keydeck\data\profiles.json`，用 DPAPI 加密并**绑定当前 Windows 用户**。
+正因如此，直接把这个文件拷到另一台机器是**解不开的**——换机后需要重新录入 Key。
+
+</details>
+
+<details>
+<summary><b>请求记录会保存我的对话内容吗？</b></summary>
+<br>
+
+不会。只记录时延、Token 数量、模型名等元数据，请求与响应正文任何时候都不落盘。
+
+</details>
+
+<details>
+<summary><b>关闭网关后，客户端配置会变回去吗？</b></summary>
+<br>
+
+会。Key Core 只把首次接管时改动的那几个字段还原回去，其他内容（包括你在此期间新增的 MCP、插件、注释）原样保留。
+如果检测到受管字段被外部修改，会拒绝停止网关，以免覆盖你的改动。
+
+</details>
+
+<details>
+<summary><b>和 one-api / new-api / claude-code-router 有什么不同？</b></summary>
+<br>
+
+那些是**服务端**中转分发平台：要部署、有数据库、面向多用户。
+Key Core 是**桌面单机工具**：不部署、不联网、只服务你自己的几个 CLI 客户端，
+核心价值在于「换方案不用改客户端配置」和「Key 加密不落地」。
+
+</details>
+
+## 开发
+
+需要 Node.js 22 与 pnpm。
 
 ```powershell
-pnpm dist       # 构建并打包，生成 latest.yml
-pnpm release    # 整理 deliverables/ 与校验和
+pnpm install --frozen-lockfile
+pnpm test        # 单元测试（使用临时目录，不读写真实配置）
+pnpm dev         # 开发模式
+pnpm dist        # 打包 Windows 安装版与便携版
+pnpm release     # 整理交付件与校验和
 ```
+
+技术栈：Electron + React + TypeScript。主进程负责全部文件写入与密钥处理，渲染进程没有文件系统权限。
+
+## 致谢
+
+- [Electron](https://www.electronjs.org/) · [electron-builder](https://www.electron.build/) · [electron-updater](https://www.electron.build/auto-update)
+- [Lucide](https://lucide.dev/) 图标
+- 灵感来自社区中各类 LLM 网关与中转管理工具
+
+## License
+
+[MIT](LICENSE)
