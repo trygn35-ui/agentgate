@@ -151,7 +151,7 @@ export interface GatewayStartSettings {
 
 export type AppTheme = "system" | "light" | "dark";
 
-export type AppLanguage = "system" | "zh" | "ja" | "en";
+export type AppLanguage = "system" | "zh" | "zh-TW" | "ja" | "en";
 
 export interface AppSettings {
   launchAtLogin: boolean;

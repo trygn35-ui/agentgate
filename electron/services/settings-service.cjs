@@ -2,7 +2,7 @@ const { z } = require('zod')
 const { SerialExecutor } = require('./storage.cjs')
 
 const THEME_VALUES = ['system', 'light', 'dark']
-const LANGUAGE_VALUES = ['system', 'zh', 'ja', 'en']
+const LANGUAGE_VALUES = ['system', 'zh', 'zh-TW', 'ja', 'en']
 const SILENT_LAUNCH_FLAG = '--silent'
 
 const SettingsSchema = z.object({

@@ -62,10 +62,11 @@ with sync_playwright() as playwright:
     page.goto(URL, wait_until="networkidle")
     page.locator(".hero h1").wait_for()
 
-    # 三语切换：每种语言下导航栏都必须有文字，且 <html lang> 同步
+    # 四语切换：每种语言下导航栏都必须有文字，且 <html lang> 同步
     page.get_by_role("button", name="设置", exact=True).click()
     languages = {}
     for label, expected_lang, nav_first in (
+        ("繁體中文", "zh-TW", "總覽"),
         ("日本語", "ja", "概要"),
         ("English", "en", "OVERVIEW"),
         ("简体中文", "zh", "概览"),

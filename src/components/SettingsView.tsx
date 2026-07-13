@@ -52,7 +52,7 @@ const THEMES: Array<{ value: AppTheme; label: (m: Messages) => string; icon: Rea
   { value: "dark", label: () => "β FIELD", icon: <Moon size={12} /> },
 ];
 
-const LANGUAGES: AppLanguage[] = ["system", "zh", "ja", "en"];
+const LANGUAGES: AppLanguage[] = ["system", "zh", "zh-TW", "ja", "en"];
 
 interface SettingsViewProps {
   settings: AppSettings;

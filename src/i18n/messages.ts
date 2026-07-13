@@ -1,10 +1,13 @@
 /**
- * 中日英三语文案。
+ * 简体中文 / 繁體中文（台灣）/ 日本語 / English 四语文案。
  *
  * 固定不译的技术术语：DIVERGENCE / CACHE HIT / TOKENS / TTFT / TTFB / DPAPI /
  * 协议名 / 客户端名 / 状态码。它们是 SG 仪表读数语言的一部分，也是跨语言的共识符号。
+ *
+ * zh-TW 不是 zh 的字形转换：台湾用语自成一套（閘道 / 用戶端 / 金鑰 / 快取 /
+ * 預設 / 介面 / 協定 / 系統匣 / 檔案），逐条另写。
  */
-export type Locale = "zh" | "ja" | "en";
+export type Locale = "zh" | "zh-TW" | "ja" | "en";
 
 export interface Messages {
   nav: { overview: string; keys: string; stream: string; config: string };
@@ -454,6 +457,234 @@ const zh: Messages = {
     profiles: "方案",
     clients: "客户端",
     preview: "界面预览",
+  },
+};
+
+const zhTW: Messages = {
+  nav: { overview: "總覽", keys: "金鑰", stream: "動態", config: "設定" },
+  gateway: {
+    online: "閘道運行中",
+    offline: "閘道已關閉",
+    syncing: "正在同步",
+    fault: "需要處理",
+    toggleOn: "開啟本機閘道",
+    toggleOff: "關閉本機閘道",
+    recover: "還原設定並關閉本機閘道",
+    hint: "用戶端固定連線本機位址；切換方案不改用戶端設定",
+  },
+  overview: {
+    heroOnline: "閘道運行中",
+    heroOffline: "閘道已關閉",
+    heroStarting: "閘道正在啟動",
+    heroStopping: "閘道正在停止",
+    heroFault: "閘道需要處理",
+    routesBound: "{routes} 條路由生效 · {profiles} 個方案就緒",
+    directToUpstream: "用戶端直連上游 · 開啟右上角開關接管",
+    streaming: "{count} 個請求進行中",
+    idle: "目前閒置",
+    faultHint: "設定被外部修改，請在頂列還原並關閉閘道",
+    divergence: "分歧率",
+    cacheHit: "快取命中",
+    tokens: "用量",
+    awaitingBaseline: "等待基準 · 需 3 個探測樣本",
+    baselineOf: "{current}ms / 基準 {baseline}ms · {profile}",
+    lastHour: "最近 1 小時 · {count} 個請求",
+    todayResets: "今日 · 0 點重置",
+    clients: "用戶端",
+    worldLines: "世界線",
+    clickToJump: "點擊跳線 · 立即生效",
+    unbound: "未接入",
+    noProfileBound: "尚未指派方案",
+    clientNotDetected: "未偵測到用戶端",
+    profileRemoved: "方案已刪除",
+    externalEdit: "偵測到外部修改",
+    current: "目前",
+    noCompatibleProfile: "沒有適用此用戶端的方案",
+    editToEnable: "編輯方案，勾選 {client}",
+    clientDefault: "沿用用戶端",
+  },
+  keys: {
+    title: "金鑰",
+    subtitle: "{count} 個方案 · 拖曳排序",
+    testAll: "檢測全部",
+    create: "新增",
+    active: "使用中",
+    tokens: "累計",
+    cache: "快取率",
+    awaitingSamples: "尚無樣本",
+    statLine: "1 小時 {availability}% · 平均 {latency}",
+    switchTo: "切換至「{name}」",
+    inUseHint: "已在使用中，點擊重新指派全部適用用戶端",
+    testEndpoints: "檢測端點延遲（不影響其他操作）",
+    probe: "實測",
+    probeHint: "實測：送出一則最小訊息，測真實可用性與延遲",
+    expand: "{name} 詳細資料",
+    key: "金鑰",
+    authHeader: "驗證標頭",
+    targets: "適用用戶端",
+    autoSwitch: "自動擇優",
+    autoSwitchOn: "每 2 分鐘依 1 小時可用率擇優",
+    autoSwitchOff: "關閉",
+    lastApplied: "上次切換",
+    never: "從未",
+    discoverModels: "辨識模型",
+    edit: "編輯",
+    duplicate: "複製",
+    delete: "刪除",
+    copyKey: "複製金鑰",
+    models: "個模型",
+    loading: "正在讀取本機設定",
+    loadError: "無法讀取本機資料",
+    retry: "重試",
+    emptyTitle: "還沒有連線方案",
+    emptyHint: "登錄第一個 API 端點和金鑰",
+    limited: "受限",
+    down: "異常",
+    untested: "未測試",
+  },
+  stream: {
+    title: "動態",
+    streaming: "{count} 個請求進行中",
+    idle: "目前閒置",
+    retained: "保留最近 1 小時",
+    all: "全部",
+    live: "活躍",
+    done: "完成",
+    fail: "異常",
+    cache: "快取率",
+    empty: "還沒有請求記錄 · 閘道收到請求後會在這裡即時顯示",
+    noMatch: "沒有符合篩選條件的請求",
+    resolving: "正在解析上游",
+    states: {
+      connect: "連線中",
+      wait: "等待首字",
+      stream: "傳輸中",
+      done: "已完成",
+      fail: "失敗",
+      abort: "已中止",
+      cancel: "已取消",
+    },
+  },
+  config: {
+    title: "設定",
+    launchAtLogin: "開機自動啟動（靜默）",
+    launchAtLoginDesc: "登入 Windows 後自動啟動並直接常駐系統匣，不彈出視窗；手動啟動仍正常顯示",
+    closeToTray: "關閉時常駐系統匣",
+    closeToTrayDesc: "閘道運行時保持背景常駐，關閉閘道後依此設定結束",
+    startGateway: "啟動時還原閘道",
+    startGatewayDesc: "啟動後還原上次的閘道開關狀態",
+    toolBridge: "Codex 工具相容模式（實驗性）",
+    toolBridgeDesc: "只轉換 Responses 的 exec 工具協定，無法修復上游裁切的上下文",
+    update: "軟體更新",
+    updateCurrent: "目前版本 {version}",
+    updateAvailable: "發現新版本 {version}",
+    updateDownloading: "正在下載 {percent}%",
+    updateReady: "新版本 {version} 已就緒，重新啟動即可安裝",
+    updateLatest: "已是最新版本",
+    updateFailed: "檢查更新失敗",
+    checkUpdate: "檢查更新",
+    download: "下載更新",
+    goDownload: "前往下載",
+    installRestart: "重新啟動並安裝",
+    attractorField: "世界線",
+    attractorFieldDesc: "α 紙與墨 · β 分歧率顯示器 · 立即生效",
+    system: "跟隨系統",
+    language: "語言",
+    languageDesc: "介面語言 · 立即生效",
+    security: "真實 Key 由 Windows DPAPI 加密，只在本機交給閘道；用戶端不會儲存上游 Key。方案中的 URL 與 Key 永不寫入用戶端設定檔。",
+  },
+  editor: {
+    createTitle: "新增連線方案",
+    editTitle: "編輯 · {name}",
+    name: "方案名稱",
+    namePlaceholder: "例如：主力中轉",
+    protocol: "API 協定",
+    apiUrl: "API URL",
+    activeUrlHint: "圓點標記使用中的 URL",
+    addUrl: "新增 URL",
+    autoSwitch: "自動擇優",
+    autoSwitchHint: "自動選擇一小時可用率最高的 URL",
+    apiKey: "API Key",
+    keyKeepHint: "留空保留 {hint}",
+    keyPlaceholder: "保留現有金鑰",
+    keyPlaceholderNew: "sk-...",
+    model: "模型 ID",
+    modelsAvailable: "{count} 個可用",
+    discoverModels: "辨識模型",
+    modelEmpty: "還沒有辨識到模型，點擊上方「辨識模型」",
+    modelNoMatch: "沒有相符的模型，點右側箭頭檢視全部",
+    authMode: "驗證方式",
+    targets: "適用用戶端",
+    viaGateway: "可由閘道轉送",
+    incompatible: "協定不相容",
+    toolSearch: "Claude Tool Search",
+    toolSearchDesc: "為非官方網域寫入 ENABLE_TOOL_SEARCH",
+    cancel: "取消",
+    save: "儲存",
+    saving: "正在儲存",
+    saveAndUse: "儲存並使用",
+    setActive: "設為使用中的 URL",
+    removeUrl: "刪除 URL",
+    showKey: "顯示金鑰",
+    hideKey: "隱藏金鑰",
+    notDetected: "未檢測",
+    unavailable: "不可用",
+    close: "關閉",
+  },
+  confirm: {
+    deleteTitle: "刪除「{name}」？",
+    deleteMessage: "指向它的路由也會一併移除。此操作不會修改已寫入用戶端的設定。",
+    deleteConfirm: "刪除",
+    discardTitle: "放棄尚未儲存的修改？",
+    discardMessage: "表單中的變更不會寫入方案。",
+    discardConfirm: "放棄修改",
+    cancel: "取消",
+  },
+  toast: {
+    saved: "已儲存「{name}」",
+    duplicated: "已複製為「{name}」",
+    deleted: "已刪除「{name}」",
+    keyCopied: "「{name}」的金鑰已複製",
+    reordered: "排序已儲存",
+    orderFailed: "目前版本不支援方案排序",
+    gatewayStarted: "本機閘道已啟動，並接管已指派的用戶端",
+    gatewayStopped: "本機閘道已停止",
+    gatewaySkipped: "本機閘道已停止；已略過使用者修改的 {targets}",
+    settingsSaved: "設定已儲存",
+    modelsFound: "已辨識 {count} 個可用模型",
+    noModels: "請求已完成，但沒有辨識到模型",
+    healthDone: "端點檢測完成：{reachable} / {total} 可達",
+    healthAllDone: "全部檢測完成：{reachable} / {total} 個方案可達",
+    probePass: "實測通過 · {model} · 首包 {ttfb} · 總耗時 {total}{usage}",
+    probeFail: "實測失敗{status}{message}",
+    autoSwitched: "已自動切換至 {url}",
+    autoSwitchFailed: "自動檢測失敗",
+    refreshFailed: "{message}，但介面重新整理失敗：{error}",
+    upToDate: "已是最新版本 {version}",
+    updateCheckFailed: "檢查更新失敗",
+    unsupported: "目前版本不支援此功能",
+    assignedRunning: "「{name}」已成為 {targets} 的目前閘道方案",
+    assignedStopped: "「{name}」已設為 {targets} 的下次啟動方案",
+    close: "關閉",
+    undo: "復原",
+  },
+  errors: {
+    profileNotFound: "方案不存在",
+    nameRequired: "請輸入方案名稱",
+    urlInvalid: "請輸入有效的 HTTP(S) API URL",
+    urlCredentials: "API URL 不能包含憑證或片段",
+    urlDuplicate: "API URL 不能重複",
+    urlActiveRequired: "請選擇一個使用中的 URL",
+    keyRequired: "請輸入 API Key",
+    targetRequired: "至少選擇一個適用用戶端",
+    urlAtLeastOne: "至少保留一個 API URL",
+  },
+  window: { minimize: "最小化", maximize: "最大化 / 還原", close: "關閉" },
+  footer: {
+    sealed: "DPAPI 本機加密",
+    profiles: "方案",
+    clients: "用戶端",
+    preview: "介面預覽",
   },
 };
 
@@ -913,20 +1144,24 @@ const en: Messages = {
   },
 };
 
-export const MESSAGES: Record<Locale, Messages> = { zh, ja, en };
+export const MESSAGES: Record<Locale, Messages> = { zh, "zh-TW": zhTW, ja, en };
 
 export const LOCALE_LABELS: Record<Locale, string> = {
   zh: "简体中文",
+  "zh-TW": "繁體中文",
   ja: "日本語",
   en: "English",
 };
 
-/** 从系统语言推断界面语言，无法匹配时回退中文。 */
+/** 台湾 / 香港 / 澳门，以及显式声明 Hant 字集的标签，都走繁体。 */
+const TRADITIONAL = /^zh-(tw|hk|mo)\b|hant/;
+
+/** 从系统语言推断界面语言，无法匹配时回退简体中文。 */
 export function detectLocale(): Locale {
   const languages = typeof navigator === "undefined" ? [] : navigator.languages ?? [navigator.language];
   for (const language of languages) {
     const tag = language.toLowerCase();
-    if (tag.startsWith("zh")) return "zh";
+    if (tag.startsWith("zh")) return TRADITIONAL.test(tag) ? "zh-TW" : "zh";
     if (tag.startsWith("ja")) return "ja";
     if (tag.startsWith("en")) return "en";
   }

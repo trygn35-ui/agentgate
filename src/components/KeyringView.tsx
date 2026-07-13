@@ -35,7 +35,7 @@ const BAR_FILL = {
 const MAX_BARS = 24;
 
 /** 并列项分隔符：中日用顿号，英文用逗号。 */
-const LIST_SEPARATOR: Record<string, string> = { zh: "、", ja: "、", en: ", " };
+const LIST_SEPARATOR: Record<string, string> = { zh: "、", "zh-TW": "、", ja: "、", en: ", " };
 
 /** 24 小时健康时间线：最近样本映射为红黄绿柱状图。 */
 function HealthBars({ endpoint, label }: { endpoint?: ProfileEndpoint; label: string }): ReactElement {

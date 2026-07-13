@@ -59,6 +59,8 @@ describe('SettingsService', () => {
     await service.initialize()
 
     await expect(service.update({ language: 'ja' })).resolves.toMatchObject({ language: 'ja' })
+    // 繁体带地区子标签，容易在某处被当成未知值丢掉
+    await expect(service.update({ language: 'zh-TW' })).resolves.toMatchObject({ language: 'zh-TW' })
     await expect(service.update({ language: 'klingon' })).rejects.toThrow()
   })
 
