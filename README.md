@@ -9,7 +9,7 @@
 换中转不用改客户端配置 · Key 加密不落地 · 请求实时可观测
 
 [![Release](https://img.shields.io/github/v/release/trygn35-ui/keydeck?style=flat-square&color=D97757)](https://github.com/trygn35-ui/keydeck/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/trygn35-ui/keydeck/total?style=flat-square&color=3E9067)](https://github.com/trygn35-ui/keydeck/releases)
+[![Downloads](https://img.shields.io/github/downloads/trygn35-ui/keydeck/total?style=flat-square&color=3E9067&label=downloads&cacheSeconds=3600)](https://github.com/trygn35-ui/keydeck/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-2F78D0?style=flat-square)](#下载与安装)
 [![License](https://img.shields.io/github/license/trygn35-ui/keydeck?style=flat-square)](LICENSE)
 
