@@ -39,8 +39,8 @@ def assert_layout(page, width: int, height: int, name: str) -> dict:
     assert layout["body"] == layout["viewport"]
     assert layout["shell"] == [0, width, height]
     assert layout["topbar"][1] == width
-    assert layout["topbar"][2] == 56
-    assert layout["footer"][1:] == [width, height - 28, height]
+    assert layout["topbar"][2] == 54
+    assert layout["footer"][1:] == [width, height - 24, height]
     page.screenshot(path=str(OUTPUT_DIR / f"{name}.png"), full_page=False)
     return layout
 
@@ -57,10 +57,11 @@ with sync_playwright() as playwright:
     # 概览：hero 标题 + 四张客户端卡片
     page.locator(".hero h1").wait_for()
     assert page.locator(".socket-card").count() == 4
+    assert page.locator(".meter").count() == 1  # DIVERGENCE METER
 
     # 密钥页：三个方案行，展开首行
-    page.get_by_role("button", name="密钥", exact=True).click()
-    page.get_by_role("heading", name="密钥", exact=True).wait_for()
+    page.get_by_role("button", name="KEYS", exact=True).click()
+    page.get_by_role("heading", name="Attractor Fields", exact=True).wait_for()
     assert page.locator(".keyring-row").count() == 3
     page.locator(".keyring-head").first.click()
     page.locator(".keyring-expand.open").wait_for()
@@ -68,25 +69,25 @@ with sync_playwright() as playwright:
     assert page.locator(".keyring-expand.open").count() == 0
 
     # 新建方案弹窗开合
-    page.get_by_role("button", name="新建方案", exact=True).first.click()
+    page.get_by_role("button", name="NEW", exact=True).first.click()
     page.get_by_role("dialog", name="新建方案").wait_for()
     page.keyboard.press("Escape")
-    page.get_by_role("heading", name="密钥", exact=True).wait_for()
+    page.get_by_role("heading", name="Attractor Fields", exact=True).wait_for()
 
     # 动态：实时请求流（活跃请求徽标会并入按钮可访问名，不能精确匹配）
-    page.get_by_role("button", name="动态").click()
-    page.get_by_role("heading", name="动态", exact=True).wait_for()
+    page.get_by_role("button", name="STREAM").click()
+    page.get_by_role("heading", name="Stream", exact=True).wait_for()
     assert page.locator(".request-row").count() == 3
-    page.get_by_role("radio", name="异常", exact=True).click()
+    page.get_by_role("radio", name="FAIL", exact=True).click()
     assert page.locator(".request-row").count() == 1
-    page.get_by_role("radio", name="全部", exact=True).click()
+    page.get_by_role("radio", name="ALL", exact=True).click()
 
     # 设置
-    page.get_by_role("button", name="设置", exact=True).click()
-    page.get_by_role("heading", name="设置", exact=True).wait_for()
+    page.get_by_role("button", name="CONFIG", exact=True).click()
+    page.get_by_role("heading", name="Config", exact=True).wait_for()
     assert page.get_by_text("Codex 工具兼容模式").is_visible()
 
-    page.get_by_role("button", name="概览", exact=True).click()
+    page.get_by_role("button", name="OVERVIEW", exact=True).click()
     layouts = {
         "wide": assert_layout(page, 1280, 800, "overview-1280x800"),
         "compact": assert_layout(page, 1000, 620, "overview-1000x620"),

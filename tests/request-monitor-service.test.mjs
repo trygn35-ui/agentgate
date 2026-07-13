@@ -49,18 +49,30 @@ describe("活动请求监视", () => {
     });
   });
 
-  it("完成记录严格限制为最近 100 条", () => {
-    let now = 10_000;
+  it("按一小时窗口保留完成记录，超时的丢弃", () => {
+    let now = Date.parse("2026-07-13T12:00:00.000Z");
     const monitor = new RequestMonitorService({ now: () => now });
-    for (let index = 0; index < MAX_RECENT_REQUESTS + 5; index += 1) {
+
+    const stale = monitor.start({ profileName: "两小时前" });
+    monitor.end(stale);
+
+    now += 90 * 60_000; // 推进 90 分钟：上一条已超出保留窗口
+    const fresh = monitor.start({ profileName: "刚刚" });
+    monitor.end(fresh);
+
+    const records = monitor.list();
+    expect(records.map((entry) => entry.profileName)).toEqual(["刚刚"]);
+  });
+
+  it("硬上限兜底：极端高频下不超过 MAX_RECENT_REQUESTS", () => {
+    let now = Date.parse("2026-07-13T12:00:00.000Z");
+    const monitor = new RequestMonitorService({ now: () => now });
+    for (let index = 0; index < MAX_RECENT_REQUESTS + 10; index += 1) {
       const id = monitor.start({ profileName: `方案 ${index}` });
-      now += 1;
+      now += 1; // 全部落在同一小时内
       monitor.end(id);
     }
-    const records = monitor.list();
-    expect(records).toHaveLength(MAX_RECENT_REQUESTS);
-    expect(records[0].profileName).toBe("方案 104");
-    expect(records.at(-1).profileName).toBe("方案 5");
+    expect(monitor.list()).toHaveLength(MAX_RECENT_REQUESTS);
   });
 
   it.each([

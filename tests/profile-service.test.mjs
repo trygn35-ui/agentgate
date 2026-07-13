@@ -266,3 +266,37 @@ describe("Token 用量统计", () => {
     expect(profile.tokenCachedTotal).toBe(750);
   });
 });
+
+describe("当日 Token 统计", () => {
+  it("同日累加，跨日归零", async () => {
+    const { profileStore } = createTestStores(root);
+    const profileService = new ProfileService(profileStore, testVault);
+    const created = await profileService.save({
+      name: "当日统计",
+      protocol: "openai-responses",
+      baseUrl: "https://day.example/v1",
+      apiKey: "sk-day-secret",
+      model: "gpt-5-codex",
+      authMode: "bearer",
+      targets: ["codex"],
+    });
+
+    await profileService.addTokenUsage(created.id, { totalTokens: 1_000 });
+    await profileService.addTokenUsage(created.id, { totalTokens: 500 });
+
+    let [profile] = await profileService.list();
+    expect(profile.tokenUsageToday).toBe(1_500);
+    expect(profile.tokenUsageTotal).toBe(1_500);
+
+    // 模拟跨日：把日期键改成昨天，下一次记账应从 0 起算
+    const data = await profileStore.read();
+    data.profiles[0].tokenDayKey = "2020-01-01";
+    await profileStore.write(data);
+
+    await profileService.addTokenUsage(created.id, { totalTokens: 200 });
+
+    [profile] = await profileService.list();
+    expect(profile.tokenUsageToday).toBe(200);
+    expect(profile.tokenUsageTotal).toBe(1_700);
+  });
+});

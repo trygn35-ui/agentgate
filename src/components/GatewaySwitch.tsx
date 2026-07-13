@@ -51,9 +51,14 @@ export function GatewaySwitch({ gateway, busy, onStart, onStop }: GatewaySwitchP
         else onStart();
       }}
     >
-      <i className="gateway-dot"><i /></i>
-      <strong>网关</strong>
-      <span className="gateway-track" aria-hidden="true"><span /></span>
+      <i className="gateway-dot" />
+      <strong>
+        {transitioning
+          ? "SYNCING"
+          : gateway.status === "error"
+            ? "FAULT"
+            : enabled ? "GATEWAY ONLINE" : "GATEWAY OFFLINE"}
+      </strong>
     </button>
   );
 }

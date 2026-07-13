@@ -14,6 +14,7 @@ import type {
 import { DEFAULT_SETTINGS } from "../config";
 
 const now = new Date();
+const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 const minutesAgo = (minutes: number) =>
   new Date(now.getTime() - minutes * 60_000).toISOString();
 const secondsAgo = (seconds: number) =>
@@ -66,6 +67,8 @@ let mockProfiles: Profile[] = [
     tokenUsageTotal: 12_480_000,
     tokenInputTotal: 11_260_000,
     tokenCachedTotal: 10_620_000,
+    tokenDayKey: todayKey,
+    tokenUsageToday: 842_310,
   },
   {
     id: "openai-main",
@@ -90,6 +93,8 @@ let mockProfiles: Profile[] = [
     tokenUsageTotal: 863_200,
     tokenInputTotal: 741_000,
     tokenCachedTotal: 668_000,
+    tokenDayKey: todayKey,
+    tokenUsageToday: 128_940,
   },
   {
     id: "gemini-fast",

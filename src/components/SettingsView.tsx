@@ -45,9 +45,9 @@ function SettingToggle({
 }
 
 const THEMES: Array<{ value: AppTheme; label: string; icon: ReactNode }> = [
-  { value: "system", label: "系统", icon: <SunMoon size={13} /> },
-  { value: "light", label: "浅色", icon: <Sun size={13} /> },
-  { value: "dark", label: "深色", icon: <Moon size={13} /> },
+  { value: "system", label: "SYSTEM", icon: <SunMoon size={12} /> },
+  { value: "light", label: "α FIELD", icon: <Sun size={12} /> },
+  { value: "dark", label: "β FIELD", icon: <Moon size={12} /> },
 ];
 
 interface SettingsViewProps {
@@ -138,7 +138,7 @@ export function SettingsView({
     <main className="page-scroll" aria-label="设置">
       <div className="page-inner narrow">
         <div className="section-head rise">
-          <h1>设置</h1>
+          <h1>Config</h1>
         </div>
         <div className="settings-card rise-1">
           <SettingToggle
@@ -178,8 +178,8 @@ export function SettingsView({
           />
           <div className="settings-theme-row" style={{ borderTop: "1px solid var(--line)" }}>
             <span className="settings-row-copy">
-              <strong>主题</strong>
-              <small>明暗外观立即生效</small>
+              <strong>Attractor Field</strong>
+              <small>α 纸与墨 · β 分歧率显示器 · 立即生效</small>
             </span>
             <div className="theme-segments" role="radiogroup" aria-label="界面主题">
               {THEMES.map((theme) => (

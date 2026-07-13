@@ -2,7 +2,10 @@ const crypto = require('node:crypto')
 const { z } = require('zod')
 
 const MAX_DETECTION_BUFFER_BYTES = 64 * 1024
-const MAX_RECENT_REQUESTS = 100
+/** 保留窗口：按时间而非条数保留，1 小时内的记录都留着，供缓存率等窗口指标计算。 */
+const RETENTION_WINDOW_MS = 60 * 60_000
+/** 硬上限：防止极端高频场景把内存和磁盘撑爆，正常使用远达不到。 */
+const MAX_RECENT_REQUESTS = 2_000
 
 const RequestLogEntrySchema = z.object({
   id: z.string(),
@@ -384,6 +387,7 @@ class RequestMonitorService {
     try {
       const data = await this.store.read()
       this.recent = data.entries.slice(0, MAX_RECENT_REQUESTS)
+      this._prune()
     } catch {
       this.recent = []
     }
@@ -413,6 +417,21 @@ class RequestMonitorService {
     if (!this.store) return
     clearTimeout(this._persistTimer)
     await this._persist()
+  }
+
+  /**
+   * 丢弃保留窗口之外的记录。
+   *
+   * 按时间保留而非条数：缓存率等窗口指标需要完整的一小时样本，固定条数会在高频
+   * 场景下把窗口截短。硬上限只在极端流量下兜底。
+   */
+  _prune() {
+    const cutoff = this.now() - RETENTION_WINDOW_MS
+    this.recent = this.recent.filter((entry) => {
+      const completedAt = Date.parse(entry.completedAt || entry.startedAt)
+      return !Number.isFinite(completedAt) || completedAt >= cutoff
+    })
+    if (this.recent.length > MAX_RECENT_REQUESTS) this.recent.length = MAX_RECENT_REQUESTS
   }
 
   setOnChange(onChange) {
@@ -559,7 +578,7 @@ class RequestMonitorService {
     entry.usageBuffer = ''
     delete entry.lastProgressNotifyAt
     this.recent.unshift(entry)
-    if (this.recent.length > MAX_RECENT_REQUESTS) this.recent.length = MAX_RECENT_REQUESTS
+    this._prune()
     if (typeof this.onRequestEnded === 'function') {
       try {
         this.onRequestEnded(toPublicRequest(entry))

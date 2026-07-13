@@ -1,14 +1,24 @@
-import { ArrowRight, ChevronsUpDown } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { CLIENT_META, CLIENT_TARGET_ORDER, PROTOCOL_META } from "../config";
+import {
+  computeDivergence,
+  formatDivergence,
+  formatRate,
+  formatTokenTotal,
+  recentCacheRate,
+  todayTokenTotal,
+} from "../lib/divergence";
 import type {
+  ActiveRequest,
   ClientStatus,
   ClientTarget,
   GatewayState,
   HealthState,
   Profile,
 } from "../types";
+import { NixieTubes } from "./NixieTubes";
 
 const HEALTH_DOT: Record<HealthState, string> = {
   healthy: "dot-good",
@@ -21,6 +31,8 @@ interface OverviewViewProps {
   profiles: Profile[];
   clients: ClientStatus[];
   gateway: GatewayState;
+  /** 最近一小时的请求记录，用于窗口指标。 */
+  requests: ActiveRequest[];
   activeRequestCount: number;
   busy: boolean;
   onApply: (id: string, target: ClientTarget) => void;
@@ -29,21 +41,23 @@ interface OverviewViewProps {
 
 function healthTag(profile: Profile): { text: string; className: string } {
   const status = profile.health?.status ?? "unknown";
-  if (status === "healthy") return { text: `${profile.health?.latencyMs ?? 0} ms`, className: "tint-good" };
-  if (status === "limited") return { text: "受限", className: "tint-warn" };
-  if (status === "unhealthy") return { text: "异常", className: "tint-bad" };
-  return { text: "", className: "tint-quiet" };
+  if (status === "healthy") return { text: `${profile.health?.latencyMs ?? 0} ms`, className: "tier-good" };
+  if (status === "limited") return { text: "LIMITED", className: "tier-warn" };
+  if (status === "unhealthy") return { text: "DOWN", className: "tier-bad" };
+  return { text: "", className: "tier-quiet" };
 }
 
 /**
- * 概览页：网关状态标题与四张客户端卡片。
+ * 概览页：DIVERGENCE METER 与客户端铭牌。
  *
- * 点击客户端卡片弹出适配方案菜单，选择后立即切换该客户端的网关路由。
+ * 仪表三格各司其职：左边告诉你「该不该换线路」（分歧率），中间「省不省钱」
+ * （缓存率），右边「用了多少」（累计 Token）。
  */
 export function OverviewView({
   profiles,
   clients,
   gateway,
+  requests,
   activeRequestCount,
   busy,
   onApply,
@@ -72,24 +86,28 @@ export function OverviewView({
     onApply(profileId, target);
     setFlashTarget(target);
     window.clearTimeout(flashTimer.current);
-    flashTimer.current = window.setTimeout(() => setFlashTarget(undefined), 600);
+    flashTimer.current = window.setTimeout(() => setFlashTarget(undefined), 500);
   }
 
   const routeCount = gateway.routes
     .filter((route) => profiles.some((profile) => profile.id === route.profileId))
     .length;
+  const divergence = computeDivergence(profiles, gateway);
+  const cacheRate = recentCacheRate(requests);
+  const tokenToday = todayTokenTotal(profiles);
+
   const heroTitle = gateway.status === "starting"
-    ? "网关正在启动"
+    ? "Gateway Starting"
     : gateway.status === "stopping"
-      ? "网关正在停止"
+      ? "Gateway Stopping"
       : gateway.status === "error"
-        ? "网关需要处理"
-        : gatewayOn ? "网关运行中" : "网关已关闭";
+        ? "Gateway Fault"
+        : gatewayOn ? "Gateway Online" : "Gateway Offline";
   const heroSub = gateway.status === "error"
     ? gateway.error ?? "配置被外部修改，请在顶栏恢复并关闭网关"
     : gatewayOn
-      ? `${routeCount} 条路由生效 · ${profiles.length} 个方案就绪`
-      : "客户端暂时直连上游 · 打开右上角开关恢复接管";
+      ? `${routeCount} ROUTES BOUND · ${profiles.length} PROFILES READY`
+      : "CLIENTS DIRECT TO UPSTREAM · TOGGLE GATEWAY TO BIND";
 
   return (
     <main className="page-scroll" aria-label="概览">
@@ -112,17 +130,59 @@ export function OverviewView({
               onClick={onGoActivity}
             >
               <i />
-              {activeRequestCount > 0 ? `${activeRequestCount} 个活跃请求` : "当前空闲"}
-              <ArrowRight size={12} />
+              {activeRequestCount > 0 ? `${activeRequestCount} STREAMING` : "IDLE"}
+              <ArrowRight size={11} />
             </button>
           </p>
         </section>
 
-        <section aria-label="客户端" className="rise-1" style={{ marginTop: 28 }}>
+        <section className="meter rise-1" aria-label="指标">
+          <div className="meter-cell">
+            <div className="meter-label">D I V E R G E N C E</div>
+            <NixieTubes
+              value={divergence ? formatDivergence(divergence.ratio) : undefined}
+              tier={divergence?.tier}
+              label={divergence
+                ? `分歧率 ${formatDivergence(divergence.ratio)}，当前 ${divergence.currentMs} 毫秒，基准 ${divergence.baselineMs} 毫秒`
+                : "分歧率无数据，等待基准样本"}
+            />
+            <div
+              className={`meter-sub ${divergence?.tier === "critical"
+                ? "tier-bad"
+                : divergence?.tier === "diverging" ? "tier-warn" : ""}`}
+            >
+              {divergence
+                ? `${divergence.currentMs}ms / ${divergence.baselineMs}ms BASELINE · ${divergence.profileName}`
+                : gatewayOn ? "AWAITING BASELINE · 需 3 个探测样本" : "GATEWAY OFFLINE"}
+            </div>
+          </div>
+
+          <div className="meter-divider" />
+
+          <div className="meter-cell">
+            <div className="meter-label">C A C H E &nbsp; H I T</div>
+            <div className={`meter-plain ${cacheRate === undefined ? "dim" : ""}`}>
+              {formatRate(cacheRate)}
+            </div>
+            <div className="meter-sub">LAST HOUR · {requests.length} REQUESTS</div>
+          </div>
+
+          <div className="meter-divider" />
+
+          <div className="meter-cell">
+            <div className="meter-label">T O K E N S</div>
+            <div className={`meter-plain ${tokenToday === 0 ? "dim" : ""}`}>
+              {formatTokenTotal(tokenToday)}
+            </div>
+            <div className="meter-sub">TODAY · RESETS AT 00:00</div>
+          </div>
+        </section>
+
+        <section aria-label="客户端" className="rise-2" style={{ marginTop: 22 }}>
           <div className="section-head">
             <span className="kicker">CLIENTS</span>
-            <h2>客户端</h2>
-            <span className="head-hint">点击卡片换方案，立即生效</span>
+            <h2>World Lines</h2>
+            <span className="head-hint">CLICK TO JUMP · INSTANT</span>
           </div>
           <div className="socket-grid">
             {CLIENT_TARGET_ORDER.map((target, index) => {
@@ -144,32 +204,32 @@ export function OverviewView({
                 ? gatewayOn ? HEALTH_DOT[profile.health?.status ?? "unknown"] : "dot-warn"
                 : "dot-unknown";
               const detail = client?.drifted
-                ? "检测到外部修改"
+                ? "EXTERNAL EDIT DETECTED"
                 : profile
                   ? profile.baseUrl.replace(/^https?:\/\//, "")
                   : route
-                    ? "方案已删除"
+                    ? "PROFILE REMOVED"
                     : client && !client.installed
-                      ? "未检测到客户端"
-                      : "在密钥页分配方案";
+                      ? "CLIENT NOT DETECTED"
+                      : "NO PROFILE BOUND";
               return (
                 <div className="socket-cell" key={target}>
                   <button
                     type="button"
                     className={cardClass}
-                    style={{ animationDelay: `${90 + index * 55}ms` }}
+                    style={{ animationDelay: `${80 + index * 45}ms` }}
                     aria-label={`为 ${CLIENT_META[target].label} 选择方案`}
                     aria-expanded={open}
                     onClick={() => setPickerFor(open ? undefined : target)}
                   >
+                    <span className="socket-no">{String(index + 1).padStart(2, "0")}</span>
                     <span className="socket-title">
-                      <strong>{CLIENT_META[target].label}</strong>
-                      <ChevronsUpDown size={13} />
+                      <strong>{CLIENT_META[target].label.toUpperCase()}</strong>
                     </span>
                     <span className="socket-profile">
                       <span className="socket-profile-line">
-                        <i className={`socket-dot ${dotClass} ${profile && gatewayOn ? "pulse" : ""}`} />
-                        <strong>{profile?.name ?? route?.profileName ?? "未接入"}</strong>
+                        <i className={`socket-dot ${dotClass}`} />
+                        <strong>{profile?.name ?? route?.profileName ?? "UNBOUND"}</strong>
                       </span>
                       <code className={`socket-detail ${client?.drifted ? "warn" : ""}`} title={detail}>
                         {detail}
@@ -180,7 +240,9 @@ export function OverviewView({
                     <div className="picker-menu" role="menu" aria-label="选择方案">
                       {options.length > 0 ? options.map((option) => {
                         const current = route?.profileId === option.id;
-                        const tag = current ? { text: "当前", className: "tint-accent" } : healthTag(option);
+                        const tag = current
+                          ? { text: "CURRENT", className: "tier-orange" }
+                          : healthTag(option);
                         return (
                           <button
                             type="button"
@@ -194,7 +256,7 @@ export function OverviewView({
                             <span style={{ minWidth: 0 }}>
                               <strong>{option.name}</strong>
                               <code>
-                                {PROTOCOL_META[option.protocol].short} · {option.model || "沿用客户端"}
+                                {PROTOCOL_META[option.protocol].short.toUpperCase()} · {option.model || "CLIENT DEFAULT"}
                               </code>
                             </span>
                             <small className={tag.className}>{tag.text}</small>
@@ -217,7 +279,6 @@ export function OverviewView({
             })}
           </div>
         </section>
-
       </div>
     </main>
   );

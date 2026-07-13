@@ -54,6 +54,12 @@ function appendHealthTimeline(history, health, now = Date.now()) {
     .slice(-MAX_HEALTH_TIMELINE)
 }
 
+/** 本地日期键（YYYY-MM-DD）：当日用量以用户本地 0 点为界重置。 */
+function localDateKey(now = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+}
+
 function profileId(value) {
   const result = ProfileIdSchema.safeParse(value)
   if (!result.success) throw new Error(validationMessage(result.error))
@@ -681,11 +687,16 @@ class ProfileService {
       const index = data.profiles.findIndex((profile) => profile.id === idResult.data)
       if (index === -1) return
       const current = data.profiles[index]
+      // 当日用量按本地日期归零：跨过 0 点后第一次记账时重新计数。
+      const today = localDateKey()
+      const sameDay = current.tokenDayKey === today
       data.profiles[index] = {
         ...current,
         tokenUsageTotal: Math.round((current.tokenUsageTotal || 0) + total),
         tokenInputTotal: Math.round((current.tokenInputTotal || 0) + input),
         tokenCachedTotal: Math.round((current.tokenCachedTotal || 0) + cached),
+        tokenDayKey: today,
+        tokenUsageToday: Math.round((sameDay ? current.tokenUsageToday || 0 : 0) + total),
       }
       await this.store.write(data)
     })
@@ -716,6 +727,7 @@ class ProfileService {
 
 module.exports = {
   HEALTH_HISTORY_WINDOW_MS,
+  localDateKey,
   HEALTH_TIMELINE_WINDOW_MS,
   MAX_HEALTH_HISTORY,
   MAX_HEALTH_TIMELINE,

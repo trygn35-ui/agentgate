@@ -23,23 +23,23 @@ with sync_playwright() as playwright:
         page.screenshot(path=str(OUTPUT_DIR / f"{name}.png"))
         print("shot", name)
 
-    for theme, suffix in (("深色", "-dark"), ("浅色", "")):
-        page.get_by_role("button", name="设置", exact=True).click()
+    for theme, suffix in (("β FIELD", "-dark"), ("α FIELD", "")):
+        page.get_by_role("button", name="CONFIG", exact=True).click()
         page.get_by_role("radio", name=theme, exact=True).click()
         page.wait_for_timeout(4600)  # 等「设置已保存」提示条自动消失
 
-        page.get_by_role("button", name="概览", exact=True).click()
+        page.get_by_role("button", name="OVERVIEW", exact=True).click()
         shoot(f"overview{suffix}")
 
-        page.get_by_role("button", name="密钥", exact=True).click()
+        page.get_by_role("button", name="KEYS", exact=True).click()
         page.locator(".keyring-head").first.click()
         shoot(f"keyring{suffix}")
         page.keyboard.press("Escape")
 
-        page.get_by_role("button", name="动态").click()
+        page.get_by_role("button", name="STREAM").click()
         shoot(f"activity{suffix}")
 
-        page.get_by_role("button", name="设置", exact=True).click()
+        page.get_by_role("button", name="CONFIG", exact=True).click()
         shoot(f"settings{suffix}")
 
     browser.close()

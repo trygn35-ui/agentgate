@@ -81,9 +81,9 @@ function HealthBars({ endpoint }: { endpoint?: ProfileEndpoint }): ReactElement 
 function healthSummary(profile: Profile): { label: string; className: string } {
   const status = profile.health?.status ?? "unknown";
   if (status === "healthy") return { label: `${profile.health?.latencyMs ?? 0} ms`, className: "good" };
-  if (status === "limited") return { label: "受限", className: "warn" };
-  if (status === "unhealthy") return { label: "异常", className: "bad" };
-  return { label: "未测试", className: "unknown" };
+  if (status === "limited") return { label: "LIMITED", className: "warn" };
+  if (status === "unhealthy") return { label: "DOWN", className: "bad" };
+  return { label: "———", className: "unknown" };
 }
 
 function endpointDot(endpoint: ProfileEndpoint): string {
@@ -94,21 +94,21 @@ function endpointDot(endpoint: ProfileEndpoint): string {
   return "dot-unknown";
 }
 
-/** 累计平均缓存率：累计缓存命中 ÷ 累计输入。 */
+/** 累计平均缓存率：累计缓存命中 ÷ 累计输入，返回 0–1 的比值。 */
 function cumulativeCacheRate(profile: Profile): number | undefined {
   const input = profile.tokenInputTotal;
   const cached = profile.tokenCachedTotal;
   if (!input || cached === undefined || !Number.isFinite(input) || !Number.isFinite(cached)) {
     return undefined;
   }
-  return Math.min(100, (cached / input) * 100);
+  return Math.min(1, cached / input);
 }
 
 function endpointLatency(endpoint: ProfileEndpoint): string {
   if (endpoint.health?.status === "healthy" || endpoint.health?.status === "limited") {
     return `${endpoint.health.latencyMs ?? 0} ms`;
   }
-  return endpoint.health ? "不可用" : "未检测";
+  return endpoint.health ? "DOWN" : "———";
 }
 
 interface KeyringViewProps {
@@ -207,8 +207,8 @@ export function KeyringView({
     <main className="page-scroll" aria-label="密钥">
       <div className="page-inner">
         <div className="section-head rise">
-          <h1>密钥</h1>
-          <span className="head-note">{profiles.length} 个方案 · 点击行展开 · 拖动排序</span>
+          <h1>Attractor Fields</h1>
+          <span className="head-note">{profiles.length} PROFILES · DRAG TO REORDER</span>
           <button
             type="button"
             className="ghost-pill"
@@ -220,7 +220,7 @@ export function KeyringView({
             {testingIds.size > 0
               ? <LoaderCircle size={13} className="spin" />
               : <Gauge size={13} />}
-            检测全部
+            TEST ALL
           </button>
           <button
             type="button"
@@ -229,7 +229,7 @@ export function KeyringView({
             disabled={Boolean(busy)}
             onClick={onCreate}
           >
-            <Plus size={14} />新建方案
+            <Plus size={13} />NEW
           </button>
         </div>
 
@@ -253,7 +253,7 @@ export function KeyringView({
             <h2>还没有连接方案</h2>
             <p>录入第一个 API 端点和密钥。</p>
             <button type="button" className="primary-pill" onClick={onCreate}>
-              <Plus size={14} />新建方案
+              <Plus size={13} />NEW
             </button>
           </div>
         ) : (
@@ -312,18 +312,18 @@ export function KeyringView({
                     onClick={() => setExpandedId(expanded ? undefined : profile.id)}
                     onKeyDown={(event) => handleHeadKey(event, profile.id)}
                   >
-                    <span className={`keyring-glyph ${tone}`}><KeyRound size={16} /></span>
+                    <span className={`keyring-glyph ${inUse ? "on" : ""}`}>
+                      {String(index + 1).padStart(2, "0")}
+                    </span>
                     <span className="keyring-name">
                       <span className="keyring-name-line">
                         <strong>{profile.name}</strong>
                         {inUse && (
-                          <small className={`tag-inuse ${gatewayOn ? "pulse" : ""}`}>
-                            <i />使用中
-                          </small>
+                          <small className={`tag-inuse ${gatewayOn ? "pulse" : ""}`}>ACTIVE</small>
                         )}
                       </span>
                       <code className="keyring-meta">
-                        {PROTOCOL_META[profile.protocol].short} · {profile.baseUrl.replace(/^https?:\/\//, "")} · {profile.keyHint}
+                        {PROTOCOL_META[profile.protocol].short.toUpperCase()} · {profile.baseUrl.replace(/^https?:\/\//, "")} · {profile.keyHint}
                       </code>
                       <span className="keyring-targets" aria-hidden="true">
                         {profile.targets.map((target) => (
@@ -337,23 +337,23 @@ export function KeyringView({
                     </span>
                     <span className="keyring-usage" title="该密钥经网关转发累计消耗的 Token">
                       <code>{formatTokenCount(profile.tokenUsageTotal ?? 0)}</code>
-                      <small>累计 Token</small>
+                      <small>TOKENS</small>
                     </span>
                     <span className="keyring-usage" title="累计缓存命中 Token 占累计输入的比例">
                       <code className={cacheRateTier(cumulativeCacheRate(profile))}>
                         {cumulativeCacheRate(profile) === undefined
-                          ? "--"
-                          : `${cumulativeCacheRate(profile)?.toFixed(1)}%`}
+                          ? "———"
+                          : cumulativeCacheRate(profile)?.toFixed(3)}
                       </code>
-                      <small>平均缓存率</small>
+                      <small>CACHE</small>
                     </span>
                     <HealthBars endpoint={activeEndpoint} />
                     <span className="keyring-stat">
                       <strong className={summary.className}>{summary.label}</strong>
                       <small>
                         {metrics.sampleCount > 0
-                          ? `1h ${metrics.availability ?? 0}% · 平均 ${metrics.averageLatencyMs === undefined ? "--" : `${metrics.averageLatencyMs} ms`}`
-                          : "尚无检测样本"}
+                          ? `1H ${metrics.availability ?? 0}% · AVG ${metrics.averageLatencyMs === undefined ? "———" : `${metrics.averageLatencyMs}ms`}`
+                          : "AWAITING SAMPLES"}
                       </small>
                     </span>
                     <span className="keyring-tools">

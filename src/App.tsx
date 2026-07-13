@@ -21,10 +21,10 @@ interface EditorState {
 }
 
 const NAV_ITEMS: Array<{ view: View; label: string; icon: ReactElement }> = [
-  { view: "overview", label: "概览", icon: <LayoutDashboard size={15} /> },
-  { view: "keyring", label: "密钥", icon: <KeyRound size={15} /> },
-  { view: "activity", label: "动态", icon: <Activity size={15} /> },
-  { view: "settings", label: "设置", icon: <Settings size={15} /> },
+  { view: "overview", label: "OVERVIEW", icon: <LayoutDashboard size={13} /> },
+  { view: "keyring", label: "KEYS", icon: <KeyRound size={13} /> },
+  { view: "activity", label: "STREAM", icon: <Activity size={13} /> },
+  { view: "settings", label: "CONFIG", icon: <Settings size={13} /> },
 ];
 
 function isContextMenuTargetInteractive(target: EventTarget | null): boolean {
@@ -122,14 +122,14 @@ function App(): ReactElement {
   }
 
   const statusText = gateway.status === "starting"
-    ? `网关正在启动 · 127.0.0.1:${gateway.port}`
+    ? `GATEWAY STARTING · 127.0.0.1:${gateway.port}`
     : gateway.status === "stopping"
-      ? `网关正在停止 · 127.0.0.1:${gateway.port}`
+      ? `GATEWAY STOPPING · 127.0.0.1:${gateway.port}`
       : gateway.status === "error"
-        ? `网关需要处理${gateway.error ? ` · ${gateway.error}` : ""}`
+        ? `GATEWAY FAULT${gateway.error ? ` · ${gateway.error}` : ""}`
         : gatewayOn
-          ? `网关运行中 · ${routeCount} 条路由 · 127.0.0.1:${gateway.port}`
-          : `网关已关闭 · 127.0.0.1:${gateway.port}`;
+          ? `GATEWAY ONLINE · ${routeCount} ROUTES · 127.0.0.1:${gateway.port}`
+          : `GATEWAY OFFLINE · 127.0.0.1:${gateway.port}`;
   const statusDot = gateway.status === "error"
     ? "var(--bad)"
     : gateway.status === "running"
@@ -141,6 +141,7 @@ function App(): ReactElement {
       <header className="topbar">
         <div className="brand-mark" aria-label="Agent;Gate">
           <strong>Agent;<span className="brand-g">G</span>ate</strong>
+          <span className="brand-rule" aria-hidden="true" />
         </div>
         <nav className="top-nav" aria-label="功能导航">
           {NAV_ITEMS.map((item) => (
@@ -205,6 +206,7 @@ function App(): ReactElement {
           profiles={controller.data.profiles}
           clients={controller.data.clients}
           gateway={gateway}
+          requests={requestRecords}
           activeRequestCount={activeRequests.length}
           busy={Boolean(controller.busy)}
           onApply={(id, target) => void controller.applyProfile(id, [target])}
@@ -250,10 +252,10 @@ function App(): ReactElement {
 
       <footer className="status-footer" aria-live="polite">
         <span><i className="status-dot" style={{ background: statusDot }} />{statusText}</span>
-        <span><ShieldCheck size={12} />DPAPI 本机加密</span>
+        <span><ShieldCheck size={12} />DPAPI SEALED</span>
         <span className="footer-right">
-          {controller.data.profiles.length} 方案 / 4 客户端 · Agent;Gate {APP_VERSION}
-          {!isDesktop && " · 界面预览"}
+          {controller.data.profiles.length} PROFILES / 4 CLIENTS · Agent;Gate {APP_VERSION}
+          {!isDesktop && " · PREVIEW"}
         </span>
       </footer>
 

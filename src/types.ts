@@ -63,6 +63,10 @@ export interface Profile {
   tokenInputTotal?: number;
   /** 累计缓存命中 Token。 */
   tokenCachedTotal?: number;
+  /** 当日用量所属的本地日期（YYYY-MM-DD）；跨日后重新计数。 */
+  tokenDayKey?: string;
+  /** 当日累计 Token，本地 0 点重置。 */
+  tokenUsageToday?: number;
 }
 
 export interface SaveProfileInput {

@@ -28,21 +28,21 @@ interface RequestMeta {
 }
 
 const REQUEST_META: Record<ActiveRequest["state"], RequestMeta> = {
-  connecting: { label: "连接中", tint: "tint-accent", icon: "loader", spin: true },
-  "waiting-first-token": { label: "等待首字", tint: "tint-accent", icon: "loader", spin: true },
-  streaming: { label: "流式传输", tint: "tint-good", icon: "dot", breathe: true },
-  completed: { label: "已完成", tint: "tint-good", icon: "check" },
-  failed: { label: "失败", tint: "tint-bad", icon: "alert" },
-  aborted: { label: "已中止", tint: "tint-warn", icon: "dot" },
-  cancelled: { label: "已取消", tint: "tint-warn", icon: "dot" },
+  connecting: { label: "CONNECT", tint: "tint-accent", icon: "loader", spin: true },
+  "waiting-first-token": { label: "WAIT", tint: "tint-accent", icon: "loader", spin: true },
+  streaming: { label: "STREAM", tint: "tint-good", icon: "dot", breathe: true },
+  completed: { label: "DONE", tint: "tint-good", icon: "check" },
+  failed: { label: "FAIL", tint: "tint-bad", icon: "alert" },
+  aborted: { label: "ABORT", tint: "tint-warn", icon: "dot" },
+  cancelled: { label: "CANCEL", tint: "tint-warn", icon: "dot" },
 };
 
 const REASONING_LABEL: Record<string, string> = {
-  minimal: "最少",
-  low: "低",
-  medium: "中",
-  high: "高",
-  xhigh: "极高",
+  minimal: "MIN",
+  low: "LOW",
+  medium: "MED",
+  high: "HIGH",
+  xhigh: "MAX",
 };
 
 function clientLabel(client: ActiveRequest["client"]): string {
@@ -129,18 +129,18 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
     <main className="page-scroll" aria-label="动态">
       <div className="page-inner">
         <div className="section-head rise" style={{ alignItems: "center" }}>
-          <h1>动态</h1>
+          <h1>Stream</h1>
           <span className="head-note">
-            {activeCount > 0 ? `${activeCount} 个活跃请求` : "当前空闲"} · 保留最近 100 条
+{activeCount > 0 ? `${activeCount} STREAMING` : "IDLE"} · LAST 100 RETAINED
           </span>
           <span style={{ marginLeft: "auto" }} />
           {(
             <div className="req-filters" role="radiogroup" aria-label="请求筛选">
               {([
-                ["all", "全部"],
-                ["active", "活跃"],
-                ["completed", "完成"],
-                ["failed", "异常"],
+                ["all", "ALL"],
+                ["active", "LIVE"],
+                ["completed", "DONE"],
+                ["failed", "FAIL"],
               ] as Array<[RequestFilter, string]>).map(([value, label]) => (
                 <button
                   type="button"
@@ -167,12 +167,12 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
                   : undefined
               );
               const firstLatency = request.firstTokenLatencyMs ?? request.firstByteLatencyMs;
-              const firstLabel = request.firstTokenLatencyMs !== undefined ? "首字" : "首包";
+              const firstLabel = request.firstTokenLatencyMs !== undefined ? "TTFT" : "TTFB";
               const reasoning = request.reasoningEffort
                 ? REASONING_LABEL[request.reasoningEffort.toLocaleLowerCase()] ?? request.reasoningEffort
-                : "默认";
-              const subline = `推理 ${reasoning}`
-                + (request.streaming === true ? " · 流式" : request.streaming === false ? " · 非流式" : "");
+                : "DEFAULT";
+              const subline = reasoning
+                + (request.streaming === true ? " · STREAM" : request.streaming === false ? " · SYNC" : "");
               const tokens = request.tokenUsage;
               const rate = cacheRate(request);
               return (
@@ -195,21 +195,23 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
                       </small>
                     </span>
                     <code className="request-sub" title={request.upstreamUrl}>
-                      {formatClock(request.startedAt)} · {request.upstreamUrl || "正在解析上游"}
+                      {formatClock(request.startedAt)} · {request.upstreamUrl || "RESOLVING"}
                     </code>
                   </span>
                   <span className="request-model">
-                    <code title={request.model}>{request.model || "未提供"}</code>
+                    <code title={request.model}>{request.model || "———"}</code>
                     <small>{subline}</small>
                   </span>
                   <span className="request-tokens">
                     <code className="tok-in" title="输入 Token">↓{formatTokenCount(tokens?.inputTokens)}</code>
                     <code className="tok-out" title="输出 Token">↑{formatTokenCount(tokens?.outputTokens)}</code>
-                    <small>缓存 {formatTokenCount(tokens?.cachedTokens)} · 推理 {formatTokenCount(tokens?.reasoningTokens)}</small>
+                    <small>CACHED {formatTokenCount(tokens?.cachedTokens)}</small>
                   </span>
                   <span className="cache-rate" title="缓存命中 Token 占输入的比例">
-                    <code className={cacheRateTier(rate)}>{rate === undefined ? "--" : `${rate.toFixed(1)}%`}</code>
-                    <small>缓存率</small>
+                    <code className={cacheRateTier(rate)}>
+                      {rate === undefined ? "———" : (rate / 100).toFixed(3)}
+                    </code>
+                    <small>CACHE</small>
                   </span>
                   <span className="request-timing">
                     <code>{formatDuration(elapsed)}</code>
@@ -222,8 +224,8 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
           {visibleRequests.length === 0 && (
             <p className="feed-empty">
               {requests.length === 0
-                ? "还没有请求记录。网关收到请求后会在这里即时显示，并保留最近 100 条。"
-                : "没有符合筛选条件的请求。"}
+                ? "NO REQUESTS YET · 网关收到请求后会在这里即时显示"
+                : "NO MATCHING REQUESTS"}
             </p>
           )}
         </div>
