@@ -679,9 +679,13 @@ class ProfileService {
     const positive = (value) => (Number.isFinite(value) && value > 0 ? value : 0)
     const total = positive(usage?.totalTokens)
       || positive(usage?.inputTokens) + positive(usage?.outputTokens)
+    // usage 已在 request-monitor 里归一化：inputTokens 含缓存读写，三家口径一致
     const input = positive(usage?.inputTokens)
     const cached = positive(usage?.cachedTokens)
-    if (!idResult.success || total + input + cached <= 0) return
+    const cacheWrite = positive(usage?.cacheWriteTokens)
+    // reasoning 本来就含在 output 里，只单独统计用于显示，绝不再加进 total
+    const reasoning = positive(usage?.reasoningTokens)
+    if (!idResult.success || total + input + cached + cacheWrite <= 0) return
     return this.serial.run(async () => {
       const data = await this.store.read()
       const index = data.profiles.findIndex((profile) => profile.id === idResult.data)
@@ -695,6 +699,8 @@ class ProfileService {
         tokenUsageTotal: Math.round((current.tokenUsageTotal || 0) + total),
         tokenInputTotal: Math.round((current.tokenInputTotal || 0) + input),
         tokenCachedTotal: Math.round((current.tokenCachedTotal || 0) + cached),
+        tokenCacheWriteTotal: Math.round((current.tokenCacheWriteTotal || 0) + cacheWrite),
+        tokenReasoningTotal: Math.round((current.tokenReasoningTotal || 0) + reasoning),
         tokenDayKey: today,
         tokenUsageToday: Math.round((sameDay ? current.tokenUsageToday || 0 : 0) + total),
       }

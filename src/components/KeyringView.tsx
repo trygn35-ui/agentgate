@@ -108,7 +108,8 @@ function cumulativeCacheRate(profile: Profile): number | undefined {
   if (!input || cached === undefined || !Number.isFinite(input) || !Number.isFinite(cached)) {
     return undefined;
   }
-  return Math.min(1, cached / input);
+  // 分母已归一化成「含缓存读写的全部提示 token」，比值天然 ≤ 1，不必再夹
+  return cached / input;
 }
 
 function endpointLatency(endpoint: ProfileEndpoint, m: Messages): string {
@@ -477,6 +478,38 @@ export function KeyringView({
                                 </span>
                               ))}
                             </dd>
+                            {/*
+                              Token 拆解。READ 是缓存命中（便宜），WRITE 是缓存写入
+                              （1.25× 计费）；REASONING 已含在输出里，单列只为看清钱花在哪。
+                            */}
+                            {(profile.tokenInputTotal || profile.tokenUsageTotal) ? (
+                              <>
+                                <dt>{m.keys.breakdown}</dt>
+                                <dd>
+                                  IN {formatTokenCount(profile.tokenInputTotal ?? 0)}
+                                  {" · "}
+                                  <span className="tier-good">
+                                    READ {formatTokenCount(profile.tokenCachedTotal ?? 0)}
+                                  </span>
+                                  {profile.tokenCacheWriteTotal ? (
+                                    <>
+                                      {" · "}
+                                      <span className="tier-warn">
+                                        WRITE {formatTokenCount(profile.tokenCacheWriteTotal)}
+                                      </span>
+                                    </>
+                                  ) : null}
+                                  {profile.tokenReasoningTotal ? (
+                                    <>
+                                      {" · "}
+                                      <span className="tier-info">
+                                        REASONING {formatTokenCount(profile.tokenReasoningTotal)}
+                                      </span>
+                                    </>
+                                  ) : null}
+                                </dd>
+                              </>
+                            ) : null}
                             <dt>{m.keys.autoSwitch}</dt>
                             <dd>{profile.autoSwitch.enabled ? m.keys.autoSwitchOn : m.keys.autoSwitchOff}</dd>
                             <dt>{m.keys.lastApplied}</dt>

@@ -68,6 +68,8 @@ let mockProfiles: Profile[] = [
     tokenUsageTotal: 12_480_000,
     tokenInputTotal: 11_260_000,
     tokenCachedTotal: 10_620_000,
+    tokenCacheWriteTotal: 384_000,
+    tokenReasoningTotal: 1_240_000,
     tokenDayKey: todayKey,
     tokenUsageToday: 842_310,
   },
@@ -94,6 +96,8 @@ let mockProfiles: Profile[] = [
     tokenUsageTotal: 863_200,
     tokenInputTotal: 741_000,
     tokenCachedTotal: 668_000,
+    tokenCacheWriteTotal: 41_500,
+    tokenReasoningTotal: 96_300,
     tokenDayKey: todayKey,
     tokenUsageToday: 128_940,
   },
@@ -221,7 +225,8 @@ const mockRequests = [
     reasoningEffort: "medium",
     streaming: true,
     receivedBytes: 147_200,
-    tokenUsage: { inputTokens: 21_904, outputTokens: 2_118, cachedTokens: 10_240, reasoningTokens: 384, totalTokens: 24_022 },
+    // Anthropic 口径：input 已归一化成含缓存读写的全部提示 token
+    tokenUsage: { inputTokens: 21_904, outputTokens: 2_118, cachedTokens: 10_240, cacheWriteTokens: 6_180, reasoningTokens: 384, totalTokens: 24_022 },
   },
   {
     id: "request-failed",

@@ -72,6 +72,7 @@ export interface Messages {
     active: string;
     tokens: string;
     cache: string;
+    breakdown: string;
     awaitingSamples: string;
     statLine: string;
     switchTo: string;
@@ -303,6 +304,7 @@ const zh: Messages = {
     active: "使用中",
     tokens: "累计",
     cache: "缓存率",
+    breakdown: "Token 拆解",
     awaitingSamples: "尚无样本",
     statLine: "1 小时 {availability}% · 平均 {latency}",
     switchTo: "切换到「{name}」",
@@ -539,6 +541,7 @@ const zhTW: Messages = {
     active: "使用中",
     tokens: "累計",
     cache: "Cache 率",
+    breakdown: "Token 拆解",
     awaitingSamples: "尚無樣本",
     statLine: "1 小時 {availability}% · 平均 {latency}",
     switchTo: "切到「{name}」",
@@ -775,6 +778,7 @@ const ja: Messages = {
     active: "使用中",
     tokens: "累計",
     cache: "キャッシュ率",
+    breakdown: "トークン内訳",
     awaitingSamples: "サンプルなし",
     statLine: "1時間 {availability}% · 平均 {latency}",
     switchTo: "「{name}」に切り替え",
@@ -1011,6 +1015,7 @@ const en: Messages = {
     active: "ACTIVE",
     tokens: "TOKENS",
     cache: "CACHE",
+    breakdown: "TOKEN BREAKDOWN",
     awaitingSamples: "AWAITING SAMPLES",
     statLine: "1H {availability}% · AVG {latency}",
     switchTo: "Switch to {name}",

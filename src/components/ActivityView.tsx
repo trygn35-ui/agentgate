@@ -70,13 +70,20 @@ function latencyTier(milliseconds?: number): string {
   return "tier-bad";
 }
 
+/**
+ * 缓存命中率 = 命中的提示 token ÷ 全部提示 token。
+ *
+ * inputTokens 已在主进程归一化成「含缓存读写的全部提示 token」，三家口径一致，
+ * 所以这里不需要再夹 Math.min——比值天然落在 0–1。老代码那个夹子是在掩盖
+ * Anthropic 的分母错了（它的 input 不含缓存，比值动辄上千）。
+ */
 function cacheRate(request: ActiveRequest): number | undefined {
   const input = request.tokenUsage?.inputTokens;
   const cached = request.tokenUsage?.cachedTokens;
   if (input === undefined || cached === undefined || !Number.isFinite(input) || input <= 0) {
     return undefined;
   }
-  return Math.min(100, (cached / input) * 100);
+  return (cached / input) * 100;
 }
 
 function formatClock(value: string, clock: Intl.DateTimeFormat): string {
@@ -192,6 +199,20 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
                 + (request.streaming === true ? " · STREAM" : request.streaming === false ? " · SYNC" : "");
               const tokens = request.tokenUsage;
               const rate = cacheRate(request);
+              // 一行放不下全部口径，悬停给完整拆解
+              const tokenBreakdown = tokens
+                ? [
+                  `IN ${formatTokenCount(tokens.inputTokens)}`,
+                  `CACHE READ ${formatTokenCount(tokens.cachedTokens)}`,
+                  tokens.cacheWriteTokens
+                    ? `CACHE WRITE ${formatTokenCount(tokens.cacheWriteTokens)} (1.25×)`
+                    : undefined,
+                  `OUT ${formatTokenCount(tokens.outputTokens)}`,
+                  tokens.reasoningTokens
+                    ? `REASONING ${formatTokenCount(tokens.reasoningTokens)} (含在 OUT 内)`
+                    : undefined,
+                ].filter(Boolean).join("\n")
+                : undefined;
               return (
                 <article
                   className="request-row"
@@ -222,7 +243,22 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
                   <span className="request-tokens">
                     <RollingNumber className="tok-in" value={`↓${formatTokenCount(tokens?.inputTokens)}`} />
                     <RollingNumber className="tok-out" value={`↑${formatTokenCount(tokens?.outputTokens)}`} />
-                    <small>CACHED {formatTokenCount(tokens?.cachedTokens)}</small>
+                    {/*
+                      READ 是缓存命中（便宜），WRITE 是缓存写入（按 1.25× 计费，最贵的一次）。
+                      REASON 是推理 token——已经含在 ↑output 里，单列只为让你看见钱花在哪。
+                    */}
+                    <small title={tokenBreakdown}>
+                      {tokens?.cacheWriteTokens
+                        ? <span className="tok-write">W {formatTokenCount(tokens.cacheWriteTokens)}</span>
+                        : null}
+                      {tokens?.cacheWriteTokens && tokens?.reasoningTokens ? " · " : null}
+                      {tokens?.reasoningTokens
+                        ? <span className="tok-reason">R {formatTokenCount(tokens.reasoningTokens)}</span>
+                        : null}
+                      {!tokens?.cacheWriteTokens && !tokens?.reasoningTokens
+                        ? `CACHE ${formatTokenCount(tokens?.cachedTokens)}`
+                        : null}
+                    </small>
                   </span>
                   <span className="cache-rate">
                     <RollingNumber

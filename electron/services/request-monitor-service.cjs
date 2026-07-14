@@ -29,7 +29,9 @@ const RequestLogEntrySchema = z.object({
   tokenUsage: z.object({
     inputTokens: z.number().optional(),
     outputTokens: z.number().optional(),
+    /** 缓存命中（读）。缓存写入不算命中，单独记在 cacheWriteTokens。 */
     cachedTokens: z.number().optional(),
+    cacheWriteTokens: z.number().optional(),
     reasoningTokens: z.number().optional(),
     totalTokens: z.number().optional(),
   }).optional(),
@@ -193,36 +195,70 @@ function numberOrUndefined(value) {
   return Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : undefined
 }
 
+/**
+ * 把各家的 usage 归一化成同一套口径。
+ *
+ * 三家对「输入 token」的定义并不一致，直接拿去算比率会得出垃圾数：
+ *
+ * - Anthropic：`input_tokens` 只是**未命中缓存的新输入**，缓存读写是两个独立字段
+ *   （`cache_read_input_tokens` / `cache_creation_input_tokens`），都不含在里面。
+ * - OpenAI：`prompt_tokens`（或 Responses 的 `input_tokens`）**已经包含**
+ *   `cached_tokens`；没有单独的「写缓存」计数。
+ * - Gemini：`promptTokenCount` **已经包含** `cachedContentTokenCount`。
+ *
+ * 归一化后 inputTokens 一律是「这次请求的全部提示 token，含缓存读写」，
+ * 于是 cacheReadTokens / inputTokens 在三家都是同一个含义的命中率。
+ *
+ * 另外两点：
+ * - 缓存**写入**不是命中。它按 1.25× 计费——是最贵的一次请求，不能算进命中里。
+ * - reasoning token 已经含在 output 里（OpenAI 的 reasoning_tokens、Gemini 的
+ *   thoughtsTokenCount 都是如此），单独拿出来只为显示，**不再加总**。
+ */
 function extractTokenUsage(payload) {
   const container = payload?.response || payload?.message || payload
   const usage = container?.usage || payload?.usageMetadata
   if (!usage || typeof usage !== 'object') return undefined
-  const inputTokens = numberOrUndefined(
-    usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokenCount,
-  )
+
   const outputTokens = numberOrUndefined(
     usage.output_tokens ?? usage.completion_tokens ?? usage.candidatesTokenCount,
-  )
-  const standardCachedTokens = numberOrUndefined(
-    usage.input_tokens_details?.cached_tokens
-      ?? usage.prompt_tokens_details?.cached_tokens
-      ?? usage.cachedContentTokenCount,
-  )
-  const cacheReadTokens = numberOrUndefined(usage.cache_read_input_tokens)
-  const cacheCreationTokens = numberOrUndefined(usage.cache_creation_input_tokens)
-  const cachedTokens = standardCachedTokens ?? (
-    cacheReadTokens !== undefined || cacheCreationTokens !== undefined
-      ? (cacheReadTokens ?? 0) + (cacheCreationTokens ?? 0)
-      : undefined
   )
   const reasoningTokens = numberOrUndefined(
     usage.output_tokens_details?.reasoning_tokens
       ?? usage.completion_tokens_details?.reasoning_tokens
       ?? usage.thoughtsTokenCount,
   )
+
+  // 只有 Anthropic 会发这两个键，拿它们当判别式
+  const anthropicRead = numberOrUndefined(usage.cache_read_input_tokens)
+  const anthropicWrite = numberOrUndefined(usage.cache_creation_input_tokens)
+  const anthropicStyle = anthropicRead !== undefined || anthropicWrite !== undefined
+
+  const rawInput = numberOrUndefined(
+    usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokenCount,
+  )
+  const cacheReadTokens = anthropicStyle
+    ? anthropicRead
+    : numberOrUndefined(
+      usage.input_tokens_details?.cached_tokens
+        ?? usage.prompt_tokens_details?.cached_tokens
+        ?? usage.cachedContentTokenCount,
+    )
+  const cacheWriteTokens = anthropicWrite
+
+  // Anthropic 的 input 不含缓存，补回来；其余两家本来就含
+  const inputTokens = anthropicStyle && rawInput !== undefined
+    ? rawInput + (anthropicRead ?? 0) + (anthropicWrite ?? 0)
+    : rawInput
+
   const explicitTotal = numberOrUndefined(usage.total_tokens ?? usage.totalTokenCount)
-  if ([inputTokens, outputTokens, cachedTokens, reasoningTokens, explicitTotal]
+  if ([inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens, explicitTotal]
     .every((value) => value === undefined)) return undefined
+
+  /*
+   * Anthropic 不发 total_tokens，而它的 input 又不含缓存——按老写法
+   * total = input + output，一个读了 3.2 万缓存 token 的请求只会被记成 305 个。
+   * 归一化后的 inputTokens 已经含缓存，这里加起来才是真实用量。
+   */
   const totalTokens = explicitTotal ?? (
     inputTokens !== undefined && outputTokens !== undefined
       ? inputTokens + outputTokens
@@ -231,7 +267,8 @@ function extractTokenUsage(payload) {
   return {
     ...(inputTokens !== undefined ? { inputTokens } : {}),
     ...(outputTokens !== undefined ? { outputTokens } : {}),
-    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(cacheReadTokens !== undefined ? { cachedTokens: cacheReadTokens } : {}),
+    ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
     ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
     ...(totalTokens !== undefined ? { totalTokens } : {}),
   }

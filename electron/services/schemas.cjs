@@ -186,6 +186,8 @@ const StoredProfileSchema = LegacyStoredProfileSchema.extend({
   tokenUsageTotal: z.number().int().nonnegative().optional(),
   tokenInputTotal: z.number().int().nonnegative().optional(),
   tokenCachedTotal: z.number().int().nonnegative().optional(),
+  tokenCacheWriteTotal: z.number().int().nonnegative().optional(),
+  tokenReasoningTotal: z.number().int().nonnegative().optional(),
   tokenDayKey: z.string().optional(),
   tokenUsageToday: z.number().int().nonnegative().optional(),
 })

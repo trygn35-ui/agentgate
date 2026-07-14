@@ -63,6 +63,10 @@ export interface Profile {
   tokenInputTotal?: number;
   /** 累计缓存命中 Token。 */
   tokenCachedTotal?: number;
+  /** 累计缓存写入 token。 */
+  tokenCacheWriteTotal?: number;
+  /** 累计推理 token（已含在输出里）。 */
+  tokenReasoningTotal?: number;
   /** 当日用量所属的本地日期（YYYY-MM-DD）；跨日后重新计数。 */
   tokenDayKey?: string;
   /** 当日累计 Token，本地 0 点重置。 */
@@ -185,7 +189,11 @@ export type ActiveRequestState =
 export interface RequestTokenUsage {
   inputTokens?: number;
   outputTokens?: number;
+  /** 缓存命中（读）——便宜。 */
   cachedTokens?: number;
+  /** 缓存写入——按 1.25× 计费，是 miss 不是命中。 */
+  cacheWriteTokens?: number;
+  /** 推理 token。已含在 outputTokens 里，单列只为显示，不再加总。 */
   reasoningTokens?: number;
   totalTokens?: number;
 }

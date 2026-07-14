@@ -1358,6 +1358,10 @@ code, .num, [data-num] { font-variant-numeric: tabular-nums; }
 .request-tokens { min-width: 0; white-space: nowrap; font-family: var(--mono); }
 .request-tokens .tok-in { font-size: var(--fs-sm); color: var(--good); }
 .request-tokens .tok-out { margin-left: 7px; font-size: var(--fs-sm); color: var(--cool); }
+/* 缓存写入按 1.25× 计费——用警示色，它是这一行里最贵的东西 */
+.request-tokens .tok-write { color: var(--warn); }
+/* 推理 token 已含在输出里，只是提示钱花在哪 */
+.request-tokens .tok-reason { color: var(--opencode); }
 .request-tokens small {
   display: block;
   margin-top: 2px;

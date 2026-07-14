@@ -245,18 +245,83 @@ describe("活动请求监视", () => {
       reasoningTokens: 8,
       totalTokens: 125,
     });
+  });
+
+  it("Anthropic：input 不含缓存，必须补回来——否则用量少算、命中率恒等于 100%", () => {
+    /*
+     * Anthropic 的 input_tokens 只是「未命中缓存的新输入」，缓存读写是两个
+     * 独立字段。老代码直接拿 input 当分母、把缓存写入算成命中：
+     *   cached/input = (20000+12000)/5 = 6400 → 被 Math.min 夹成 100%
+     * 而 total = input+output = 305，把 3.2 万个缓存 token 全丢了。
+     */
     expect(extractTokenUsage({
+      usage: {
+        input_tokens: 5,
+        cache_read_input_tokens: 20_000,
+        cache_creation_input_tokens: 12_000,
+        output_tokens: 300,
+      },
+    })).toEqual({
+      inputTokens: 32_005,        // 5 + 20000 + 12000：归一化成「全部提示 token」
+      outputTokens: 300,
+      cachedTokens: 20_000,       // 只有「读」算命中
+      cacheWriteTokens: 12_000,   // 「写」是 miss，还按 1.25× 计费
+      totalTokens: 32_305,        // 不再漏掉缓存
+    });
+  });
+
+  it("缓存写入不是命中：全新建缓存的请求命中率必须是 0，而不是 100%", () => {
+    const usage = extractTokenUsage({
       usage: {
         input_tokens: 80,
         output_tokens: 20,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 30,
       },
-    })).toEqual({
-      inputTokens: 80,
+    });
+    expect(usage).toEqual({
+      inputTokens: 110,          // 80 + 0 + 30
       outputTokens: 20,
-      cachedTokens: 30,
-      totalTokens: 100,
+      cachedTokens: 0,           // 一个字都没命中
+      cacheWriteTokens: 30,
+      totalTokens: 130,
+    });
+    // 这正是最贵的一次请求，绝不能显示成「100% 命中」
+    expect(usage.cachedTokens / usage.inputTokens).toBe(0);
+  });
+
+  it("OpenAI / Gemini：prompt 已含缓存，不能重复加", () => {
+    // OpenAI：prompt_tokens 里已经包含 cached_tokens
+    expect(extractTokenUsage({
+      usage: {
+        prompt_tokens: 25_000,
+        completion_tokens: 800,
+        prompt_tokens_details: { cached_tokens: 20_000 },
+        completion_tokens_details: { reasoning_tokens: 640 },
+      },
+    })).toEqual({
+      inputTokens: 25_000,       // 原样，不能再加 20000
+      outputTokens: 800,
+      cachedTokens: 20_000,
+      reasoningTokens: 640,      // 已含在 output 里，只为显示
+      totalTokens: 25_800,
+    });
+
+    // Gemini：promptTokenCount 里已经包含 cachedContentTokenCount
+    expect(extractTokenUsage({
+      usageMetadata: {
+        promptTokenCount: 9_000,
+        candidatesTokenCount: 500,
+        cachedContentTokenCount: 7_200,
+        thoughtsTokenCount: 210,
+        totalTokenCount: 9_500,
+      },
+    })).toEqual({
+      inputTokens: 9_000,
+      outputTokens: 500,
+      cachedTokens: 7_200,
+      reasoningTokens: 210,
+      totalTokens: 9_500,
     });
   });
 
