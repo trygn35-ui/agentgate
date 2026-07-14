@@ -46,6 +46,7 @@ const {
 const { UpdateService } = require('./services/update-service.cjs')
 const { migrateLegacyUserData } = require('./services/migration-service.cjs')
 const { CHANNELS, registerIpcHandlers } = require('./services/ipc.cjs')
+const { SessionService } = require('./services/session-service.cjs')
 
 const APP_NAME = 'agentgate'
 const APP_DISPLAY_NAME = 'Agent;Gate'
@@ -209,7 +210,11 @@ function createServices() {
     },
   })
 
+  // 读的是各家 agent 自己的会话库，跟本应用的 userData 无关
+  const sessionService = new SessionService({})
+
   return {
+    sessionService,
     profileService,
     clientService,
     healthService,

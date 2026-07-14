@@ -799,11 +799,15 @@ code, .num, [data-num] { font-variant-numeric: tabular-nums; }
   transform: scaleY(0);
   transform-origin: bottom;
   transition: transform 240ms cubic-bezier(.4, 0, .7, .2);
-  background: linear-gradient(
-    to top,
-    color-mix(in srgb, var(--tone, var(--accent)) 22%, transparent),
-    color-mix(in srgb, var(--tone, var(--accent)) 7%, transparent)
-  );
+  /*
+   * 实色平涂，不用渐变。
+   *
+   * 这套界面说的是印刷与仪表的话——实色块、细线、等宽字。渐变是别处的方言，
+   * 混进来就脏。液面用元素自己的上边缘交代，硬边，不糊。
+   *
+   * （别在这儿加 border-top：整个元素是被 scaleY 拉起来的，边框会跟着一起压扁。）
+   */
+  background: color-mix(in srgb, var(--tone, var(--accent)) 14%, transparent);
 }
 .socket-card.engaged .socket-fill {
   transform: scaleY(1);
@@ -2104,3 +2108,224 @@ code, .num, [data-num] { font-variant-numeric: tabular-nums; }
   color: var(--ink-quiet);
 }
 .empty-state .primary-pill, .empty-state .ghost-pill { margin: 10px auto 0; }
+
+/* ————————————————————————— 会话页 ————————————————————————— */
+
+.session-cell { position: relative; }
+
+.session-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 96px 104px 16px;
+  gap: 12px;
+  align-items: center;
+  min-height: 54px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  animation: row-in 300ms cubic-bezier(.2, .9, .25, 1) backwards;
+  transition: background 180ms ease, box-shadow 180ms ease;
+}
+.session-cell:nth-child(even) .session-row { background: var(--soft); }
+.session-row:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.session-row:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+/* 展开的那一行是当前焦点，压住底线让它和下面的正文连成一体 */
+.session-row.open {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  border-bottom-color: transparent;
+}
+/* 选中 = 即将被删。用警示色，别让人误以为只是高亮。 */
+.session-row.picked {
+  background: color-mix(in srgb, var(--bad) 8%, transparent);
+  box-shadow: inset 2px 0 0 var(--bad);
+}
+.session-row input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--bad);
+  cursor: pointer;
+}
+
+.session-main { min-width: 0; }
+.session-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.session-title strong {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-base);
+  font-weight: 600;
+}
+.session-path {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 3px;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--ink-quiet);
+  white-space: nowrap;
+}
+.session-path svg { flex: 0 0 auto; opacity: .6; }
+
+.session-size { text-align: right; white-space: nowrap; }
+.session-size code { font-family: var(--mono); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+.session-size small {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-label);
+  color: var(--ink-quiet);
+}
+.session-when {
+  text-align: right;
+  font-size: var(--fs-xs);
+  color: var(--ink-quiet);
+  white-space: nowrap;
+}
+.session-chev {
+  color: var(--ink-quiet);
+  transition: transform 260ms cubic-bezier(.16, .84, .3, 1);
+}
+.session-chev.flip { transform: rotate(180deg); color: var(--accent-ink); }
+
+.session-search {
+  width: 150px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  transition: width 240ms cubic-bezier(.16, .84, .3, 1), border-color 160ms ease;
+}
+.session-search:focus { width: 210px; border-color: var(--accent); outline: none; }
+.session-search::-webkit-search-cancel-button { filter: grayscale(1); opacity: .5; }
+
+/* ——— 展开后的对话 ——— */
+
+.transcript {
+  margin: 0 0 0 30px;
+  padding: 10px 14px 12px;
+  border-left: 1px solid var(--line-strong);
+  border-bottom: 1px solid var(--line);
+  animation: transcript-open 300ms cubic-bezier(.16, .84, .3, 1);
+}
+@keyframes transcript-open {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.say {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 12px;
+  padding: 7px 0;
+  animation: row-in 280ms cubic-bezier(.2, .9, .25, 1) backwards;
+}
+.say + .say { border-top: 1px dashed var(--line); }
+.say-who {
+  padding-top: 1px;
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  letter-spacing: .1em;
+  color: var(--ink-quiet);
+  user-select: none;
+}
+/* 人说的话立起来，模型说的话退后——一眼分得清谁在说 */
+.say-user .say-who { color: var(--accent-ink); }
+.say-user p { color: var(--ink); font-weight: 500; }
+.say-assistant p { color: var(--ink-soft, var(--ink)); }
+.say p {
+  margin: 0;
+  /* 正文可能极长，只给一段的高度，够看清是什么就行 */
+  max-height: 168px;
+  overflow: auto;
+  font-size: var(--fs-sm);
+  line-height: 1.62;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.transcript-note {
+  margin: 8px 0 0;
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  letter-spacing: .06em;
+  color: var(--ink-quiet);
+}
+.transcript-more {
+  margin-bottom: 8px;
+  padding: 3px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ink-soft, var(--ink));
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease;
+}
+.transcript-more:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-ink); }
+.transcript-more:disabled { opacity: .55; cursor: default; }
+
+/* 选中后升起的操作条。没选中就不占地方。 */
+.session-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 20px 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--paper);
+  box-shadow: 0 6px 24px rgb(0 0 0 / .16);
+  animation: bar-rise 280ms cubic-bezier(.16, .84, .3, 1) backwards;
+}
+.session-bar > span:first-child {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
+.session-bar .btn-danger { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+
+@keyframes bar-rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 删除演练：要删什么，以及特意不删什么 */
+.plan {
+  margin: 12px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--soft);
+}
+.plan-row { display: flex; align-items: baseline; gap: 10px; padding: 3px 0; }
+.plan-label {
+  min-width: 66px;
+  font-size: var(--fs-label);
+  letter-spacing: .08em;
+  color: var(--ink-quiet);
+}
+.plan-row code {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--bad);
+  font-variant-numeric: tabular-nums;
+}
+/* 保留的那一行是「好消息」，别跟着标红 */
+.plan-row.keep code { color: var(--good); }
+.plan-hint {
+  margin: 6px 0 0;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--ink-quiet);
+}
+
+.btn-icon { display: inline-grid; place-items: center; width: 26px; height: 24px; padding: 0; }

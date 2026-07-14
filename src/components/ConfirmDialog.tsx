@@ -1,10 +1,12 @@
 import { useEffect, useRef } from "react";
-import type { ReactElement } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { useI18n } from "../i18n";
 
 interface ConfirmDialogProps {
   title: string;
   message: string;
+  /** 正文下面的明细区。删会话时用来摆出「要删什么、又特意保留什么」。 */
+  details?: ReactNode;
   confirmLabel: string;
   cancelLabel?: string;
   danger?: boolean;
@@ -20,6 +22,7 @@ interface ConfirmDialogProps {
 export function ConfirmDialog({
   title,
   message,
+  details,
   confirmLabel,
   cancelLabel,
   danger,
@@ -52,6 +55,7 @@ export function ConfirmDialog({
       <div className="confirm-dialog">
         <h2>{title}</h2>
         <p>{message}</p>
+        {details}
         <div className="confirm-foot">
           <button type="button" className="btn-ghost" onClick={onCancel}>{cancelText}</button>
           <button

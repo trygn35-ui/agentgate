@@ -134,6 +134,43 @@ export interface Messages {
       cancel: string;
     };
   };
+  sessions: {
+    title: string;
+    subtitle: string;
+    /** 展开看发言。 */
+    loading: string;
+    noMessages: string;
+    loadAll: string;
+    showingMessages: string;
+    you: string;
+    agent: string;
+    search: string;
+    capped: string;
+    refresh: string;
+    scanning: string;
+    empty: string;
+    emptyHint: string;
+    noMatch: string;
+    all: string;
+    workspace: string;
+    unknownWorkspace: string;
+    messages: string;
+    selected: string;
+    selectAll: string;
+    clear: string;
+    remove: string;
+    removing: string;
+    /** 删除确认弹窗。会话没有回收站，删了就没了。 */
+    confirmTitle: string;
+    confirmBody: string;
+    confirmIrreversible: string;
+    willDelete: string;
+    willKeep: string;
+    keptHint: string;
+    removed: string;
+    removeFailed: string;
+    dbLocked: string;
+  };
   config: {
     title: string;
     launchAtLogin: string;
@@ -370,6 +407,41 @@ const zh: Messages = {
       abort: "已中止",
       cancel: "已取消",
     },
+  },
+  sessions: {
+    title: "会话",
+    subtitle: "本机 agent 的会话 · 直接读它们自己的库",
+    loading: "正在读取",
+    noMessages: "这个会话没有可显示的发言",
+    loadAll: "读取全部发言",
+    showingMessages: "以上 {count} 条",
+    you: "我",
+    agent: "AGENT",
+    search: "搜索标题或工作区",
+    capped: "仅显示 {shown} 个 · 另有 {hidden} 个，搜索可以够到",
+    refresh: "重新扫描",
+    scanning: "正在扫描本机会话",
+    empty: "没有找到任何会话",
+    emptyHint: "Claude Code / Codex / OpenCode 都还没在这台机器上留下会话",
+    noMatch: "没有符合筛选条件的会话",
+    all: "全部",
+    workspace: "工作区",
+    unknownWorkspace: "工作区未知",
+    messages: "{count} 条消息",
+    selected: "已选 {count} 个",
+    selectAll: "全选",
+    clear: "取消选择",
+    remove: "删除",
+    removing: "正在删除",
+    confirmTitle: "删除 {count} 个会话？",
+    confirmBody: "会连同它们在数据库里的记录一起清掉。",
+    confirmIrreversible: "没有回收站，删了就没了。",
+    willDelete: "将删除",
+    willKeep: "保留不动",
+    keptHint: "这些是跨会话共享的，按会话删会毁掉别的会话的数据。",
+    removed: "已删除 {count} 个会话",
+    removeFailed: "{count} 个会话删除失败",
+    dbLocked: "文件被占用 · 关掉对应的 agent 再试",
   },
   config: {
     title: "设置",
@@ -613,6 +685,41 @@ const zhTW: Messages = {
       cancel: "取消",
     },
   },
+  sessions: {
+    title: "Session",
+    subtitle: "本機 agent 的 session · 直接讀它們自己的資料庫",
+    loading: "讀取中",
+    noMessages: "這個 session 沒有可顯示的發言",
+    loadAll: "讀取全部發言",
+    showingMessages: "以上 {count} 則",
+    you: "我",
+    agent: "AGENT",
+    search: "搜尋標題或工作目錄",
+    capped: "僅顯示 {shown} 個 · 另有 {hidden} 個，用搜尋找得到",
+    refresh: "重新掃描",
+    scanning: "正在掃描本機 session",
+    empty: "找不到任何 session",
+    emptyHint: "Claude Code / Codex / OpenCode 都還沒在這台機器上留下 session",
+    noMatch: "沒有符合篩選條件的 session",
+    all: "全部",
+    workspace: "工作目錄",
+    unknownWorkspace: "工作目錄不明",
+    messages: "{count} 則訊息",
+    selected: "已選 {count} 個",
+    selectAll: "全選",
+    clear: "取消選取",
+    remove: "刪除",
+    removing: "正在刪除",
+    confirmTitle: "刪除 {count} 個 session？",
+    confirmBody: "連同它們在資料庫裡的紀錄一起清掉。",
+    confirmIrreversible: "沒有資源回收筒，刪了就沒了。",
+    willDelete: "將刪除",
+    willKeep: "保留不動",
+    keptHint: "這些是跨 session 共用的，按 session 刪會毀掉別的 session 的資料。",
+    removed: "已刪除 {count} 個 session",
+    removeFailed: "{count} 個 session 刪除失敗",
+    dbLocked: "檔案被占用 · 關掉對應的 agent 再試",
+  },
   config: {
     title: "設定",
     launchAtLogin: "開機自動啟動（靜默）",
@@ -855,6 +962,41 @@ const ja: Messages = {
       cancel: "キャンセル",
     },
   },
+  sessions: {
+    title: "セッション",
+    subtitle: "ローカル agent のセッション · 各自の DB を直読み",
+    loading: "読み込み中",
+    noMessages: "表示できる発言なし",
+    loadAll: "すべて読み込む",
+    showingMessages: "以上 {count} 件",
+    you: "自分",
+    agent: "AGENT",
+    search: "タイトル・作業ディレクトリを検索",
+    capped: "{shown} 件を表示 · 他 {hidden} 件は検索で",
+    refresh: "再スキャン",
+    scanning: "ローカルセッションをスキャン中",
+    empty: "セッションなし",
+    emptyHint: "Claude Code / Codex / OpenCode いずれもこの端末にセッションを残していない",
+    noMatch: "条件に合うセッションなし",
+    all: "すべて",
+    workspace: "作業ディレクトリ",
+    unknownWorkspace: "作業ディレクトリ不明",
+    messages: "{count} メッセージ",
+    selected: "{count} 件選択中",
+    selectAll: "全選択",
+    clear: "選択解除",
+    remove: "削除",
+    removing: "削除中",
+    confirmTitle: "{count} 件のセッションを削除？",
+    confirmBody: "DB 上のレコードごと消えます。",
+    confirmIrreversible: "ゴミ箱なし。戻せません。",
+    willDelete: "削除対象",
+    willKeep: "手を付けない",
+    keptHint: "セッション間で共有されている。セッション単位で消すと他のセッションのデータを壊す。",
+    removed: "{count} 件のセッションを削除",
+    removeFailed: "{count} 件の削除に失敗",
+    dbLocked: "ファイルが使用中 · 対象の agent を終了してから再試行",
+  },
   config: {
     title: "設定",
     launchAtLogin: "自動起動（サイレント）",
@@ -1096,6 +1238,41 @@ const en: Messages = {
       abort: "ABORT",
       cancel: "CANCEL",
     },
+  },
+  sessions: {
+    title: "Sessions",
+    subtitle: "Local agent sessions · read straight from their own stores",
+    loading: "Loading",
+    noMessages: "No messages to show",
+    loadAll: "Load all messages",
+    showingMessages: "{count} shown",
+    you: "You",
+    agent: "AGENT",
+    search: "Search title or workspace",
+    capped: "Showing {shown} · {hidden} more, reachable via search",
+    refresh: "Rescan",
+    scanning: "Scanning local sessions",
+    empty: "No sessions found",
+    emptyHint: "Claude Code / Codex / OpenCode have not left any sessions on this machine",
+    noMatch: "No sessions match this filter",
+    all: "All",
+    workspace: "Workspace",
+    unknownWorkspace: "Workspace unknown",
+    messages: "{count} messages",
+    selected: "{count} selected",
+    selectAll: "Select all",
+    clear: "Clear",
+    remove: "Delete",
+    removing: "Deleting",
+    confirmTitle: "Delete {count} sessions?",
+    confirmBody: "Their database rows go with them.",
+    confirmIrreversible: "There is no trash. This cannot be undone.",
+    willDelete: "Will delete",
+    willKeep: "Left alone",
+    keptHint: "These are shared across sessions — deleting them per-session would destroy other sessions' data.",
+    removed: "Deleted {count} sessions",
+    removeFailed: "{count} sessions failed to delete",
+    dbLocked: "File is in use · close that agent and retry",
   },
   config: {
     title: "Config",

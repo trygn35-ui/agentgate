@@ -1,8 +1,9 @@
-import { Activity, KeyRound, LayoutDashboard, Minus, Settings, ShieldCheck, Square, X } from "lucide-react";
+import { Activity, KeyRound, LayoutDashboard, MessagesSquare, Minus, Settings, ShieldCheck, Square, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent, ReactElement } from "react";
 import { ActivityView } from "./components/ActivityView";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { SessionsView } from "./components/SessionsView";
 import { KeyringView } from "./components/KeyringView";
 import { OverviewView } from "./components/OverviewView";
 import { ProfileEditor } from "./components/ProfileEditor";
@@ -26,6 +27,7 @@ const NAV_ICONS: Record<View, ReactElement> = {
   overview: <LayoutDashboard size={13} />,
   keyring: <KeyRound size={13} />,
   activity: <Activity size={13} />,
+  sessions: <MessagesSquare size={13} />,
   settings: <Settings size={13} />,
 };
 
@@ -33,10 +35,11 @@ const NAV_LABEL: Record<View, (m: Messages) => string> = {
   overview: (m) => m.nav.overview,
   keyring: (m) => m.nav.keys,
   activity: (m) => m.nav.stream,
+  sessions: (m) => m.sessions.title,
   settings: (m) => m.nav.config,
 };
 
-const NAV_ORDER: View[] = ["overview", "keyring", "activity", "settings"];
+const NAV_ORDER: View[] = ["overview", "keyring", "activity", "sessions", "settings"];
 
 /** 与 CSS 里 .theme-shifting 的过渡时长保持一致。 */
 const THEME_SHIFT_MS = 460;
@@ -298,6 +301,9 @@ function AppShell({ controller }: { controller: ReturnType<typeof useAgentGateCo
         />
       )}
       {view === "activity" && <ActivityView key={locale} requests={requestRecords} />}
+      {view === "sessions" && (
+        <SessionsView key={locale} onToast={(kind, message) => controller.setToast({ kind, message })} />
+      )}
       {view === "settings" && (
         <SettingsView
           key={locale}

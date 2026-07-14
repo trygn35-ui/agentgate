@@ -1,4 +1,6 @@
 import type {
+  AgentSession,
+  SessionMessage,
   BootstrapData,
   ClientStatus,
   ClientTarget,
@@ -257,6 +259,57 @@ function getMockKeyHint(input: SaveProfileInput, existing?: Profile): string {
   if (apiKey) return `•••• ${apiKey.slice(-4).toUpperCase()}`;
   return existing?.keyHint ?? "•••• NEW";
 }
+
+const hoursAgo = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString();
+
+let mockSessions: AgentSession[] = [
+  {
+    id: "codex:019f5fdc-7324-7911-8c9d-7e39f784efa6",
+    client: "codex",
+    nativeId: "019f5fdc-7324-7911-8c9d-7e39f784efa6",
+    title: "先探索理解一下当前项目内的东西",
+    workspace: "E:\\godot的游戏\\怪物区驿站",
+    updatedAt: hoursAgo(0.4),
+    sizeBytes: 41_003_520,
+  },
+  {
+    id: "claude:e8fee807-a093-449b-95bc-512795b85513",
+    client: "claude",
+    nativeId: "e8fee807-a093-449b-95bc-512795b85513",
+    title: "把网关的首字延迟修一下",
+    workspace: "D:\\AI\\Keydeck",
+    updatedAt: hoursAgo(1.2),
+    sizeBytes: 8_912_896,
+  },
+  {
+    id: "opencode:ses_17ebba7f2ffeaR1wt3zBk6zIM5",
+    client: "opencode",
+    nativeId: "ses_17ebba7f2ffeaR1wt3zBk6zIM5",
+    title: "角色移速与场景地图关联的bug检查",
+    workspace: "E:\\godot的游戏\\修仙宗门模拟器",
+    updatedAt: hoursAgo(26),
+    sizeBytes: 2_310_144,
+    messages: 412,
+  },
+  {
+    id: "codex:019f4a24-1c88-7ab0-9d31-0e4b7c9a1f22",
+    client: "codex",
+    nativeId: "019f4a24-1c88-7ab0-9d31-0e4b7c9a1f22",
+    title: "检查当前可用工具、MCP 资源和插件暴露情况",
+    workspace: "C:\\Users\\TRYGN\\Documents\\codex",
+    updatedAt: hoursAgo(73),
+    sizeBytes: 279_412_736,
+  },
+  {
+    id: "claude:44940e55-2b71-4c3d-8f19-6a2e0d5b7c81",
+    client: "claude",
+    nativeId: "44940e55-2b71-4c3d-8f19-6a2e0d5b7c81",
+    title: "cdesktop 窗口层级重构",
+    workspace: "D:\\AI\\cdesktop",
+    updatedAt: hoursAgo(190),
+    sizeBytes: 36_700_160,
+  },
+];
 
 const mockBridge: AgentGateBridge = {
   async getBootstrap(): Promise<BootstrapData> {
@@ -561,6 +614,52 @@ const mockBridge: AgentGateBridge = {
   async updateSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
     mockSettings = { ...mockSettings, ...patch };
     return clone(mockSettings);
+  },
+
+  async listSessions() {
+    await new Promise((resolve) => setTimeout(resolve, 260));
+    return clone(mockSessions);
+  },
+
+  async readSessionMessages(id: string, limit = 30) {
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    const session = mockSessions.find((item) => item.id === id);
+    const script: Array<[SessionMessage["role"], string]> = [
+      ["user", "先探索理解一下当前项目内的东西，别急着改代码。"],
+      ["assistant", "看完了。这是一个 Godot 4 项目，场景树的入口在 `main.tscn`，角色控制器挂在 `Player` 节点上，移动逻辑用的是 `CharacterBody2D.move_and_slide()`。\n\n有一处可疑：`_physics_process` 里每帧都在 `get_node()`，这在移动端会很吃 CPU。"],
+      ["user", "那个卡顿是不是就是这个引起的？"],
+      ["assistant", "不是。`get_node()` 有缓存，真正的开销在 `TileMap` 的 `update_dirty_quadrants()` —— 你每帧都在改 tile，触发了整块重建。"],
+      ["user", "怎么改"],
+      ["assistant", "把 tile 的写入攒起来，一帧只提交一次。我先把复现脚本跑一遍确认。"],
+    ];
+    const want = limit > 0 ? limit : script.length;
+    const messages: SessionMessage[] = script.slice(-want).map(([role, text], index) => ({
+      role,
+      text,
+      at: new Date(Date.now() - (script.length - index) * 240_000).toISOString(),
+    }));
+    return { messages, truncated: want < script.length || Boolean(session && session.sizeBytes > 5e7) };
+  },
+
+  async planSessionRemoval(ids: string[]) {
+    return clone(mockSessions.filter((s) => ids.includes(s.id)).map((s) => ({
+      id: s.id,
+      client: s.client,
+      title: s.title,
+      workspace: s.workspace,
+      files: [{ path: `…/${s.nativeId}.jsonl`, bytes: s.sizeBytes }],
+      rows: s.client === "claude" ? [] : [{ kind: "sqlite", file: "…/state.sqlite" }],
+      // 预览里也要如实体现：这两样是共享的，删会话时绝不碰
+      kept: s.client === "codex" ? ["attachments", "auth", "config"]
+        : s.client === "opencode" ? ["snapshot", "auth"]
+          : ["memory", "settings", "credentials"],
+    })));
+  },
+
+  async removeSessions(ids: string[]) {
+    await new Promise((resolve) => setTimeout(resolve, 420));
+    mockSessions = mockSessions.filter((s) => !ids.includes(s.id));
+    return { removed: [...ids], failed: [] };
   },
 
   async checkForUpdate() {

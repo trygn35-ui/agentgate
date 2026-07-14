@@ -18,6 +18,11 @@ const CHANNELS = Object.freeze({
   stopGateway: 'agentgate:stop-gateway',
   reassignPort: 'agentgate:reassign-port',
   updateSettings: 'agentgate:update-settings',
+  // 会话不进 bootstrap：扫一遍要翻上百个正文文件加两个 SQLite，开页面时再拉
+  listSessions: 'agentgate:list-sessions',
+  readSessionMessages: 'agentgate:read-session-messages',
+  planSessionRemoval: 'agentgate:plan-session-removal',
+  removeSessions: 'agentgate:remove-sessions',
   checkForUpdate: 'agentgate:check-for-update',
   downloadUpdate: 'agentgate:download-update',
   installUpdate: 'agentgate:install-update',
@@ -29,6 +34,12 @@ const GatewayStartSchema = z.object({
   // 省略 = 全部已分配的客户端；给定子集 = 只接管这几个
   targets: z.array(z.enum(TARGETS)).optional(),
 })
+
+/** 会话 id 长这样：`<客户端>:<原生 id>`。一次最多删这么多，防手滑清空。 */
+const SessionIdSchema = z.string().min(3).max(200)
+const SessionIdsSchema = z.array(SessionIdSchema).min(1).max(200)
+/** 0 = 尽量多（主进程仍有硬上限）。 */
+const MessageLimitSchema = z.number().int().min(0).max(200).optional().default(30)
 
 const GatewayStopSchema = z.object({
   // 省略 = 放掉全部；给定子集 = 只放掉这几个
@@ -65,6 +76,7 @@ function registerIpcHandlers({
   gatewayService,
   settingsService,
   updateService,
+  sessionService,
   requestUpdateInstall,
 }) {
   const getBootstrap = async () => {
@@ -236,6 +248,26 @@ function registerIpcHandlers({
     if (!settingsService) throw new Error('Application settings are unavailable')
     return settingsService.update(patch)
   })
+  /*
+   * 会话管理。删除是不可逆的，所以渲染进程只能递会话 id，删什么由主进程按各家的
+   * 真实牵连面自己算——路径不从渲染进程来，免得被越权删到别处去。
+   */
+  ipcMain.handle(CHANNELS.listSessions, async () => (
+    sessionService ? sessionService.list() : []
+  ))
+  ipcMain.handle(CHANNELS.readSessionMessages, async (_event, id, limit) => (
+    sessionService
+      ? sessionService.readMessages(SessionIdSchema.parse(id), { limit: MessageLimitSchema.parse(limit) })
+      : { messages: [], truncated: false }
+  ))
+  ipcMain.handle(CHANNELS.planSessionRemoval, async (_event, ids) => (
+    sessionService ? sessionService.plan(SessionIdsSchema.parse(ids)) : []
+  ))
+  ipcMain.handle(CHANNELS.removeSessions, async (_event, ids) => {
+    if (!sessionService) return { removed: [], failed: [] }
+    return sessionService.remove(SessionIdsSchema.parse(ids))
+  })
+
   ipcMain.handle(CHANNELS.checkForUpdate, async () => {
     if (!updateService) throw new Error('Update service is unavailable')
     return updateService.check()

@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",
+    "better-sqlite3": "^12.11.1",
     "electron-updater": "^6.8.9",
     "jsonc-parser": "^3.3.1",
     "lucide-react": "^0.468.0",
@@ -30,6 +31,7 @@
     "@fontsource/eb-garamond": "^5.2.7",
     "@fontsource/ibm-plex-mono": "^5.2.7",
     "@fontsource/ibm-plex-sans": "^5.2.8",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.10.2",
     "@types/react": "^19.0.2",
     "@types/react-dom": "^19.0.2",
@@ -90,12 +92,9 @@
     },
     "portable": {
       "artifactName": "AgentGate-Portable-${version}-${arch}.${ext}"
-    }
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "electron",
-      "esbuild"
+    },
+    "asarUnpack": [
+      "**/node_modules/better-sqlite3/**"
     ]
   }
 }

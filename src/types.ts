@@ -258,6 +258,8 @@ export type StateChangedEvent =
   | {
       type: "active-requests-changed";
       activeRequests: ActiveRequest[];
+      /** 只带了还在跑的那几条：按 id 就地更新，别整表替换。见 _notifyProgress。 */
+      patch?: boolean;
     }
   | {
       type: "settings-changed";
@@ -308,6 +310,49 @@ export interface ApplyResult {
  * 所有 Promise 都可能因参数校验、DPAPI、网络或文件系统错误而拒绝；调用方必须
  * 显式处理失败。接口不会返回明文 Key。
  */
+/** 本机 agent 的一次会话。id 是 `<客户端>:<原生 id>`。 */
+export interface AgentSession {
+  id: string;
+  client: "claude" | "codex" | "opencode";
+  nativeId: string;
+  title: string;
+  /** 会话开始时所在的目录。Claude Code 的目录名编码是有损的，只能从正文里读。 */
+  workspace: string;
+  updatedAt?: string;
+  sizeBytes: number;
+  messages?: number;
+  archived?: boolean;
+}
+
+/** 会话里的一条发言。 */
+export interface SessionMessage {
+  role: "user" | "assistant";
+  text: string;
+  at?: string;
+}
+
+export interface SessionTranscript {
+  messages: SessionMessage[];
+  /** 还有更早的没读到。 */
+  truncated: boolean;
+}
+
+/**
+ * 删除演练：要删什么，以及**特意不删什么**。
+ *
+ * kept 不是凑数的——Codex 的附件是跨会话共享的，OpenCode 的快照是个指向用户真实
+ * 代码目录的 git 仓库。这两样按会话删都会毁掉别的东西，所以只报告、不动手。
+ */
+export interface SessionRemovalPlan {
+  id: string;
+  client: string;
+  title: string;
+  workspace: string;
+  files: { path: string; bytes: number }[];
+  rows: { kind: string; file: string }[];
+  kept: string[];
+}
+
 export interface AgentGateBridge {
   /** 读取方案、客户端扫描状态和公开历史。 */
   getBootstrap(): Promise<BootstrapData>;
@@ -340,6 +385,14 @@ export interface AgentGateBridge {
   stopGateway(settings?: GatewayStopSettings): Promise<BootstrapData>;
   /** 更新应用行为设置。旧版 preload 可能暂未提供。 */
   updateSettings?(patch: Partial<AppSettings>): Promise<AppSettings | BootstrapData>;
+  /** 扫描本机 agent 的会话。不进 bootstrap——要翻上百个正文文件加两个 SQLite。 */
+  listSessions?(): Promise<AgentSession[]>;
+  /** 读会话最后的若干条发言。limit=0 表示尽量多。 */
+  readSessionMessages?(id: string, limit?: number): Promise<SessionTranscript>;
+  /** 演练：删这些会话会动到哪些文件和数据库行。 */
+  planSessionRemoval?(ids: string[]): Promise<SessionRemovalPlan[]>;
+  /** 真删。不可逆。渲染进程只递 id，删什么由主进程算。 */
+  removeSessions?(ids: string[]): Promise<{ removed: string[]; failed: { id: string; reason: string }[] }>;
   /** 无边框窗口的最小化/最大化/关闭控制。仅桌面环境提供。 */
   windowControl?(action: "minimize" | "maximize" | "close"): Promise<void>;
   /** 检查 GitHub Releases 上是否有新版本。 */

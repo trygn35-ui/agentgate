@@ -1,3 +1,6 @@
 allowBuilds:
+  # 原生模块，得编出 .node。会话页要读 Codex / OpenCode 的 SQLite，
+  # 而且它们的 WAL 是热的——不走真 SQLite 读到的是过期数据，写更会写坏。
+  better-sqlite3: true
   electron: true
   esbuild: true

@@ -485,6 +485,44 @@ describe("中止归类", () => {
     expect(monitor.list()[0]).toMatchObject({ firstTokenLatencyMs: 20, state: "streaming" });
   });
 
+  it("传输途中只推活跃请求，不把整部历史重发一遍", () => {
+    let now = 70_000;
+    const events = [];
+    const monitor = new RequestMonitorService({
+      now: () => now,
+      onChange: (event) => events.push(event),
+    });
+
+    // 攒一点历史
+    for (let index = 0; index < 5; index += 1) {
+      const old = monitor.start({ profileName: `历史 ${index}`, protocol: "openai-responses" });
+      monitor.end(old);
+    }
+
+    const id = monitor.start({ profileName: "在跑", protocol: "openai-responses", streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+    monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"首"}\n\n');
+    events.length = 0;
+
+    // 传输途中：节流窗口过了，应当只推还在跑的那一条
+    now += 300;
+    monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"续"}\n\n');
+    const progress = events.at(-1);
+    expect(progress.patch).toBe(true);
+    expect(progress.activeRequests).toHaveLength(1);
+    expect(progress.activeRequests[0].id).toBe(id);
+
+    /*
+     * 历史记录只在请求「结束」时才变，传输途中一条都不该跟着重发——这段代码同步压在
+     * 网关的转发路径上，实测 4 条并发流跑 30 秒会白推一百万条记录，吃掉八成六的 CPU。
+     */
+    now += 300;
+    monitor.end(id);
+    const final = events.at(-1);
+    expect(final.patch).toBeUndefined();
+    expect(final.activeRequests).toHaveLength(6);
+  });
+
   it("首字前的大量事件不会拖慢转发（增量解析，不重扫缓冲区）", () => {
     const monitor = new RequestMonitorService({ now: () => 60_000 });
     const id = monitor.start({ profileName: "长前导", protocol: "openai-responses", streaming: true });

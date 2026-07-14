@@ -3,6 +3,7 @@ import { CLIENT_META, DEFAULT_SETTINGS, EMPTY_BOOTSTRAP } from "../config";
 import { MESSAGES, fill, resolveLocale } from "../i18n";
 import { api } from "../lib/api";
 import { describeError, formatDuration, formatTokenCount } from "../lib/format";
+import { mergeActiveRequests } from "../lib/requests";
 import type {
   BootstrapData,
   ClientTarget,
@@ -137,6 +138,20 @@ export function useAgentGateController(): AgentGateController {
 
   useEffect(() => api.onStateChanged((event: StateChangedEvent) => {
     if (event.type === "active-requests-changed") {
+      /*
+       * patch = 只带了还在跑的那几条的最新状态。
+       *
+       * 传输途中每 200ms 一次的进度通知，原本推的是整部历史（最多 2000 条）。那部分
+       * 根本没变，白白序列化过来——主进程那边实测吃掉了转发路径八成六的 CPU。
+       * 现在只推活跃的那几条，这里按 id 就地更新。
+       */
+      if (event.patch) {
+        setData((current) => ({
+          ...current,
+          activeRequests: mergeActiveRequests(current.activeRequests ?? [], event.activeRequests),
+        }));
+        return;
+      }
       setData((current) => ({ ...current, activeRequests: event.activeRequests }));
       return;
     }
