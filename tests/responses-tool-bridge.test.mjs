@@ -45,6 +45,35 @@ describe('Codex Responses 工具兼容桥', () => {
     expect(result.input[1]).toMatchObject({ type: 'function_call_output', call_id: 'call_1' })
   })
 
+  it('改写类型时摘掉带类型前缀的 item.id，避免上游按 fc_ 前缀拒收', () => {
+    // 真实事故：中转按 custom_tool_call 签发 ctc_ 前缀 id，桥把类型改成
+    // function_call 却带着旧 id 回传，上游报 invalid_id_prefix 拒收整个请求。
+    const result = convertRequestPayload({
+      model: 'gpt-test',
+      tools: [{ type: 'custom', name: 'exec' }],
+      input: [
+        {
+          type: 'custom_tool_call',
+          id: 'ctc_0035ca6ca3f441cf016a5530cdb0bc81',
+          call_id: 'call_9',
+          name: 'exec',
+          input: 'Get-Date',
+        },
+        { type: 'custom_tool_call_output', id: 'ctco_77', call_id: 'call_9', output: 'ok' },
+        // 非 exec 项原样通过，id 不能被误伤
+        { type: 'message', id: 'msg_1', role: 'user', content: 'hi' },
+      ],
+    })
+
+    expect(result.input[0].id).toBeUndefined()
+    expect(result.input[0]).toMatchObject({ type: 'function_call', call_id: 'call_9' })
+    expect(result.input[1].id).toBeUndefined()
+    expect(result.input[1]).toMatchObject({ type: 'function_call_output', call_id: 'call_9' })
+    expect(result.input[2]).toMatchObject({ id: 'msg_1' })
+    // 序列化后不能残留 "id": undefined 之类的痕迹
+    expect(JSON.stringify(result)).not.toContain('ctc_')
+  })
+
   it('将分块 function arguments 严格还原为 custom exec SSE', async () => {
     const source = [
       'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"id":"item_1","type":"function_call","name":"exec","call_id":"call_1","arguments":""}}\n\n',

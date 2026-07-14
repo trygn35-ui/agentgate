@@ -324,6 +324,21 @@ function hasTerminalMarker(source) {
   return TERMINAL_MARKER_PATTERN.test(source)
 }
 
+/**
+ * 上游错误事件标记：流只回了个错误就结束时（HTTP 仍是 200），不该记成「已完成」。
+ *
+ * 模式收紧到 SSE 事件行与事件体的 type 字段，避免误伤正文里恰好出现的字样；
+ * 最终判定还要求全程没出现过首个有效 token（见 end()），双保险。
+ */
+const ERROR_EVENT_PATTERN = new RegExp([
+  'event:\\s*(?:response\\.failed|error)\\b',
+  '"type"\\s*:\\s*"(?:response\\.failed|error)"',
+].join('|'))
+
+function hasErrorEvent(source) {
+  return ERROR_EVENT_PATTERN.test(source)
+}
+
 function mergeUsage(current, next) {
   if (!next) return current
   const merged = { ...(current || {}) }
@@ -527,6 +542,9 @@ class RequestMonitorService {
     if (!entry.sawCompletion && hasTerminalMarker(entry.usageBuffer)) {
       entry.sawCompletion = true
     }
+    if (!entry.sawErrorEvent && hasErrorEvent(entry.usageBuffer)) {
+      entry.sawErrorEvent = true
+    }
     if (entry.firstTokenLatencyMs === undefined) {
       entry.detectionBuffer = `${entry.detectionBuffer}${decoded}`
         .slice(-MAX_DETECTION_BUFFER_BYTES)
@@ -571,7 +589,10 @@ class RequestMonitorService {
     // 流里已出现协议级完成标记时，socket 层的中止只是客户端提前收尾，不改判为中止。
     const effectiveOutcome = outcome === 'aborted' && entry.sawCompletion ? undefined : outcome
     entry.outcome = effectiveOutcome || (
-      entry.statusCode !== undefined && entry.statusCode >= 400 ? 'failed' : 'completed'
+      entry.statusCode !== undefined && entry.statusCode >= 400 ? 'failed'
+        // 只见错误事件、始终没等来首个有效 token 的流，是伪装成 200 的失败
+        : entry.sawErrorEvent && entry.firstTokenLatencyMs === undefined ? 'failed'
+          : 'completed'
     )
     entry.state = entry.outcome === 'completed' ? 'completed' : entry.outcome
     entry.detectionBuffer = ''

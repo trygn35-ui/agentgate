@@ -199,6 +199,27 @@ describe("活动请求监视", () => {
     expect(monitor.list()[0]).toMatchObject({ durationMs: 2_000, outcome: "completed" });
   });
 
+  it("只回错误事件的 200 流记为 failed，而不是 completed", () => {
+    // 真实事故：中转校验请求失败后仍以 HTTP 200 开流，只发一个
+    // response.failed 就结束；此前会被记成「已完成」且无任何 token。
+    const monitor = new RequestMonitorService({ now: () => 1_000 });
+    const id = monitor.start({ profileName: "中转", protocol: "openai-responses", streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+    monitor.observeChunk(id, 'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"invalid_id_prefix"}}}\n\n');
+    monitor.end(id);
+    expect(monitor.list()[0]).toMatchObject({ state: "failed", outcome: "failed" });
+  });
+
+  it("正文里出现 error 字样但已产出内容的流仍是 completed", () => {
+    const monitor = new RequestMonitorService({ now: () => 1_000 });
+    const id = monitor.start({ profileName: "中转", protocol: "openai-responses", streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+    monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"讲讲 \\"type\\":\\"error\\" 事件"}\n\n');
+    monitor.observeChunk(id, 'data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}\n\n');
+    monitor.end(id);
+    expect(monitor.list()[0]).toMatchObject({ state: "completed", outcome: "completed" });
+  });
+
   it("提取请求模型、推理强度和真实 usage", () => {
     expect(extractRequestMetadata({
       model: "gpt-5.2-codex",

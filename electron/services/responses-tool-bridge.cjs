@@ -57,10 +57,17 @@ function convertInputItem(item) {
       type: 'function_call',
       arguments: encodeFunctionArguments(item.input),
       input: undefined,
+      /*
+       * 服务端签发的 item.id 前缀即类型：custom_tool_call 是 ctc_、
+       * function_call 是 fc_。改了类型还带着旧前缀的 id，上游会按
+       * 「function_call 必须 fc 开头」拒收整个请求。历史项的 id 本就
+       * 可省略，摘掉最稳；call_id 才是调用与结果的关联键，保留不动。
+       */
+      id: undefined,
     }
   }
   if (item.type === 'custom_tool_call_output') {
-    return { ...item, type: 'function_call_output' }
+    return { ...item, type: 'function_call_output', id: undefined }
   }
   return item
 }
