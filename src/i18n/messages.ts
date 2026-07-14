@@ -140,6 +140,7 @@ export interface Messages {
     /** 展开看发言。 */
     loading: string;
     noMessages: string;
+    pickOne: string;
     loadAll: string;
     showingMessages: string;
     you: string;
@@ -155,6 +156,8 @@ export interface Messages {
     workspace: string;
     unknownWorkspace: string;
     messages: string;
+    /** 列表里跟在条数后面的量词，越短越好。 */
+    msgUnit: string;
     selected: string;
     selectAll: string;
     clear: string;
@@ -413,6 +416,7 @@ const zh: Messages = {
     subtitle: "本机 agent 的会话 · 直接读它们自己的库",
     loading: "正在读取",
     noMessages: "这个会话没有可显示的发言",
+    pickOne: "从左边选一个会话",
     loadAll: "读取全部发言",
     showingMessages: "以上 {count} 条",
     you: "我",
@@ -428,6 +432,7 @@ const zh: Messages = {
     workspace: "工作区",
     unknownWorkspace: "工作区未知",
     messages: "{count} 条消息",
+    msgUnit: "条",
     selected: "已选 {count} 个",
     selectAll: "全选",
     clear: "取消选择",
@@ -690,6 +695,7 @@ const zhTW: Messages = {
     subtitle: "本機 agent 的 session · 直接讀它們自己的資料庫",
     loading: "讀取中",
     noMessages: "這個 session 沒有可顯示的發言",
+    pickOne: "從左邊選一個 session",
     loadAll: "讀取全部發言",
     showingMessages: "以上 {count} 則",
     you: "我",
@@ -705,6 +711,7 @@ const zhTW: Messages = {
     workspace: "工作目錄",
     unknownWorkspace: "工作目錄不明",
     messages: "{count} 則訊息",
+    msgUnit: "則",
     selected: "已選 {count} 個",
     selectAll: "全選",
     clear: "取消選取",
@@ -967,6 +974,7 @@ const ja: Messages = {
     subtitle: "ローカル agent のセッション · 各自の DB を直読み",
     loading: "読み込み中",
     noMessages: "表示できる発言なし",
+    pickOne: "左からセッションを選択",
     loadAll: "すべて読み込む",
     showingMessages: "以上 {count} 件",
     you: "自分",
@@ -982,6 +990,7 @@ const ja: Messages = {
     workspace: "作業ディレクトリ",
     unknownWorkspace: "作業ディレクトリ不明",
     messages: "{count} メッセージ",
+    msgUnit: "件",
     selected: "{count} 件選択中",
     selectAll: "全選択",
     clear: "選択解除",
@@ -1244,6 +1253,7 @@ const en: Messages = {
     subtitle: "Local agent sessions · read straight from their own stores",
     loading: "Loading",
     noMessages: "No messages to show",
+    pickOne: "Pick a session on the left",
     loadAll: "Load all messages",
     showingMessages: "{count} shown",
     you: "You",
@@ -1259,6 +1269,7 @@ const en: Messages = {
     workspace: "Workspace",
     unknownWorkspace: "Workspace unknown",
     messages: "{count} messages",
+    msgUnit: "msg",
     selected: "{count} selected",
     selectAll: "Select all",
     clear: "Clear",

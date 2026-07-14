@@ -1,4 +1,5 @@
 const fs = require('node:fs')
+const readline = require('node:readline')
 const fsp = require('node:fs/promises')
 const os = require('node:os')
 const path = require('node:path')
@@ -33,6 +34,8 @@ const MAX_TITLE_LENGTH = 90
 
 /** Claude Code 的首条用户消息常常是命令桩子，不是人话，得跳过。 */
 const COMMAND_STUB = /^\s*<(?:command-name|command-message|command-args|local-command-|user-prompt-submit-hook)/i
+/** 工具注入进用户消息里的东西，不是用户说的话。 */
+const INJECTED_BLOCK = /<(system-reminder|local-command-stdout|local-command-caveat)>[\s\S]*?<\/\1>/gi
 
 /** 展开看发言：一次最多给这么多条、一条最长这些字。 */
 const MAX_MESSAGES = 200
@@ -63,23 +66,26 @@ async function readTail(file, bytes) {
   }
 }
 
-/** 把 Claude 的一行变成一条发言。工具调用/结果不是发言，压成一句标记。 */
+/**
+ * 把 Claude 的一行变成一条发言。
+ *
+ * 只要真正说出口的话。工具调用、工具结果、思考过程一概不算——它们在正文里占了
+ * 绝大多数，混进来的话整页就是 (Bash) (Write) (Read) 的流水账，看不到人话。
+ * 一条 assistant 记录如果只有工具调用、没有文字，直接整条丢掉。
+ */
 function claudeMessage(record) {
   if (record.type !== 'user' && record.type !== 'assistant') return undefined
   const content = record.message?.content
   let text = ''
   if (typeof content === 'string') text = content
   else if (Array.isArray(content)) {
-    const chunks = []
-    for (const part of content) {
-      if (part?.type === 'text' && typeof part.text === 'string') chunks.push(part.text)
-      else if (part?.type === 'thinking' && typeof part.thinking === 'string') chunks.push(part.thinking)
-      else if (part?.type === 'tool_use') chunks.push(`⟨${part.name ?? 'tool'}⟩`)
-    }
-    text = chunks.join('\n')
+    text = content
+      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('\n')
   }
-  text = text.trim()
-  // 命令桩子和工具回填不是人话，别塞进对话里
+  // <system-reminder> 之类是工具塞进用户消息里的，不是用户说的话
+  text = text.replace(INJECTED_BLOCK, '').trim()
   if (!text || COMMAND_STUB.test(text)) return undefined
   return { role: record.type, text: clampText(text), at: record.timestamp }
 }
@@ -217,6 +223,8 @@ class SessionService {
   constructor({ home = os.homedir(), openDatabase = defaultOpenDatabase } = {}) {
     this.home = home
     this.openDatabase = openDatabase
+    /** 发言条数缓存，键是 路径:大小:改动时间——文件没变就不重扫。 */
+    this.counts = new Map()
     this.roots = {
       claude: path.join(home, '.claude'),
       codex: path.join(home, '.codex'),
@@ -521,8 +529,8 @@ class SessionService {
     if (!fs.existsSync(file)) return []
     const db = this.openDatabase(file, { readonly: true })
     try {
+      // 发言条数不在这儿算：口径统一交给 countMessages，免得列表和正文各说各的
       const rows = db.all(`SELECT s.id, s.title, s.directory, s.time_created, s.time_updated,
-                                  (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS messages,
                                   (SELECT COALESCE(SUM(LENGTH(p.data)), 0) FROM part p
                                     WHERE p.session_id = s.id) AS bytes
                            FROM session s`)
@@ -534,7 +542,6 @@ class SessionService {
         workspace: typeof row.directory === 'string' ? row.directory : '',
         updatedAt: isoOrUndefined(row.time_updated ?? row.time_created),
         sizeBytes: Number(row.bytes) || 0,
-        messages: Number(row.messages) || 0,
       }))
     } finally {
       db.close()
@@ -576,6 +583,95 @@ class SessionService {
       // snapshot/ 是按 项目 + 工作目录哈希 存的，跨会话共享；它还是个 git 仓库，
       // core.worktree 指着用户真实的代码目录——删它可能把用户的工作区搞坏。
       kept: ['snapshot', 'auth'],
+    }
+  }
+
+  // ————————————————————————————— 数发言 —————————————————————————————
+
+  /**
+   * 数每个会话有多少条真发言。
+   *
+   * 三家都没在索引里存这个数，要算就得扫全文——而正文合计 3.8 GB，最大的单个文件
+   * 279 MB。好在中位数只有 0.55 MB：只数「界面上看得见的那几十行」，再按
+   * 路径+大小+改动时间缓存，文件没变就不重扫。
+   *
+   * 数的是和正文里显示的**同一种东西**（真发言，不含工具调用），否则列表说 137 条、
+   * 点开只有 12 条人话，那个数就是在骗人。
+   */
+  async countMessages(ids) {
+    const sessions = await this.list()
+    const index = new Map(sessions.map((session) => [session.id, session]))
+    const counts = {}
+    for (const id of ids) {
+      const session = index.get(id)
+      if (!session) continue
+      try {
+        counts[id] = await this._count(session)
+      } catch {
+        // 数不出来就不显示，别拿一个假数糊弄
+      }
+    }
+    return counts
+  }
+
+  async _count(session) {
+    if (session.client === 'opencode') return this._countOpenCode(session)
+
+    const file = session.client === 'claude'
+      ? await this._claudeFile(session.nativeId)
+      : await this._codexFile(session.nativeId)
+    if (!file) return 0
+    const stats = await statOrUndefined(file)
+    if (!stats) return 0
+
+    const key = `${file}:${stats.size}:${stats.mtimeMs}`
+    const cached = this.counts.get(key)
+    if (cached !== undefined) return cached
+
+    const pick = session.client === 'claude' ? claudeMessage : codexMessage
+    // 先做廉价的子串预筛，命中了才 JSON.parse——279 MB 的文件里只有 449 行是候选
+    const hint = session.client === 'claude'
+      ? (line) => line.includes('"type":"user"') || line.includes('"type":"assistant"')
+      : (line) => line.includes('"user_message"') || line.includes('"agent_message"')
+
+    let total = 0
+    const reader = readline.createInterface({
+      input: fs.createReadStream(file, { highWaterMark: 1 << 20 }),
+      crlfDelay: Infinity,
+    })
+    try {
+      for await (const line of reader) {
+        if (!hint(line)) continue
+        let record
+        try {
+          record = JSON.parse(line)
+        } catch {
+          continue
+        }
+        if (pick(record)) total += 1
+      }
+    } finally {
+      reader.close()
+    }
+    this.counts.set(key, total)
+    return total
+  }
+
+  _countOpenCode(session) {
+    const db = this.openDatabase(this._openCodeDb(), { readonly: true })
+    try {
+      // 只数有正文的消息。纯工具/步骤的 part 不是发言，正文里也不显示。
+      const row = db.get(
+        `SELECT COUNT(*) AS total FROM message m
+          WHERE m.session_id = ?
+            AND EXISTS (SELECT 1 FROM part p
+                         WHERE p.message_id = m.id
+                           AND json_extract(p.data, '$.type') = 'text')`,
+        session.nativeId,
+      )
+      return Number(row?.total) || 0
+    } finally {
+      db.close()
     }
   }
 

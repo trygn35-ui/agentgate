@@ -28,6 +28,7 @@ function openDatabase(file, { readonly = false } = {}) {
 }
 
 let home;
+let openCodePartBytes = 0;
 
 function write(relative, content) {
   const full = path.join(home, relative);
@@ -128,11 +129,19 @@ function seedOpenCode() {
     .run("ses_a", "E:\\留存资源\\放置游戏", "角色移速 bug", 1_700_000_000_000, 1_700_000_200_000);
   db.prepare("INSERT INTO session VALUES (?,?,?,?,?)")
     .run("ses_b", "E:\\别的", "留着的", 1_700_000_000_000, 1_700_000_010_000);
-  db.prepare("INSERT INTO message VALUES (?,?,?)").run("msg_a", "ses_a", "hello");
-  db.prepare("INSERT INTO message VALUES (?,?,?)").run("msg_b", "ses_b", "keep");
-  db.prepare("INSERT INTO part VALUES (?,?,?,?)").run("prt_a", "msg_a", "ses_a", "1234567890");
-  db.prepare("INSERT INTO part VALUES (?,?,?,?)").run("prt_b", "msg_b", "ses_b", "keep");
+  // 真实的 OpenCode：message.data 里有 role，正文在 part.data 的 JSON 里
+  db.prepare("INSERT INTO message VALUES (?,?,?)")
+    .run("msg_a", "ses_a", JSON.stringify({ role: "user" }));
+  db.prepare("INSERT INTO message VALUES (?,?,?)")
+    .run("msg_b", "ses_b", JSON.stringify({ role: "assistant" }));
+  const textPart = JSON.stringify({ type: "text", text: "角色移速不对" });
+  db.prepare("INSERT INTO part VALUES (?,?,?,?)").run("prt_a", "msg_a", "ses_a", textPart);
+  db.prepare("INSERT INTO part VALUES (?,?,?,?)").run("prt_b", "msg_b", "ses_b", textPart);
+  // 纯工具的 part 不是发言：数条数时不该算，正文里也不显示
+  db.prepare("INSERT INTO part VALUES (?,?,?,?)")
+    .run("prt_tool", "msg_a", "ses_a", JSON.stringify({ type: "tool", tool: "bash" }));
   db.prepare("INSERT INTO todo VALUES (?,?)").run("td_a", "ses_a");
+  openCodePartBytes = textPart.length + JSON.stringify({ type: "tool", tool: "bash" }).length;
   db.close();
   write("storage/session_diff/ses_a.json", "[]");
   write("auth.json", '{"key":"绝密"}');
@@ -191,10 +200,46 @@ describe("会话清单", () => {
     expect(codex.title).toBe("留着的会话");
   });
 
-  it("OpenCode 报出消息数与正文字节", async () => {
+  it("OpenCode 报出正文字节", async () => {
     const oc = (await service().list()).find((s) => s.nativeId === "ses_a");
-    expect(oc).toMatchObject({ title: "角色移速 bug", messages: 1, sizeBytes: 10 });
+    expect(oc).toMatchObject({ title: "角色移速 bug", sizeBytes: openCodePartBytes });
     expect(oc.workspace).toBe("E:\\留存资源\\放置游戏");
+    // 条数不在清单里算——要扫全文，交给 countMessages 按需数
+    expect(oc.messages).toBeUndefined();
+  });
+});
+
+describe("发言条数", () => {
+  it("三家都数得出来，数的是真发言不是工具调用", async () => {
+    const svc = service();
+    const list = await svc.list();
+    const ids = ["claude", "codex", "opencode"].map(
+      (client) => list.find((s) => s.client === client).id,
+    );
+    const counts = await svc.countMessages(ids);
+
+    /*
+     * Claude 那条正文里有 4 行记录：命令桩子、一句真话、一句回复、cd 之后的一句。
+     * 桩子不算发言，所以是 3 条——列表说几条，点开就该看到几条，不能各说各的。
+     */
+    expect(counts[ids[0]]).toBe(3);
+    expect(counts[ids[1]]).toBeGreaterThanOrEqual(0);
+    expect(counts[ids[2]]).toBe(1);
+  });
+
+  it("同一个文件不重扫：结果按 路径+大小+改动时间 缓存", async () => {
+    const svc = service();
+    const claude = (await svc.list()).find((s) => s.client === "claude");
+    const first = await svc.countMessages([claude.id]);
+    expect(svc.counts.size).toBe(1);
+    // 再数一次不该再开一条读流——正文能有 279 MB，扫一遍不便宜
+    const again = await svc.countMessages([claude.id]);
+    expect(again).toEqual(first);
+    expect(svc.counts.size).toBe(1);
+  });
+
+  it("不存在的会话安静跳过", async () => {
+    expect(await service().countMessages(["claude:没这个"])).toEqual({});
   });
 });
 

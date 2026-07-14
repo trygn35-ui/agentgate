@@ -389,6 +389,8 @@ export interface AgentGateBridge {
   listSessions?(): Promise<AgentSession[]>;
   /** 读会话最后的若干条发言。limit=0 表示尽量多。 */
   readSessionMessages?(id: string, limit?: number): Promise<SessionTranscript>;
+  /** 数发言条数。要扫全文，所以只对界面上看得见的那几十行调，结果按文件指纹缓存。 */
+  countSessionMessages?(ids: string[]): Promise<Record<string, number>>;
   /** 演练：删这些会话会动到哪些文件和数据库行。 */
   planSessionRemoval?(ids: string[]): Promise<SessionRemovalPlan[]>;
   /** 真删。不可逆。渲染进程只递 id，删什么由主进程算。 */

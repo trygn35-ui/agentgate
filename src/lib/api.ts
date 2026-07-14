@@ -641,6 +641,17 @@ const mockBridge: AgentGateBridge = {
     return { messages, truncated: want < script.length || Boolean(session && session.sizeBytes > 5e7) };
   },
 
+  async countSessionMessages(ids: string[]) {
+    await new Promise((resolve) => setTimeout(resolve, 380));
+    const counts: Record<string, number> = {};
+    for (const id of ids) {
+      const session = mockSessions.find((item) => item.id === id);
+      // 假数据里按体积估一个像样的条数，真机是扫全文数出来的
+      if (session) counts[id] = Math.max(2, Math.round(session.sizeBytes / 620_000));
+    }
+    return counts;
+  },
+
   async planSessionRemoval(ids: string[]) {
     return clone(mockSessions.filter((s) => ids.includes(s.id)).map((s) => ({
       id: s.id,

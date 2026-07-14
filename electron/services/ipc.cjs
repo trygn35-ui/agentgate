@@ -21,6 +21,7 @@ const CHANNELS = Object.freeze({
   // 会话不进 bootstrap：扫一遍要翻上百个正文文件加两个 SQLite，开页面时再拉
   listSessions: 'agentgate:list-sessions',
   readSessionMessages: 'agentgate:read-session-messages',
+  countSessionMessages: 'agentgate:count-session-messages',
   planSessionRemoval: 'agentgate:plan-session-removal',
   removeSessions: 'agentgate:remove-sessions',
   checkForUpdate: 'agentgate:check-for-update',
@@ -259,6 +260,9 @@ function registerIpcHandlers({
     sessionService
       ? sessionService.readMessages(SessionIdSchema.parse(id), { limit: MessageLimitSchema.parse(limit) })
       : { messages: [], truncated: false }
+  ))
+  ipcMain.handle(CHANNELS.countSessionMessages, async (_event, ids) => (
+    sessionService ? sessionService.countMessages(SessionIdsSchema.parse(ids)) : {}
   ))
   ipcMain.handle(CHANNELS.planSessionRemoval, async (_event, ids) => (
     sessionService ? sessionService.plan(SessionIdsSchema.parse(ids)) : []

@@ -2109,181 +2109,453 @@ code, .num, [data-num] { font-variant-numeric: tabular-nums; }
 }
 .empty-state .primary-pill, .empty-state .ghost-pill { margin: 10px auto 0; }
 
-/* ————————————————————————— 会话页 ————————————————————————— */
+/* ————————————————————————— 会话页 —————————————————————————
+ *
+ * 左边一列索引，右边是词条正文——SG 的 TIPS 那一页就是这个结构。
+ * 两栏各自滚动，页面本身不滚。
+ *
+ * 这一页里没有任何原生控件：勾选框、滚动条、搜索框、刷新键全是自己画的。
+ * 原生的那些带着系统的圆角、渐变和聚焦环，和这套印刷/仪表的语言对不上。
+ */
 
-.session-cell { position: relative; }
-
-.session-row {
+.sessions-page {
+  position: relative;
+  z-index: 1;
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) 96px 104px 16px;
-  gap: 12px;
-  align-items: center;
-  min-height: 54px;
-  padding: 8px 4px;
-  border-bottom: 1px solid var(--line);
-  cursor: pointer;
-  animation: row-in 300ms cubic-bezier(.2, .9, .25, 1) backwards;
-  transition: background 180ms ease, box-shadow 180ms ease;
-}
-.session-cell:nth-child(even) .session-row { background: var(--soft); }
-.session-row:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
-.session-row:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
-/* 展开的那一行是当前焦点，压住底线让它和下面的正文连成一体 */
-.session-row.open {
-  background: color-mix(in srgb, var(--accent) 6%, transparent);
-  border-bottom-color: transparent;
-}
-/* 选中 = 即将被删。用警示色，别让人误以为只是高亮。 */
-.session-row.picked {
-  background: color-mix(in srgb, var(--bad) 8%, transparent);
-  box-shadow: inset 2px 0 0 var(--bad);
-}
-.session-row input[type="checkbox"] {
-  width: 14px;
-  height: 14px;
-  accent-color: var(--bad);
-  cursor: pointer;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+  padding: 20px 20px 0;
+  /*
+   * clip 而不是 hidden。
+   *
+   * hidden 只是不给用户滚动条，元素本身仍然是个滚动容器——scrollTop 照样能被设，
+   * 键盘聚焦到下面的条目时浏览器还会自己把整页顶上去，两栏就一起错位了。
+   * clip 压根不建滚动容器：这一页只负责分栏，滚动是两栏自己的事。
+   */
+  overflow: clip;
 }
 
-.session-main { min-width: 0; }
-.session-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.session-title strong {
-  flex: 0 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--fs-base);
-  font-weight: 600;
-}
-.session-path {
+.sessions-head {
   display: flex;
   align-items: center;
-  gap: 5px;
-  margin-top: 3px;
-  overflow: hidden;
-  font-family: var(--mono);
-  font-size: var(--fs-xs);
-  color: var(--ink-quiet);
-  white-space: nowrap;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line-strong);
 }
-.session-path svg { flex: 0 0 auto; opacity: .6; }
+.sessions-head h1 {
+  margin: 0;
+  font-size: var(--fs-3xl);
+  font-weight: 600;
+  letter-spacing: -.01em;
+}
 
-.session-size { text-align: right; white-space: nowrap; }
-.session-size code { font-family: var(--mono); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
-.session-size small {
-  display: block;
-  margin-top: 2px;
-  font-size: var(--fs-label);
-  color: var(--ink-quiet);
-}
-.session-when {
-  text-align: right;
-  font-size: var(--fs-xs);
-  color: var(--ink-quiet);
-  white-space: nowrap;
-}
-.session-chev {
-  color: var(--ink-quiet);
-  transition: transform 260ms cubic-bezier(.16, .84, .3, 1);
-}
-.session-chev.flip { transform: rotate(180deg); color: var(--accent-ink); }
+/* ——— 自绘搜索框：一条下划线，没有圆角框，也没有原生的清除叉 ——— */
 
-.session-search {
+.finder {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
   width: 150px;
   height: 24px;
-  padding: 0 8px;
-  border: 1px solid var(--line-strong);
-  border-radius: 2px;
-  background: var(--paper);
+  transition: width 260ms cubic-bezier(.16, .84, .3, 1);
+}
+.finder:focus-within { width: 214px; }
+.finder input {
+  width: 100%;
+  height: 100%;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
   color: var(--ink);
   font-family: var(--mono);
   font-size: var(--fs-xs);
-  transition: width 240ms cubic-bezier(.16, .84, .3, 1), border-color 160ms ease;
+  outline: none;
+  appearance: none;
 }
-.session-search:focus { width: 210px; border-color: var(--accent); outline: none; }
-.session-search::-webkit-search-cancel-button { filter: grayscale(1); opacity: .5; }
+.finder input::placeholder { color: var(--ink-quiet); }
+/* 下划线：静止时是细线，聚焦时从中间向两端拉成实线 */
+.finder i {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: var(--line-strong);
+}
+.finder i::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--accent);
+  transform: scaleX(0);
+  transition: transform 240ms cubic-bezier(.16, .84, .3, 1);
+}
+.finder:focus-within i::after { transform: scaleX(1); }
+.finder > button {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-quiet);
+  cursor: pointer;
+}
+.finder > button:hover { color: var(--bad); }
 
-/* ——— 展开后的对话 ——— */
+/* ——— 自绘刷新键：一个方框，转起来的是里面的针 ——— */
 
-.transcript {
-  margin: 0 0 0 30px;
-  padding: 10px 14px 12px;
-  border-left: 1px solid var(--line-strong);
+.restat {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink-quiet);
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+}
+.restat:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.restat:disabled { opacity: .5; cursor: default; }
+.restat .spin { animation: spin 900ms linear infinite; }
+
+/* ——— 自绘滚动轨 ——— */
+
+/* 滚动容器和它的轨道并排。轨道常驻，装得下也在。 */
+.pane {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 10px;
+  /*
+   * 行高必须钉死成一格 1fr。
+   *
+   * 只写 columns 的话，隐式行是 auto——它会一路长到内容那么高（80 条就是 4300px），
+   * 容器再也框不住它，子元素拿不到确定高度，overflow-y: auto 就永远不会生效，
+   * 滚动条也就无从谈起。
+   */
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+}
+.pane > :first-child {
+  min-height: 0;
+  overflow-y: auto;
+  /* 原生滚动条一律不要 */
+  scrollbar-width: none;
+}
+.pane > :first-child::-webkit-scrollbar { width: 0; height: 0; }
+
+.rail {
+  position: relative;
+  width: 10px;
+  min-height: 0;
+  cursor: pointer;
+  /* 轨槽：一条细缝，压在纸上 */
+  background:
+    linear-gradient(var(--line) 0 0) center / 1px 100% no-repeat;
+}
+.rail-thumb {
+  position: absolute;
+  top: 0;
+  right: 1px;
+  left: 1px;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 2px;
+  border: 1px solid var(--line-strong);
+  background: var(--paper);
+  cursor: grab;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+.rail-thumb:hover,
+body.rail-dragging .rail-thumb {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--paper));
+}
+body.rail-dragging { cursor: grabbing; user-select: none; }
+body.rail-dragging .rail-thumb { cursor: grabbing; }
+/* 滑块上的两道刻痕：是抓手，也是这套仪表语言的一部分 */
+.rail-thumb i {
+  width: 4px;
+  height: 1px;
+  background: var(--ink-quiet);
+  opacity: .7;
+}
+/* 装得下的时候滑块占满全轨——它仍旧在那儿，只是没得可拖 */
+.rail-full .rail-thumb {
+  cursor: default;
+  border-color: var(--line);
+  background: transparent;
+}
+.rail-full .rail-thumb i { opacity: 0; }
+
+/* ——— 左栏：索引 ——— */
+
+.sessions-split {
+  display: grid;
+  grid-template-columns: minmax(300px, 34%) minmax(0, 1fr);
+  min-height: 0;
+}
+
+.session-index {
+  padding: 4px 6px 24px 0;
+  /* 中缝的竖线画在这儿，右栏不再加边框，否则两条会叠成一条粗的 */
+  border-right: 1px solid var(--line-strong);
+}
+
+.index-item {
+  display: grid;
+  grid-template-columns: 13px 24px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  padding: 9px 10px 9px 4px;
   border-bottom: 1px solid var(--line);
-  animation: transcript-open 300ms cubic-bezier(.16, .84, .3, 1);
+  cursor: pointer;
+  animation: row-in 280ms cubic-bezier(.2, .9, .25, 1) backwards;
+  transition: background 150ms ease, box-shadow 150ms ease;
 }
-@keyframes transcript-open {
-  from { opacity: 0; transform: translateY(-6px); }
-  to { opacity: 1; transform: none; }
+.index-item:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.index-item:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+/* 正在看的那一条：左边竖一条实线，像 TIPS 里的游标 */
+.index-item.current {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.index-item.current .index-no,
+.index-item.current .index-main strong { color: var(--accent-ink); }
+/* 勾中 = 即将被删。压过「正在看」——那是更要紧的状态。 */
+.index-item.picked {
+  background: color-mix(in srgb, var(--bad) 9%, transparent);
+  box-shadow: inset 2px 0 0 var(--bad);
+}
+.index-item.picked .index-no,
+.index-item.picked .index-main strong { color: var(--bad); }
+
+/* ——— 自绘勾选框 ——— */
+
+.tick {
+  display: grid;
+  place-items: center;
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+  transition: border-color 150ms ease, background 150ms ease;
+}
+.tick:hover:not(:disabled) { border-color: var(--bad); }
+.tick:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.tick:disabled { opacity: .45; cursor: default; }
+/* 勾中就实心填成警示色——勾中意味着这条会话即将被删 */
+.tick span {
+  width: 7px;
+  height: 7px;
+  background: var(--bad);
+  transform: scale(0);
+  transition: transform 180ms cubic-bezier(.16, .84, .3, 1);
+}
+.tick.on { border-color: var(--bad); }
+.tick.on span { transform: scale(1); }
+
+.index-no {
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-quiet);
+  user-select: none;
+}
+.index-main { min-width: 0; }
+.index-main strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.index-main code {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  color: var(--ink-quiet);
+}
+.index-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  white-space: nowrap;
+}
+.index-count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-quiet);
+}
+.index-count em,
+.index-when {
+  font-style: normal;
+  font-size: var(--fs-label);
+  color: var(--ink-quiet);
 }
 
+/* ——— 右栏：正文 ——— */
+
+.detail {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  padding-left: 20px;
+}
+.detail-empty {
+  display: grid;
+  place-items: center;
+  padding-bottom: 40px;
+}
+.detail-empty p {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  letter-spacing: .1em;
+  color: var(--ink-quiet);
+}
+
+.detail-head {
+  padding: 4px 0 12px;
+  /* 双线：SG 里词条标题下面就是这么收口的 */
+  border-bottom: 3px double var(--line-strong);
+}
+.detail-head h2 {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-xl);
+  font-weight: 600;
+}
+.detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7px;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--ink-quiet);
+}
+.detail-meta code {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+}
+.detail-meta svg { flex: 0 0 auto; opacity: .6; }
+.detail-dot {
+  width: 3px;
+  height: 3px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--ink-quiet);
+  opacity: .5;
+}
+
+.detail-body { padding: 12px 14px 28px 0; }
+
+.detail-note {
+  margin: 10px 0;
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  letter-spacing: .08em;
+  color: var(--ink-quiet);
+}
+.detail-more {
+  margin-bottom: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: border-color 150ms ease, color 150ms ease, background 150ms ease;
+}
+.detail-more:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.detail-more:disabled { opacity: .55; cursor: default; }
+
+/* 一句发言：左边是说话人，右边是话。 */
 .say {
   display: grid;
-  grid-template-columns: 52px minmax(0, 1fr);
-  gap: 12px;
-  padding: 7px 0;
-  animation: row-in 280ms cubic-bezier(.2, .9, .25, 1) backwards;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 14px;
+  padding: 9px 0;
+  animation: row-in 260ms cubic-bezier(.2, .9, .25, 1) backwards;
 }
 .say + .say { border-top: 1px dashed var(--line); }
 .say-who {
-  padding-top: 1px;
+  padding-top: 2px;
   font-family: var(--mono);
   font-size: var(--fs-label);
-  letter-spacing: .1em;
+  letter-spacing: .12em;
   color: var(--ink-quiet);
   user-select: none;
 }
 /* 人说的话立起来，模型说的话退后——一眼分得清谁在说 */
 .say-user .say-who { color: var(--accent-ink); }
-.say-user p { color: var(--ink); font-weight: 500; }
-.say-assistant p { color: var(--ink-soft, var(--ink)); }
+.say-user p { font-weight: 500; }
 .say p {
   margin: 0;
-  /* 正文可能极长，只给一段的高度，够看清是什么就行 */
-  max-height: 168px;
+  /* 一条能有几千字，给个高度上限，超了自己滚 */
+  max-height: 220px;
   overflow: auto;
   font-size: var(--fs-sm);
-  line-height: 1.62;
+  line-height: 1.66;
   white-space: pre-wrap;
   word-break: break-word;
+  scrollbar-width: none;
 }
+.say p::-webkit-scrollbar { width: 0; }
 
-.transcript-note {
-  margin: 8px 0 0;
-  font-family: var(--mono);
-  font-size: var(--fs-label);
-  letter-spacing: .06em;
-  color: var(--ink-quiet);
-}
-.transcript-more {
-  margin-bottom: 8px;
-  padding: 3px 9px;
-  border: 1px solid var(--line-strong);
-  border-radius: 2px;
-  background: transparent;
-  color: var(--ink-soft, var(--ink));
-  font-family: var(--mono);
-  font-size: var(--fs-xs);
-  cursor: pointer;
-  transition: border-color 160ms ease, color 160ms ease;
-}
-.transcript-more:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-ink); }
-.transcript-more:disabled { opacity: .55; cursor: default; }
-
-/* 选中后升起的操作条。没选中就不占地方。 */
+/* 选中后从底部升起的操作条。没选中就不占地方。 */
 .session-bar {
-  position: sticky;
-  bottom: 0;
+  position: absolute;
+  right: 20px;
+  bottom: 14px;
+  left: 20px;
   z-index: 6;
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 0 20px 14px;
   padding: 10px 14px;
   border: 1px solid var(--line-strong);
-  border-radius: 3px;
   background: var(--paper);
-  box-shadow: 0 6px 24px rgb(0 0 0 / .16);
+  box-shadow: 0 6px 24px rgb(0 0 0 / .18);
   animation: bar-rise 280ms cubic-bezier(.16, .84, .3, 1) backwards;
 }
 .session-bar > span:first-child {
@@ -2303,7 +2575,6 @@ code, .num, [data-num] { font-variant-numeric: tabular-nums; }
   margin: 12px 0 4px;
   padding: 10px 12px;
   border: 1px solid var(--line);
-  border-radius: 3px;
   background: var(--soft);
 }
 .plan-row { display: flex; align-items: baseline; gap: 10px; padding: 3px 0; }
@@ -2327,5 +2598,3 @@ code, .num, [data-num] { font-variant-numeric: tabular-nums; }
   line-height: 1.5;
   color: var(--ink-quiet);
 }
-
-.btn-icon { display: inline-grid; place-items: center; width: 26px; height: 24px; padding: 0; }
