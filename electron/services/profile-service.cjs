@@ -15,6 +15,25 @@ const { SerialExecutor } = require('./storage.cjs')
 const ProfileIdSchema = z.string().uuid()
 const ConnectionRevisionSchema = z.number().int().positive()
 const EMPTY_KEY_HINT = 'Not set'
+
+/** 网关一条条请求攒出来的账。编辑方案时必须原样带走，见 save()。 */
+const TOKEN_ACCOUNTING_FIELDS = Object.freeze([
+  'tokenUsageTotal',
+  'tokenInputTotal',
+  'tokenCachedTotal',
+  'tokenCacheWriteTotal',
+  'tokenReasoningTotal',
+  'tokenDayKey',
+  'tokenUsageToday',
+])
+
+function tokenAccounting(profile) {
+  const result = {}
+  for (const field of TOKEN_ACCOUNTING_FIELDS) {
+    if (profile?.[field] !== undefined) result[field] = profile[field]
+  }
+  return result
+}
 const MAX_DISCOVERED_MODELS = 1_000
 const HEALTH_HISTORY_WINDOW_MS = 60 * 60_000
 const HEALTH_TIMELINE_WINDOW_MS = 2 * 60 * 60_000
@@ -293,6 +312,14 @@ class ProfileService {
           ? { modelsCheckedAt: existing.modelsCheckedAt }
           : {}),
         ...(activeEndpoint.health ? { health: activeEndpoint.health } : {}),
+        /*
+         * 累计用量必须原样带过来。
+         *
+         * 这个对象是从零重建的，编辑一次名字就把累计 Token、缓存率的分母全部
+         * 归零——那是网关一条条请求攒出来的账，不是这次编辑的输入。哪怕换了
+         * Key、换了 URL 也照样保留：账记在「方案」名下，跟着方案走。
+         */
+        ...tokenAccounting(existing),
       }
 
       if (existingIndex >= 0) data.profiles[existingIndex] = profile

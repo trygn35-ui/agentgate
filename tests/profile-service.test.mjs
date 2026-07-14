@@ -265,6 +265,57 @@ describe("Token 用量统计", () => {
     expect(profile.tokenInputTotal).toBe(1_000);
     expect(profile.tokenCachedTotal).toBe(750);
   });
+
+  it("编辑方案不清空累计用量", async () => {
+    const { profileStore } = createTestStores(root);
+    const profileService = new ProfileService(profileStore, testVault);
+    const created = await profileService.save({
+      name: "改前",
+      protocol: "anthropic",
+      baseUrl: "https://usage.example",
+      apiKey: "sk-usage-secret",
+      model: "claude-sonnet-4-5",
+      authMode: "bearer",
+      targets: ["claude"],
+    });
+    await profileService.addTokenUsage(created.id, {
+      totalTokens: 32_305,
+      inputTokens: 32_000,
+      cachedTokens: 30_000,
+      cacheWriteTokens: 1_500,
+      reasoningTokens: 200,
+      outputTokens: 305,
+    });
+
+    /*
+     * save() 是从零重建方案对象的——这些账是网关一条条请求攒出来的，不是这次
+     * 编辑的输入，编辑一次名字就归零等于把密钥页的累计和缓存率全部清掉。
+     * 连 Key、URL 一起换也照样保留：账记在「方案」名下。
+     */
+    const renamed = await profileService.save({
+      id: created.id,
+      name: "改后（连 Key 和 URL 一起换）",
+      protocol: "anthropic",
+      baseUrl: "https://other.example",
+      apiKey: "sk-brand-new-secret",
+      model: "claude-sonnet-4-5",
+      authMode: "bearer",
+      targets: ["claude"],
+    });
+
+    expect(renamed.tokenUsageTotal).toBe(32_305);
+    expect(renamed.tokenInputTotal).toBe(32_000);
+    expect(renamed.tokenCachedTotal).toBe(30_000);
+    expect(renamed.tokenCacheWriteTotal).toBe(1_500);
+    expect(renamed.tokenReasoningTotal).toBe(200);
+    expect(renamed.tokenUsageToday).toBe(32_305);
+    expect(renamed.tokenDayKey).toBeTruthy();
+
+    // 编辑之后继续记账，要接着累计而不是另起炉灶
+    await profileService.addTokenUsage(created.id, { totalTokens: 100, inputTokens: 90 });
+    const [after] = await profileService.list();
+    expect(after.tokenUsageTotal).toBe(32_405);
+  });
 });
 
 describe("当日 Token 统计", () => {
