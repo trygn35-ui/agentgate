@@ -35,6 +35,19 @@ const PICKER_GUTTER = 34;
 const PICKER_MIN = 132;
 
 /**
+ * 鼠标滚轮一格在 Chromium 上是 100px 的大增量；触控板是一串几像素的小增量。
+ * 用这个阈值把两者分开——只接管滚轮，触控板本来就是像素级平滑滚动，别插手。
+ */
+const WHEEL_NOTCH_MIN = 50;
+
+/** 量一项有多高（含间距）。两项以上就用它们的间距，那才是真正的一格。 */
+function itemStep(node: HTMLElement): number {
+  const items = node.querySelectorAll<HTMLElement>(".picker-item");
+  if (items.length >= 2) return items[1].offsetTop - items[0].offsetTop;
+  return items[0]?.offsetHeight ?? 44;
+}
+
+/**
  * 方案菜单：最大高度按「卡片下方在当前窗口里还剩多少」现算，内部滚动。
  *
  * 写死一个 max-height 没用——窗口高度是用户随便拖的，卡片本身的 y 坐标又随
@@ -43,6 +56,8 @@ const PICKER_MIN = 132;
 function PickerMenu({ label, children }: { label: string; children: ReactNode }): ReactElement {
   const ref = useRef<HTMLDivElement>(null);
   const [maxHeight, setMaxHeight] = useState<number>();
+  /** 滚动目标位。连着拨滚轮时得从上一次的目标接着算，而不是从还在路上的实时位置。 */
+  const goal = useRef<number>(undefined);
 
   useLayoutEffect(() => {
     function measure(): void {
@@ -54,6 +69,36 @@ function PickerMenu({ label, children }: { label: string; children: ReactNode })
     measure();
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
+  }, []);
+
+  // 滚轮一格滚一项。系统默认一格 100px，在这个高度的菜单里一下就窜过去两三项。
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return undefined;
+
+    function onWheel(event: WheelEvent): void {
+      const menu = ref.current;
+      if (!menu) return;
+      const limit = menu.scrollHeight - menu.clientHeight;
+      // 装得下就不拦：让滚轮事件冒上去滚页面
+      if (limit <= 1 || Math.abs(event.deltaY) < WHEEL_NOTCH_MIN) return;
+      event.preventDefault();
+      const from = goal.current ?? menu.scrollTop;
+      const next = Math.min(limit, Math.max(0, from + Math.sign(event.deltaY) * itemStep(menu)));
+      goal.current = next;
+      menu.scrollTo({ top: next, behavior: "smooth" });
+    }
+    // 滚停了就把目标交还给真实位置，免得跟键盘聚焦滚动之类的别的滚动源打架
+    function onScrollEnd(): void {
+      goal.current = undefined;
+    }
+
+    node.addEventListener("wheel", onWheel, { passive: false });
+    node.addEventListener("scrollend", onScrollEnd);
+    return () => {
+      node.removeEventListener("wheel", onWheel);
+      node.removeEventListener("scrollend", onScrollEnd);
+    };
   }, []);
 
   return (

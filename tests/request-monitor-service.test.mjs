@@ -30,9 +30,11 @@ describe("活动请求监视", () => {
       protocol: "openai-chat",
     });
 
-    expect(monitor.list().map((request) => request.id)).toEqual([first, second]);
+    // 最新的永远在最上面：不按「活跃优先」分组，也不按完成时间排
+    expect(monitor.list().map((request) => request.id)).toEqual([second, first]);
     now += 25;
     expect(monitor.end(first)).toBe(true);
+    // first 刚刚完成，但它开始得早，所以仍排在还活着的 second 下面
     expect(monitor.list().map((request) => request.id)).toEqual([second, first]);
     expect(monitor.list()[1]).toMatchObject({
       id: first,
@@ -444,5 +446,73 @@ describe("中止归类", () => {
     monitor.end(id, { outcome: "aborted" });
 
     expect(monitor.list()[0]).toMatchObject({ state: "aborted", outcome: "aborted" });
+  });
+
+  it("后开始的请求排在前面，跟谁先完成无关", () => {
+    let now = 40_000;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const early = monitor.start({ profileName: "先发起" });
+    now += 10;
+    const late = monitor.start({ profileName: "后发起" });
+
+    // 后发起的先完成——老写法按完成时间 unshift，会把它排到已完成组的最前面，
+    // 而 early 还活着又被「活跃优先」顶到最上面，时间戳列于是乱的。
+    now += 5;
+    monitor.end(late);
+    now += 5;
+    monitor.end(early);
+
+    expect(monitor.list().map((request) => request.profileName))
+      .toEqual(["后发起", "先发起"]);
+  });
+
+  it("多字节字符被 chunk 从中间劈开也不会解错", () => {
+    let now = 50_000;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const id = monitor.start({ profileName: "分片", protocol: "openai-responses", streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+
+    const payload = Buffer.from(
+      'data: {"type":"response.output_text.delta","delta":"世界线"}\n\n',
+      "utf8",
+    );
+    // 「世」是 3 字节，切在它中间。逐字节 toString('utf8') 会解出替换字符，
+    // 整块 JSON 就废了；StringDecoder 会把残字节留到下一片。
+    const cut = payload.indexOf(Buffer.from("世", "utf8")) + 1;
+    now += 20;
+    expect(monitor.observeChunk(id, payload.subarray(0, cut))).toBe(false);
+    expect(monitor.observeChunk(id, payload.subarray(cut))).toBe(true);
+    expect(monitor.list()[0]).toMatchObject({ firstTokenLatencyMs: 20, state: "streaming" });
+  });
+
+  it("首字前的大量事件不会拖慢转发（增量解析，不重扫缓冲区）", () => {
+    const monitor = new RequestMonitorService({ now: () => 60_000 });
+    const id = monitor.start({ profileName: "长前导", protocol: "openai-responses", streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+
+    /*
+     * 首字之前塞 4000 个非有效事件——推理模型开流后常先刷一串状态事件。
+     *
+     * 老写法每来一片就把整个累积缓冲区重新 split + JSON.parse 一遍（还切两遍、
+     * 每行 parse 两次），这段代码又同步卡在网关的转发路径上：实测 800 个事件就给
+     * 首字硬加了 1.4 秒。这里 4000 个，老写法要跑几十秒；增量解析是几毫秒。
+     * 上限拍在 2 秒——离新写法有几百倍余量，又稳稳卡死 O(n²) 的回归。
+     */
+    const started = performance.now();
+    for (let index = 0; index < 4_000; index += 1) {
+      monitor.observeChunk(
+        id,
+        `event: response.output_item.added\ndata: ${JSON.stringify({
+          type: "response.output_item.added",
+          output_index: index,
+          item: { type: "reasoning", id: `rs_${index}`, summary: [] },
+        })}\n\n`,
+      );
+    }
+    const elapsed = performance.now() - started;
+
+    expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
+    expect(monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"来"}\n\n')).toBe(true);
+    expect(elapsed).toBeLessThan(2_000);
   });
 });

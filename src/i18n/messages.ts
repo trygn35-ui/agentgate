@@ -115,6 +115,12 @@ export interface Messages {
     done: string;
     fail: string;
     cache: string;
+    /** 请求行里 ↓↑CWR 五个缩写的全称，只在悬停提示里出现。 */
+    tipIn: string;
+    tipOut: string;
+    tipCache: string;
+    tipWrite: string;
+    tipReason: string;
     empty: string;
     noMatch: string;
     resolving: string;
@@ -347,6 +353,11 @@ const zh: Messages = {
     done: "完成",
     fail: "异常",
     cache: "缓存率",
+    tipIn: "全部提示 Token（含缓存读写）",
+    tipOut: "输出 Token",
+    tipCache: "命中的提示 Token（便宜）",
+    tipWrite: "写入的缓存（按 1.25× 计费，最贵）",
+    tipReason: "推理 Token（已含在输出里）",
     empty: "还没有请求记录 · 网关收到请求后会在这里即时显示",
     noMatch: "没有符合筛选条件的请求",
     resolving: "正在解析上游",
@@ -584,6 +595,11 @@ const zhTW: Messages = {
     done: "完成",
     fail: "異常",
     cache: "Cache 率",
+    tipIn: "全部提示 Token（含快取讀寫）",
+    tipOut: "輸出 Token",
+    tipCache: "命中的提示 Token（便宜）",
+    tipWrite: "寫入的快取（1.25× 計費，最貴）",
+    tipReason: "推理 Token（已算在輸出裡）",
     empty: "還沒有請求 · Gateway 收到請求後會即時顯示在這裡",
     noMatch: "沒有符合篩選條件的請求",
     resolving: "解析上游中",
@@ -821,6 +837,11 @@ const ja: Messages = {
     done: "完了",
     fail: "異常",
     cache: "キャッシュ率",
+    tipIn: "入力トークン合計（キャッシュ読み書き込み）",
+    tipOut: "出力トークン",
+    tipCache: "ヒットした入力トークン（安い）",
+    tipWrite: "キャッシュ書き込み（1.25 倍課金、最も高い）",
+    tipReason: "推論トークン（出力に含まれる）",
     empty: "リクエストはまだありません · ゲートウェイが受けた時点でここに出ます",
     noMatch: "条件に一致するリクエストがありません",
     resolving: "上流を解決中",
@@ -1058,6 +1079,11 @@ const en: Messages = {
     done: "DONE",
     fail: "FAIL",
     cache: "CACHE",
+    tipIn: "All prompt tokens incl. cache",
+    tipOut: "Output tokens",
+    tipCache: "Cached prompt tokens (cheap)",
+    tipWrite: "Cache write (billed 1.25x, priciest)",
+    tipReason: "Reasoning tokens (already inside output)",
     empty: "NO REQUESTS YET · gateway traffic appears here in real time",
     noMatch: "NO MATCHING REQUESTS",
     resolving: "RESOLVING",

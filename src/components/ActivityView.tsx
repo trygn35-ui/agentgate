@@ -199,19 +199,15 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
                 + (request.streaming === true ? " · STREAM" : request.streaming === false ? " · SYNC" : "");
               const tokens = request.tokenUsage;
               const rate = cacheRate(request);
-              // 一行放不下全部口径，悬停给完整拆解
+              // 行里是缩写，悬停给全称
               const tokenBreakdown = tokens
                 ? [
-                  `IN ${formatTokenCount(tokens.inputTokens)}`,
-                  `CACHE READ ${formatTokenCount(tokens.cachedTokens)}`,
-                  tokens.cacheWriteTokens
-                    ? `CACHE WRITE ${formatTokenCount(tokens.cacheWriteTokens)} (1.25×)`
-                    : undefined,
-                  `OUT ${formatTokenCount(tokens.outputTokens)}`,
-                  tokens.reasoningTokens
-                    ? `REASONING ${formatTokenCount(tokens.reasoningTokens)} (含在 OUT 内)`
-                    : undefined,
-                ].filter(Boolean).join("\n")
+                  `↓ ${m.stream.tipIn} ${formatTokenCount(tokens.inputTokens)}`,
+                  `↑ ${m.stream.tipOut} ${formatTokenCount(tokens.outputTokens)}`,
+                  `C ${m.stream.tipCache} ${formatTokenCount(tokens.cachedTokens)}`,
+                  `W ${m.stream.tipWrite} ${formatTokenCount(tokens.cacheWriteTokens)}`,
+                  `R ${m.stream.tipReason} ${formatTokenCount(tokens.reasoningTokens)}`,
+                ].join("\n")
                 : undefined;
               return (
                 <article
@@ -241,23 +237,31 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
                     <small>{subline}</small>
                   </span>
                   <span className="request-tokens">
-                    <RollingNumber className="tok-in" value={`↓${formatTokenCount(tokens?.inputTokens)}`} />
-                    <RollingNumber className="tok-out" value={`↑${formatTokenCount(tokens?.outputTokens)}`} />
+                    <span className="tok-io">
+                      <RollingNumber className="tok-in" value={`↓${formatTokenCount(tokens?.inputTokens)}`} />
+                      <RollingNumber className="tok-out" value={`↑${formatTokenCount(tokens?.outputTokens)}`} />
+                    </span>
                     {/*
-                      READ 是缓存命中（便宜），WRITE 是缓存写入（按 1.25× 计费，最贵的一次）。
-                      REASON 是推理 token——已经含在 ↑output 里，单列只为让你看见钱花在哪。
+                      四个口径一起列，谁也不顶替谁。
+                      C 是缓存命中（便宜），W 是缓存写入（按 1.25× 计费，最贵的一次），
+                      R 是推理 token——它已经含在 ↑ 输出里了，单列只为让你看见钱花在哪。
                     */}
-                    <small title={tokenBreakdown}>
-                      {tokens?.cacheWriteTokens
-                        ? <span className="tok-write">W {formatTokenCount(tokens.cacheWriteTokens)}</span>
-                        : null}
-                      {tokens?.cacheWriteTokens && tokens?.reasoningTokens ? " · " : null}
-                      {tokens?.reasoningTokens
-                        ? <span className="tok-reason">R {formatTokenCount(tokens.reasoningTokens)}</span>
-                        : null}
-                      {!tokens?.cacheWriteTokens && !tokens?.reasoningTokens
-                        ? `CACHE ${formatTokenCount(tokens?.cachedTokens)}`
-                        : null}
+                    <small className="tok-detail" title={tokenBreakdown}>
+                      <RollingNumber
+                        as="span"
+                        className="tok-cache"
+                        value={`C ${formatTokenCount(tokens?.cachedTokens)}`}
+                      />
+                      <RollingNumber
+                        as="span"
+                        className="tok-write"
+                        value={`W ${formatTokenCount(tokens?.cacheWriteTokens)}`}
+                      />
+                      <RollingNumber
+                        as="span"
+                        className="tok-reason"
+                        value={`R ${formatTokenCount(tokens?.reasoningTokens)}`}
+                      />
                     </small>
                   </span>
                   <span className="cache-rate">

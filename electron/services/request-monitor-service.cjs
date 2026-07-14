@@ -1,7 +1,20 @@
 const crypto = require('node:crypto')
+const { StringDecoder } = require('node:string_decoder')
 const { z } = require('zod')
 
 const MAX_DETECTION_BUFFER_BYTES = 64 * 1024
+/**
+ * 单行上限。SSE 的一个 data 行可以很大（整个 response.completed 都在里面），
+ * 但不能无限——超过就放弃精确解析，退回结束时的尾部扫描。
+ */
+const MAX_LINE_BYTES = 1024 * 1024
+/** 终止/错误标记跨 chunk 被劈开时的重叠窗口。标记本身最长不过几十个字符。 */
+const MARKER_OVERLAP = 64
+/**
+ * 首字定了之后就只剩 usage 值得解析了。这两个键正是 extractTokenUsage 认的全部
+ * 入口——Anthropic/OpenAI 用 usage，Gemini 用 usageMetadata。
+ */
+const USAGE_HINT = /"usage"|"usageMetadata"/
 /** 保留窗口：按时间而非条数保留，1 小时内的记录都留着，供缓存率等窗口指标计算。 */
 const RETENTION_WINDOW_MS = 60 * 60_000
 /** 硬上限：防止极端高频场景把内存和磁盘撑爆，正常使用远达不到。 */
@@ -148,47 +161,163 @@ function parsedJson(value) {
   }
 }
 
-function streamPayloads(source) {
-  const results = []
-  const normalized = source.replace(/\r\n/g, '\n')
-  const seen = new Set()
-
-  for (const block of normalized.split('\n\n')) {
-    let eventName = ''
-    const data = []
-    for (const line of block.split('\n')) {
-      if (line.startsWith('event:')) eventName = line.slice(6).trim()
-      else if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
-    }
-    const value = data.join('\n').trim()
-    for (const payload of parsedJson(value)) {
-      const key = `${eventName}\n${value}`
-      if (!seen.has(key)) {
-        seen.add(key)
-        results.push({ eventName, payload })
-      }
-    }
+/**
+ * 增量流扫描器：只看新到的那一片字节，绝不回头重扫。
+ *
+ * 这段代码同步跑在网关的转发热路径上——它不算完，客户端的字节就出不去。老写法
+ * 每来一个 chunk 就把整个 64KB 累积缓冲区重新 split + JSON.parse 一遍（而且先按
+ * 空行切一遍、再按换行切一遍，每行 parse 两次），是彻头彻尾的 O(n²)。实测首字之前
+ * 有 800 个非有效事件时，网关给首字硬加了 1.4 秒；两千个增量的响应总耗时多 387ms。
+ *
+ * 现在按行增量喂：残缺的半行留到下一片，完整的块当场解析一次就丢。
+ */
+class StreamScanner {
+  constructor() {
+    // chunk 可能从一个多字节字符中间劈开，交给 StringDecoder 兜着，别解出替换字符
+    this.decoder = new StringDecoder('utf8')
+    this.lineCarry = ''
+    this.eventName = ''
+    this.dataLines = []
+    this.dataBytes = 0
+    this.probedLength = -1
+    this.sawSse = false
+    /** 首字已经认出来了——之后除了 usage，什么都不必再解析。 */
+    this.settled = false
+    this.markerCarry = ''
+    this.sawTerminal = false
+    this.sawErrorEvent = false
+    /**
+     * 正文尾巴，按片存着，只在结束时 join 一次。
+     * 每个 chunk 拼一个 64KB 字符串正是要除掉的那笔开销。
+     */
+    this.tailParts = []
+    this.tailBytes = 0
   }
 
-  for (const line of normalized.split('\n')) {
-    const value = line.trim()
-    if (!value || value.startsWith('event:') || value.startsWith(':')) continue
-    const data = value.startsWith('data:') ? value.slice(5).trim() : value
-    for (const payload of parsedJson(data)) {
-      const key = `\n${data}`
-      if (!seen.has(key)) {
-        seen.add(key)
-        results.push({ eventName: '', payload })
+  /** @returns {Array<{eventName: string, payload: unknown}>} 这一片里新解析出来的。 */
+  push(bytes) {
+    const text = this.decoder.write(bytes)
+    if (!text) return []
+    return this._consume(text)
+  }
+
+  /** 流结束：把残留的半行和未闭合的块也吐出来。 */
+  end() {
+    const tail = this.decoder.end()
+    const out = this._consume(tail, true)
+    this._flushBlock(out)
+    return out
+  }
+
+  /** 结束时的兜底源：非 SSE 正文（尤其是被换行拆开的）只能靠它捞 usage。 */
+  tailSource() {
+    return this.tailParts.join('')
+  }
+
+  _consume(text, final = false) {
+    const out = []
+    if (text) {
+      this._scanMarkers(text)
+      this.tailParts.push(text)
+      this.tailBytes += text.length
+      while (this.tailParts.length > 1
+        && this.tailBytes - this.tailParts[0].length >= MAX_DETECTION_BUFFER_BYTES) {
+        this.tailBytes -= this.tailParts.shift().length
       }
     }
+    const merged = this.lineCarry + text
+    const lines = merged.split('\n')
+    // 最后一段没跟换行，可能只是半行，留到下一片再说——除非流已经结束了
+    this.lineCarry = final ? '' : (lines.pop() ?? '')
+    for (const line of lines) this._line(line, out)
+    if (this.lineCarry.length > MAX_LINE_BYTES) {
+      // 单行大到离谱：只保住内存上限，usage 靠结束时的尾部扫描兜底
+      this.lineCarry = this.lineCarry.slice(-MAX_LINE_BYTES)
+      this.probedLength = this.lineCarry.length
+    } else if (!final) {
+      this._probeBody(out)
+    }
+    return out
   }
-  return results
-}
 
-function hasMeaningfulStreamDelta(protocol, source) {
-  return streamPayloads(source).some(({ eventName, payload }) => (
-    isMeaningfulPayload(protocol, payload, eventName)
-  ))
+  _line(raw, out) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    if (line.startsWith('data:')) {
+      this.sawSse = true
+      if (this.dataBytes < MAX_LINE_BYTES) {
+        const value = line.slice(5).replace(/^ /, '')
+        this.dataLines.push(value)
+        this.dataBytes += value.length
+      }
+      return
+    }
+    if (line.startsWith('event:')) {
+      this.sawSse = true
+      this.eventName = line.slice(6).trim()
+      return
+    }
+    if (line.startsWith(':')) return // SSE 注释，中转常拿它当心跳
+    if (line.trim() === '') {
+      this._flushBlock(out)
+      return
+    }
+    // 不是 SSE：可能是 JSON-lines，也可能是被换行拆开的一整个正文
+    this._emit('', line.trim(), out)
+  }
+
+  _flushBlock(out) {
+    if (this.dataLines.length === 0) {
+      this.eventName = ''
+      return
+    }
+    const eventName = this.eventName
+    const value = this.dataLines.join('\n').trim()
+    this.dataLines = []
+    this.dataBytes = 0
+    this.eventName = ''
+    this._emit(eventName, value, out)
+  }
+
+  /**
+   * 首字认出来之后，剩下的事件里只有 usage 还值得看一眼。
+   *
+   * 绝大多数增量事件里压根没有 usage，照样 JSON.parse 一遍纯属白烧 CPU——一个
+   * 两千增量的回复就是两千次无用的解析，而这活是同步卡在转发路径上的。先用一次
+   * 正则筛掉，命中了才解析。
+   */
+  _emit(eventName, value, out) {
+    if (!value) return
+    if (this.settled && !USAGE_HINT.test(value)) return
+    for (const payload of parsedJson(value)) out.push({ eventName, payload })
+  }
+
+  /**
+   * 非流式正文没有换行，一辈子等不到行结束——得在这儿主动试一次。
+   *
+   * 但不能每片都试：一个 10MB 的正文分 160 片到达，就是 160 次全量 JSON.parse。
+   * 所以先做 O(1) 预检——正文没闭合（末字符不是 } 或 ]）就绝不可能解析成功。
+   * 多片正文里只有最后一片能过这道闸。
+   */
+  _probeBody(out) {
+    if (this.sawSse) return
+    const source = this.lineCarry
+    if (source.length === 0 || source.length === this.probedLength) return
+    let end = source.length - 1
+    while (end >= 0 && (source[end] === ' ' || source[end] === '\t' || source[end] === '\r')) end -= 1
+    if (end < 0) return
+    const last = source[end]
+    if (last !== '}' && last !== ']') return
+    this.probedLength = source.length
+    for (const payload of parsedJson(source.trim())) out.push({ eventName: '', payload })
+  }
+
+  _scanMarkers(text) {
+    if (this.sawTerminal && this.sawErrorEvent) return
+    const window = this.markerCarry + text
+    if (!this.sawTerminal && hasTerminalMarker(window)) this.sawTerminal = true
+    if (!this.sawErrorEvent && hasErrorEvent(window)) this.sawErrorEvent = true
+    this.markerCarry = window.slice(-MARKER_OVERLAP)
+  }
 }
 
 function numberOrUndefined(value) {
@@ -389,6 +518,13 @@ function mergeUsage(current, next) {
   return merged
 }
 
+/** 活跃记录带 startedAtMs；从磁盘恢复的只有 ISO 串。排序两边都得认。 */
+function startedAtMillis(entry) {
+  if (Number.isFinite(entry.startedAtMs)) return entry.startedAtMs
+  const parsed = Date.parse(entry.startedAt)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
 function toPublicRequest(entry) {
   return {
     id: entry.id,
@@ -490,10 +626,19 @@ class RequestMonitorService {
     this.onChange = onChange
   }
 
+  /**
+   * 全部记录按「开始时间」倒序，最新的永远在最上面。
+   *
+   * 老写法是 [...active, ...recent]：活跃的整组置顶，组内还按正序排，于是刚发出的
+   * 请求只能落在活跃组的末尾——看上去像是「新请求出现在下面」。而 recent 是按完成
+   * 时间 unshift 的，并发请求交错完成时，时间戳列也是乱的。
+   *
+   * recent 本身仍保持完成时间倒序不动：_prune 靠这个顺序截断最旧的。
+   */
   list() {
-    const active = [...this.active.values()]
-      .sort((left, right) => left.startedAtMs - right.startedAtMs)
-    return [...active, ...this.recent].map(toPublicRequest)
+    return [...this.active.values(), ...this.recent]
+      .sort((left, right) => startedAtMillis(right) - startedAtMillis(left))
+      .map(toPublicRequest)
   }
 
   start(input) {
@@ -514,8 +659,7 @@ class RequestMonitorService {
       model: input.model,
       reasoningEffort: input.reasoningEffort,
       streaming: input.streaming,
-      detectionBuffer: '',
-      usageBuffer: '',
+      scanner: new StreamScanner(),
       lastProgressNotifyAt: startedAtMs,
     })
     this._notify()
@@ -559,67 +703,52 @@ class RequestMonitorService {
     return true
   }
 
-  observeChunk(id, chunk, options = {}) {
+  observeChunk(id, chunk) {
     const entry = this.active.get(id)
     if (!entry) return false
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     if (bytes.byteLength === 0) return false
     entry.receivedBytes += bytes.byteLength
-    const firstByteObserved = entry.firstByteLatencyMs === undefined
-    if (firstByteObserved) {
+    if (entry.firstByteLatencyMs === undefined) {
       entry.firstByteLatencyMs = Math.max(0, this.now() - entry.startedAtMs)
       this._notify()
     }
-
-    const streaming = options.streaming ?? entry.streaming
-    const decoded = bytes.toString('utf8')
-    entry.usageBuffer = `${entry.usageBuffer}${decoded}`.slice(-MAX_DETECTION_BUFFER_BYTES)
-    const tailUsage = extractTokenUsageFromSource(entry.usageBuffer)
-    if (tailUsage) entry.tokenUsage = mergeUsage(entry.tokenUsage, tailUsage)
-    if (!entry.sawCompletion && hasTerminalMarker(entry.usageBuffer)) {
-      entry.sawCompletion = true
-    }
-    if (!entry.sawErrorEvent && hasErrorEvent(entry.usageBuffer)) {
-      entry.sawErrorEvent = true
-    }
-    if (entry.firstTokenLatencyMs === undefined) {
-      entry.detectionBuffer = `${entry.detectionBuffer}${decoded}`
-        .slice(-MAX_DETECTION_BUFFER_BYTES)
-    }
-    const payloads = entry.firstTokenLatencyMs === undefined
-      ? streamPayloads(entry.detectionBuffer)
-      : []
-    for (const { payload } of payloads) {
-      const metadata = extractRequestMetadata(payload?.response || payload)
-      if (metadata.model) entry.model = metadata.model
-      const usage = extractTokenUsage(payload)
-      if (usage) entry.tokenUsage = mergeUsage(entry.tokenUsage, usage)
-    }
-
-    if (entry.firstTokenLatencyMs === undefined && streaming === false
-      && payloads.some(({ eventName, payload }) => (
-        isMeaningfulPayload(entry.protocol, payload, eventName)
-      ))) {
-      this._markFirstToken(entry)
-      return true
-    }
-
-    if (streaming !== false && entry.firstTokenLatencyMs === undefined
-      && payloads.some(({ eventName, payload }) => (
-        isMeaningfulPayload(entry.protocol, payload, eventName)
-      ))) {
-      this._markFirstToken(entry)
-      return true
-    }
-
+    const marked = this._absorb(entry, entry.scanner.push(bytes))
+    if (marked) return true
     this._notifyProgress(entry)
     return false
+  }
+
+  /** 消化新解析出的 payload：累计 usage、认领模型、判首字。 */
+  _absorb(entry, payloads) {
+    let marked = false
+    for (const { eventName, payload } of payloads) {
+      const usage = extractTokenUsage(payload)
+      if (usage) entry.tokenUsage = mergeUsage(entry.tokenUsage, usage)
+      if (entry.firstTokenLatencyMs !== undefined) continue
+      const metadata = extractRequestMetadata(payload?.response || payload)
+      if (metadata.model) entry.model = metadata.model
+      if (isMeaningfulPayload(entry.protocol, payload, eventName)) {
+        this._markFirstToken(entry)
+        marked = true
+      }
+    }
+    if (entry.scanner.sawTerminal) entry.sawCompletion = true
+    if (entry.scanner.sawErrorEvent) entry.sawErrorEvent = true
+    return marked
   }
 
   end(id, { outcome } = {}) {
     const entry = this.active.get(id)
     if (!entry) return false
     this.active.delete(id)
+    // 收尾：残留的半行、没闭合的块，还有非 SSE 正文——被换行拆开的正文行行都解析
+    // 不出来，只能从尾巴里把 usage 捞出来（它通常就在 JSON 末尾）。
+    this._absorb(entry, entry.scanner.end())
+    if (entry.tokenUsage === undefined) {
+      const usage = extractTokenUsageFromSource(entry.scanner.tailSource())
+      if (usage) entry.tokenUsage = mergeUsage(entry.tokenUsage, usage)
+    }
     const completedAtMs = this.now()
     entry.completedAt = new Date(completedAtMs).toISOString()
     entry.durationMs = Math.max(0, completedAtMs - entry.startedAtMs)
@@ -632,8 +761,8 @@ class RequestMonitorService {
           : 'completed'
     )
     entry.state = entry.outcome === 'completed' ? 'completed' : entry.outcome
-    entry.detectionBuffer = ''
-    entry.usageBuffer = ''
+    // 记录会在 recent 里留一小时。扫描器攥着 64KB 尾巴，留着就是 2000 × 64KB。
+    delete entry.scanner
     delete entry.lastProgressNotifyAt
     this.recent.unshift(entry)
     this._prune()
@@ -657,6 +786,8 @@ class RequestMonitorService {
   _markFirstToken(entry) {
     entry.firstTokenLatencyMs = Math.max(0, this.now() - entry.startedAtMs)
     entry.state = 'streaming'
+    // 告诉扫描器：可以只盯 usage 了，别再解析每一个增量
+    entry.scanner.settled = true
     this._notify()
   }
 
@@ -685,10 +816,9 @@ module.exports = {
   MAX_RECENT_REQUESTS,
   RequestLogStoreSchema,
   RequestMonitorService,
+  StreamScanner,
   extractRequestMetadata,
   extractTokenUsage,
   extractTokenUsageFromSource,
-  hasMeaningfulStreamDelta,
   isMeaningfulPayload,
-  streamPayloads,
 }

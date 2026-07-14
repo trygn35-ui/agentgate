@@ -1193,14 +1193,24 @@ class GatewayService {
           streaming: responseIsEventStream ? true : undefined,
         })
       } catch {}
-      upstreamResponse.on('data', (chunk) => {
-        try {
-          this.requestMonitor?.observeChunk?.(monitorId, chunk)
-        } catch {}
-      })
       upstreamResponse.once('end', () => endMonitor())
       upstreamResponse.once('aborted', () => endMonitor('aborted'))
       upstreamResponse.once('error', () => endMonitor('failed'))
+
+      /*
+       * 统计挂在转发之后。
+       *
+       * 'data' 监听器按注册顺序触发，pipeline 内部也是靠 'data' 把字节写出去的。
+       * 原本统计先注册，于是每一片都要先被统计跑完才轮到转发——统计再快也是白白
+       * 顶在客户端前面。挪到后面，字节先出门，统计随后。
+       */
+      const attachMonitor = () => {
+        upstreamResponse.on('data', (chunk) => {
+          try {
+            this.requestMonitor?.observeChunk?.(monitorId, chunk)
+          } catch {}
+        })
+      }
 
       if (!bridgeResponse) {
         response.writeHead(
@@ -1211,6 +1221,7 @@ class GatewayService {
         pipeline(upstreamResponse, response, (error) => {
           if (error && !response.destroyed) response.destroy(error)
         })
+        attachMonitor()
         return
       }
 
@@ -1230,6 +1241,7 @@ class GatewayService {
           response.destroy(error)
         }
       })
+      attachMonitor()
     })
     upstreamRequest.on('error', () => {
       endMonitor('failed')
