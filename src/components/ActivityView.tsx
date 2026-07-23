@@ -29,14 +29,14 @@ function requestMeta(m: Messages): Record<ActiveRequest["state"], RequestMeta> {
     connecting: { label: s.connect, tint: "tint-accent", icon: "loader", spin: true },
     "waiting-first-token": { label: s.wait, tint: "tint-accent", icon: "loader", spin: true },
     streaming: { label: s.stream, tint: "tint-good", icon: "dot", breathe: true },
-    completed: { label: s.done, tint: "tint-good", icon: "check" },
+    completed: { label: s.done, tint: "tint-complete", icon: "check" },
     failed: { label: s.fail, tint: "tint-bad", icon: "alert" },
     aborted: { label: s.abort, tint: "tint-warn", icon: "dot" },
     cancelled: { label: s.cancel, tint: "tint-warn", icon: "dot" },
   };
 }
 
-/** 最多渲染多少行。数据仍保留一小时，这里只是渲染窗口。 */
+/** 最多渲染多少行。数据仍保留三天，这里只是渲染窗口。 */
 const MAX_VISIBLE_ROWS = 50;
 
 const REASONING_LABEL: Record<string, string> = {
@@ -60,7 +60,7 @@ function clientTone(client: ActiveRequest["client"]): string {
     : "";
 }
 
-/** 首字时延色阶：<5s 绿、5-10s 蓝、10-30s 黄、30-60s 橙、60s+ 红。 */
+/** 首包/首内容时延色阶：<5s 绿、5-10s 蓝、10-30s 黄、30-60s 橙、60s+ 红。 */
 function latencyTier(milliseconds?: number): string {
   if (milliseconds === undefined || !Number.isFinite(milliseconds)) return "tier-quiet";
   if (milliseconds < 5_000) return "tier-good";
@@ -74,8 +74,7 @@ function latencyTier(milliseconds?: number): string {
  * 缓存命中率 = 命中的提示 token ÷ 全部提示 token。
  *
  * inputTokens 已在主进程归一化成「含缓存读写的全部提示 token」，三家口径一致，
- * 所以这里不需要再夹 Math.min——比值天然落在 0–1。老代码那个夹子是在掩盖
- * Anthropic 的分母错了（它的 input 不含缓存，比值动辄上千）。
+ * 正常情况下比值落在 0–1；展示层仍做边界保护，避免损坏或异常上游数据撑破布局。
  */
 function cacheRate(request: ActiveRequest): number | undefined {
   const input = request.tokenUsage?.inputTokens;
@@ -83,7 +82,7 @@ function cacheRate(request: ActiveRequest): number | undefined {
   if (input === undefined || cached === undefined || !Number.isFinite(input) || input <= 0) {
     return undefined;
   }
-  return (cached / input) * 100;
+  return Math.max(0, Math.min(100, (cached / input) * 100));
 }
 
 function formatClock(value: string, clock: Intl.DateTimeFormat): string {
@@ -112,7 +111,7 @@ function RequestStateIcon({ meta }: { meta: RequestMeta }): ReactElement {
 
 interface RequestRowProps {
   request: ActiveRequest;
-  /** 已完成的行这是个定值；只有还在跑的行会每 300ms 变一次。 */
+  /** 已完成的行这是个定值；只有还在跑的行会每秒变一次。 */
   elapsed?: number;
   state: RequestMeta;
   m: Messages;
@@ -121,7 +120,7 @@ interface RequestRowProps {
 }
 
 /**
- * 一条请求。memo 包着，因为秒表每 300ms 跳一次。
+ * 一条请求。memo 包着，因为秒表每秒跳一次。
  *
  * 跳的只有还在跑的那几行，可原本每跳一次都要把 50 行、七千多个节点整个对账一遍。
  * 已完成的行 props 一个字都没变——request 对象的引用也是稳的（见
@@ -131,8 +130,10 @@ interface RequestRowProps {
 const RequestRow = memo(function RequestRow({
   request, elapsed, state, m, clock, delayMs,
 }: RequestRowProps): ReactElement {
-  const firstLatency = request.firstTokenLatencyMs ?? request.firstByteLatencyMs;
-  const firstLabel = request.firstTokenLatencyMs !== undefined ? "TTFT" : "TTFB";
+  // 网关看不到模型内部的首 token；该字段是首个非空输出事件，所以诚实标成 TTFC。
+  const contentTiming = request.streaming === true;
+  const firstLatency = contentTiming ? request.firstTokenLatencyMs : request.firstByteLatencyMs;
+  const firstLabel = contentTiming ? "TTFC" : "TTFB";
   const reasoning = request.reasoningEffort
     ? REASONING_LABEL[request.reasoningEffort.toLocaleLowerCase()] ?? request.reasoningEffort
     : "DEFAULT";
@@ -224,7 +225,7 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
     () => requests.filter((request) => matchesFilter(request, filter)),
     [filter, requests],
   );
-  // 记录保留一小时（可达 2000 条），但只渲染最近这些。每行有六个滚轮读数、
+  // 记录完整保留三天，但只渲染最近这些。每行有六个滚轮读数、
   // 每个读数又是若干字位，全渲染会堆出几万个节点并让每次 300ms 的计时刷新
   // 扫过全部——数据不动，只收窄渲染窗口。
   const visibleRequests = useMemo(() => matched.slice(0, MAX_VISIBLE_ROWS), [matched]);
@@ -239,8 +240,20 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
 
   useEffect(() => {
     if (activeCount === 0) return undefined;
-    const timer = window.setInterval(() => setNow(Date.now()), 300);
-    return () => window.clearInterval(timer);
+    let timer: number | undefined;
+    const syncTimer = () => {
+      if (timer !== undefined) window.clearInterval(timer);
+      timer = undefined;
+      if (document.visibilityState !== "visible") return;
+      setNow(Date.now());
+      timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    };
+    document.addEventListener("visibilitychange", syncTimer);
+    syncTimer();
+    return () => {
+      document.removeEventListener("visibilitychange", syncTimer);
+      if (timer !== undefined) window.clearInterval(timer);
+    };
   }, [activeCount]);
 
   const liveText = activeCount > 0 ? fill(m.stream.streaming, { count: activeCount }) : m.stream.idle;
@@ -282,7 +295,7 @@ export function ActivityView({ requests }: ActivityViewProps): ReactElement {
             const startedAt = new Date(request.startedAt).getTime();
             /*
              * 已完成的行 elapsed 就是它的 durationMs——一个定值，跟 now 无关。
-             * 所以秒表每 300ms 跳一次时，只有还在跑的那几行 props 变了，其余的
+             * 所以秒表每秒跳一次时，只有还在跑的那几行 props 变了，其余的
              * 被 memo 挡在外面，不会重渲。
              */
             const elapsed = request.durationMs ?? (

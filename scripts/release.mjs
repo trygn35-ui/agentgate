@@ -14,24 +14,31 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { version } = require(path.join(root, "package.json"));
+const packageMetadata = require(path.join(root, "package.json"));
+const { version } = packageMetadata;
+const releaseLabel = packageMetadata.build?.buildVersion || version;
+
+if (typeof releaseLabel !== "string" || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(releaseLabel)) {
+  throw new Error(`无效的交付版本标签：${String(releaseLabel)}`);
+}
 
 const RELEASE_DIR = path.join(root, "release");
 const OUTPUT_DIR = path.join(root, "deliverables");
 const SOURCE_ENTRIES = [
-  ".gitignore", "README.md", "index.html", "package.json", "pnpm-lock.yaml",
+  ".gitignore", "LICENSE", "README.md", "README.en.md", "README.ja.md", "README.zh-TW.md",
+  "index.html", "package.json", "pnpm-lock.yaml",
   "pnpm-workspace.yaml", "tsconfig.json", "vite.config.ts", "vitest.config.mts",
   "assets", "electron", "public", "scripts", "src", "tests",
 ];
 const SKIP_DIRS = new Set(["node_modules", "__pycache__"]);
 
 const artifacts = [
-  `AgentGate-Portable-${version}-x64.exe`,
-  `AgentGate-Setup-${version}-x64.exe`,
-  `AgentGate-Setup-${version}-x64.exe.blockmap`,
+  `AgentGate-Portable-${releaseLabel}-x64.exe`,
+  `AgentGate-Setup-${releaseLabel}-x64.exe`,
+  `AgentGate-Setup-${releaseLabel}-x64.exe.blockmap`,
   "latest.yml",
 ];
-const sourceZip = `AgentGate-${version}-source.zip`;
+const sourceZip = `AgentGate-${releaseLabel}-source.zip`;
 
 async function sha256(file) {
   const hash = createHash("sha256");
@@ -43,8 +50,8 @@ async function sha256(file) {
 async function pruneOldVersions() {
   const locked = [];
   for (const [dir, isStale] of [
-    [OUTPUT_DIR, (name) => !name.includes(version)],
-    [RELEASE_DIR, (name) => name.startsWith("AgentGate-") && !name.includes(version)],
+    [OUTPUT_DIR, (name) => !name.includes(releaseLabel)],
+    [RELEASE_DIR, (name) => name.startsWith("AgentGate-") && !name.includes(releaseLabel)],
   ]) {
     const entries = await fs.readdir(dir).catch(() => []);
     for (const name of entries) {
@@ -120,8 +127,8 @@ for (const name of artifacts) {
 await buildSourceZip(await collectSourceFiles());
 
 const checksumTargets = [
-  `AgentGate-Portable-${version}-x64.exe`,
-  `AgentGate-Setup-${version}-x64.exe`,
+  `AgentGate-Portable-${releaseLabel}-x64.exe`,
+  `AgentGate-Setup-${releaseLabel}-x64.exe`,
   sourceZip,
 ];
 const lines = [];
@@ -129,9 +136,9 @@ for (const name of checksumTargets) {
   const digest = await sha256(path.join(OUTPUT_DIR, name));
   lines.push(`${digest} *${name}`);
 }
-await fs.writeFile(path.join(OUTPUT_DIR, `SHA256SUMS-${version}.txt`), `${lines.join("\n")}\n`, "utf8");
+await fs.writeFile(path.join(OUTPUT_DIR, `SHA256SUMS-${releaseLabel}.txt`), `${lines.join("\n")}\n`, "utf8");
 
-console.log(`交付件已整理到 deliverables/（v${version}）`);
+console.log(`交付件已整理到 deliverables/（内部 v${version}，交付标签 ${releaseLabel}）`);
 for (const line of lines) console.log(`  ${line}`);
 console.log("  latest.yml（更新清单，发 Release 时必须上传）");
 if (locked.length > 0) console.log(`旧文件被占用未删除：${locked.join(", ")}`);

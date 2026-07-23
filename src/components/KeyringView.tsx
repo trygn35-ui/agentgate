@@ -15,7 +15,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { DragEvent as ReactDragEvent, KeyboardEvent as ReactKeyboardEvent, ReactElement } from "react";
+import type { DragEvent as ReactDragEvent, ReactElement } from "react";
 import { CLIENT_META, PROTOCOL_META } from "../config";
 import { useI18n } from "../i18n";
 import type { Messages } from "../i18n";
@@ -193,13 +193,6 @@ export function KeyringView({
       : undefined);
   }, [profiles]);
 
-  function handleHeadKey(event: ReactKeyboardEvent<HTMLDivElement>, id: string): void {
-    if (event.target !== event.currentTarget) return;
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    setExpandedId((current) => current === id ? undefined : id);
-  }
-
   function handleDrop(event: ReactDragEvent<HTMLElement>, targetId: string): void {
     event.preventDefault();
     const sourceId = dragId;
@@ -278,6 +271,7 @@ export function KeyringView({
               const metrics: EndpointMetrics = activeEndpoint
                 ? getEndpointMetrics(activeEndpoint)
                 : { sampleCount: 0 };
+              const cacheRate = cumulativeCacheRate(profile);
               const testing = testingIds.has(profile.id);
               const discovering = busy === "test" && busyId === profile.id;
               const probing = busy === "probe" && busyId === profile.id;
@@ -314,63 +308,65 @@ export function KeyringView({
                     setDragOverId(undefined);
                   }}
                 >
-                  <div
-                    className="keyring-head"
-                    role="button"
-                    tabIndex={0}
-                    aria-expanded={expanded}
-                    aria-label={fill(m.keys.expand, { name: profile.name })}
-                    onClick={() => setExpandedId(expanded ? undefined : profile.id)}
-                    onKeyDown={(event) => handleHeadKey(event, profile.id)}
-                  >
-                    <span className={`keyring-glyph ${inUse ? "on" : ""}`}>
-                      {String(index + 1).padStart(2, "0")}
-                    </span>
-                    <span className="keyring-name">
-                      <span className="keyring-name-line">
-                        <strong>{profile.name}</strong>
-                        {inUse && (
-                          <small className={`tag-inuse ${gatewayOn ? "pulse" : ""}`}>{m.keys.active}</small>
-                        )}
+                  <div className="keyring-head">
+                    <button
+                      type="button"
+                      className="keyring-open"
+                      aria-expanded={expanded}
+                      aria-label={fill(m.keys.expand, { name: profile.name })}
+                      onClick={() => setExpandedId(expanded ? undefined : profile.id)}
+                    >
+                      <span className={`keyring-glyph ${inUse ? "on" : ""}`}>
+                        {String(index + 1).padStart(2, "0")}
                       </span>
-                      <code className="keyring-meta">
-                        {PROTOCOL_META[profile.protocol].short.toUpperCase()} · {profile.baseUrl.replace(/^https?:\/\//, "")} · {profile.keyHint}
-                      </code>
-                      <span className="keyring-targets" aria-hidden="true">
-                        {profile.targets.map((target) => (
-                          <i
-                            key={target}
-                            className={`tone-${CLIENT_META[target].tone}`}
-                            title={CLIENT_META[target].label}
-                          />
-                        ))}
+                      <span className="keyring-name">
+                        <span className="keyring-name-line">
+                          <strong>{profile.name}</strong>
+                          {inUse && (
+                            <small className={`tag-inuse ${gatewayOn ? "pulse" : ""}`}>{m.keys.active}</small>
+                          )}
+                        </span>
+                        <span className="keyring-meta-line">
+                          <code className="keyring-meta">
+                            {PROTOCOL_META[profile.protocol].short.toUpperCase()} · {profile.baseUrl.replace(/^https?:\/\//, "")} · {profile.keyHint}
+                          </code>
+                          <span className="keyring-targets" aria-hidden="true">
+                            {profile.targets.map((target) => (
+                              <i
+                                key={target}
+                                className={`tone-${CLIENT_META[target].tone}`}
+                                title={CLIENT_META[target].label}
+                              />
+                            ))}
+                          </span>
+                        </span>
                       </span>
-                    </span>
-                    <span className="keyring-usage">
-                      <RollingNumber value={formatTokenCount(profile.tokenUsageTotal ?? 0)} />
-                      <small>{m.keys.tokens}</small>
-                    </span>
-                    <span className="keyring-usage">
-                      <RollingNumber
-                        className={cacheRateTier(cumulativeCacheRate(profile))}
-                        value={cumulativeCacheRate(profile)?.toFixed(3) ?? "———"}
-                      />
-                      <small>{m.keys.cache}</small>
-                    </span>
-                    <HealthBars endpoint={activeEndpoint} label={m.keys.awaitingSamples} />
-                    <span className="keyring-stat">
-                      <RollingNumber as="strong" className={summary.className} value={summary.label} />
-                      <small>
-                        {metrics.sampleCount > 0
-                          ? fill(m.keys.statLine, {
-                            availability: metrics.availability ?? 0,
-                            latency: metrics.averageLatencyMs === undefined
-                              ? "———"
-                              : `${metrics.averageLatencyMs}ms`,
-                          })
-                          : m.keys.awaitingSamples}
-                      </small>
-                    </span>
+                      <span className="keyring-usage">
+                        <RollingNumber value={formatTokenCount(profile.tokenUsageTotal ?? 0)} />
+                        <small>{m.keys.tokens}</small>
+                      </span>
+                      <span className="keyring-usage">
+                        <RollingNumber
+                          className={cacheRateTier(cacheRate === undefined ? undefined : cacheRate * 100)}
+                          value={cacheRate === undefined ? "———" : `${(cacheRate * 100).toFixed(1)}%`}
+                        />
+                        <small>{m.keys.cache}</small>
+                      </span>
+                      <HealthBars endpoint={activeEndpoint} label={m.keys.awaitingSamples} />
+                      <span className="keyring-stat">
+                        <RollingNumber as="strong" className={summary.className} value={summary.label} />
+                        <small>
+                          {metrics.sampleCount > 0
+                            ? fill(m.keys.statLine, {
+                              availability: metrics.availability ?? 0,
+                              latency: metrics.averageLatencyMs === undefined
+                                ? "———"
+                                : `${metrics.averageLatencyMs}ms`,
+                            })
+                            : m.keys.awaitingSamples}
+                        </small>
+                      </span>
+                    </button>
                     <span className="keyring-tools">
                       <button
                         type="button"

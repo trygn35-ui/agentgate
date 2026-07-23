@@ -8,7 +8,8 @@ import {
   formatDivergence,
   formatRate,
   formatTokenTotal,
-  recentCacheRate,
+  todayCacheRate,
+  todayRequestCount,
   todayTokenTotal,
 } from "../lib/divergence";
 import type {
@@ -181,7 +182,8 @@ export function OverviewView({
     .filter((route) => profiles.some((profile) => profile.id === route.profileId))
     .length;
   const divergence = computeDivergence(profiles, gateway);
-  const cacheRate = recentCacheRate(requests);
+  const cacheRate = todayCacheRate(requests);
+  const cacheRequests = todayRequestCount(requests);
   const tokenToday = todayTokenTotal(profiles);
   const cacheText = formatRate(cacheRate);
   const tokenText = formatTokenTotal(tokenToday);
@@ -267,7 +269,7 @@ export function OverviewView({
               className={`meter-plain ${cacheRate === undefined ? "dim" : ""}`}
               value={cacheText}
             />
-            <div className="meter-sub">{fill(m.overview.lastHour, { count: requests.length })}</div>
+            <div className="meter-sub">{fill(m.overview.cacheToday, { count: cacheRequests })}</div>
           </div>
 
           <div className="meter-divider" />

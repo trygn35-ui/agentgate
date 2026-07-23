@@ -261,7 +261,6 @@ function AppShell({ controller }: { controller: ReturnType<typeof useAgentGateCo
 
       {view === "overview" && (
         <OverviewView
-          key={locale}
           profiles={controller.data.profiles}
           clients={controller.data.clients}
           gateway={gateway}
@@ -279,7 +278,6 @@ function AppShell({ controller }: { controller: ReturnType<typeof useAgentGateCo
       )}
       {view === "keyring" && (
         <KeyringView
-          key={locale}
           profiles={controller.data.profiles}
           gateway={gateway}
           busy={controller.busy}
@@ -301,13 +299,13 @@ function AppShell({ controller }: { controller: ReturnType<typeof useAgentGateCo
           onRetry={() => void controller.refresh()}
         />
       )}
-      {view === "activity" && <ActivityView key={locale} requests={requestRecords} />}
-      {view === "sessions" && (
-        <SessionsView key={locale} onToast={(kind, message) => controller.setToast({ kind, message })} />
-      )}
+      {view === "activity" && <ActivityView requests={requestRecords} />}
+      <SessionsView
+        active={view === "sessions"}
+        onToast={(kind, message) => controller.setToast({ kind, message })}
+      />
       {view === "settings" && (
         <SettingsView
-          key={locale}
           settings={settings}
           busy={controller.busy === "settings"}
           update={controller.data.update}
@@ -352,9 +350,7 @@ function AppShell({ controller }: { controller: ReturnType<typeof useAgentGateCo
           profile={editor.profile}
           busy={controller.busy === "save"}
           discovering={controller.busy === "test" && controller.busyId === editor.profile?.id}
-          onDiscoverModels={editor.profile
-            ? () => controller.testProfile(editor.profile!.id)
-            : undefined}
+          onDiscoverModels={(input) => controller.testProfileDraft(input)}
           onClose={() => setEditor({ open: false })}
           onSave={handleSave}
         />

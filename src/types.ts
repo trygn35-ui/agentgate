@@ -258,8 +258,12 @@ export type StateChangedEvent =
   | {
       type: "active-requests-changed";
       activeRequests: ActiveRequest[];
-      /** 只带了还在跑的那几条：按 id 就地更新，别整表替换。见 _notifyProgress。 */
+      /** 只带变动记录：按 id upsert，别整表替换。 */
       patch?: boolean;
+      /** 本次状态变更淘汰的历史记录。 */
+      removedRequestIds?: string[];
+      /** 与 bootstrap 对齐的单调版本号。 */
+      revision?: number;
     }
   | {
       type: "settings-changed";
@@ -277,6 +281,8 @@ export interface BootstrapData {
   gateway: GatewayState;
   settings?: AppSettings;
   activeRequests?: ActiveRequest[];
+  /** activeRequests 对应的请求监控版本；旧 preload/ mock 可省略。 */
+  activeRequestsRevision?: number;
   update?: UpdateState;
   gatewayRecovery?: {
     skippedTargets: ClientTarget[];
@@ -315,6 +321,8 @@ export interface AgentSession {
   id: string;
   client: "claude" | "codex" | "opencode";
   nativeId: string;
+  /** Claude 会话所在的 projects 子目录；同一 UUID 跨项目重复时用于区分会话。 */
+  project?: string;
   title: string;
   /** 会话开始时所在的目录。Claude Code 的目录名编码是有损的，只能从正文里读。 */
   workspace: string;
@@ -322,6 +330,21 @@ export interface AgentSession {
   sizeBytes: number;
   messages?: number;
   archived?: boolean;
+  /** Codex 的任务来源及子代理关系；其他客户端不提供。 */
+  threadSource?: string;
+  agentNickname?: string;
+  agentRole?: string;
+  parentNativeId?: string;
+}
+
+export interface SessionScanError {
+  client: AgentSession["client"];
+  reason: string;
+}
+
+export interface SessionListResult {
+  sessions: AgentSession[];
+  errors: SessionScanError[];
 }
 
 /** 会话里的一条发言。 */
@@ -345,6 +368,9 @@ export interface SessionTranscript {
  */
 export interface SessionRemovalPlan {
   id: string;
+  nativeId: string;
+  /** Claude 会话所在的 projects 子目录。 */
+  project?: string;
   client: string;
   title: string;
   workspace: string;
@@ -368,6 +394,8 @@ export interface AgentGateBridge {
   copyProfileKey(id: string): Promise<void>;
   /** 直接探测全部 URL 的模型列表并返回更新后的公开方案。 */
   testProfile(id: string): Promise<Profile>;
+  /** 使用未保存的编辑器连接参数识别活动 URL 的模型，不持久化草稿。 */
+  testProfileDraft?(input: SaveProfileInput): Promise<string[]>;
   /** 无凭据检测全部 URL 的可达性和延迟，不识别模型。 */
   checkProfileHealth(id: string): Promise<Profile>;
   /** 用真实 Key 发送最小消息实测渠道可用性与时延。旧版 preload 可能暂未提供。 */
@@ -386,10 +414,10 @@ export interface AgentGateBridge {
   /** 更新应用行为设置。旧版 preload 可能暂未提供。 */
   updateSettings?(patch: Partial<AppSettings>): Promise<AppSettings | BootstrapData>;
   /** 扫描本机 agent 的会话。不进 bootstrap——要翻上百个正文文件加两个 SQLite。 */
-  listSessions?(): Promise<AgentSession[]>;
+  listSessions?(): Promise<SessionListResult | AgentSession[]>;
   /** 读会话最后的若干条发言。limit=0 表示尽量多。 */
   readSessionMessages?(id: string, limit?: number): Promise<SessionTranscript>;
-  /** 数发言条数。要扫全文，所以只对界面上看得见的那几十行调，结果按文件指纹缓存。 */
+  /** 数发言条数。要扫全文，所以只在用户选中会话后调用，结果按文件指纹缓存。 */
   countSessionMessages?(ids: string[]): Promise<Record<string, number>>;
   /** 演练：删这些会话会动到哪些文件和数据库行。 */
   planSessionRemoval?(ids: string[]): Promise<SessionRemovalPlan[]>;

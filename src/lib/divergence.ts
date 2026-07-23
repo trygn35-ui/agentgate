@@ -70,7 +70,7 @@ function tierOf(ratio: number): DivergenceTier {
  *
  * @param profiles 全部方案。
  * @param gateway 当前网关状态；未运行或无路由时无分歧率可言。
- * @returns 活跃线路的分歧率；无路由、无基准样本或线路不可达时返回 undefined。
+ * @returns 最偏离基准的活跃线路；无可计算线路时返回 undefined。
  */
 export function computeDivergence(
   profiles: Profile[],
@@ -79,30 +79,31 @@ export function computeDivergence(
   const running = gateway.status === "running" || gateway.status === "starting";
   if (!running || gateway.routes.length === 0) return undefined;
 
-  // 多条路由时取第一条：它们通常指向同一批线路，且用户主要关心当前主力。
-  const route = gateway.routes[0];
-  const profile = profiles.find((item) => item.id === route.profileId);
-  if (!profile) return undefined;
-
-  const endpoint = profile.endpoints.find((item) => item.url === profile.baseUrl)
-    ?? profile.endpoints[0];
-  if (!endpoint) return undefined;
-
-  const currentMs = endpoint.health?.latencyMs;
-  if (!Number.isFinite(currentMs) || (currentMs ?? 0) <= 0) return undefined;
-  if (endpoint.health?.status === "unhealthy") return undefined;
-
-  const baselineMs = baselineLatency(endpoint);
-  if (baselineMs === undefined) return undefined;
-
-  const ratio = (currentMs as number) / baselineMs;
-  return {
-    ratio,
-    currentMs: Math.round(currentMs as number),
-    baselineMs: Math.round(baselineMs),
-    profileName: profile.name,
-    tier: tierOf(ratio),
-  };
+  // routes 只是已分配集合；只有 engaged 中的客户端真的在经过本地网关。
+  const engaged = new Set(gateway.engaged);
+  let worst: Divergence | undefined;
+  for (const route of gateway.routes) {
+    if (!engaged.has(route.target)) continue;
+    const profile = profiles.find((item) => item.id === route.profileId);
+    if (!profile) continue;
+    const endpoint = profile.endpoints.find((item) => item.url === profile.baseUrl)
+      ?? profile.endpoints[0];
+    if (!endpoint || endpoint.health?.status === "unhealthy") continue;
+    const currentMs = endpoint.health?.latencyMs;
+    const baselineMs = baselineLatency(endpoint);
+    if (!Number.isFinite(currentMs) || (currentMs ?? 0) <= 0 || baselineMs === undefined) continue;
+    const ratio = (currentMs as number) / baselineMs;
+    if (!worst || ratio > worst.ratio) {
+      worst = {
+        ratio,
+        currentMs: Math.round(currentMs as number),
+        baselineMs: Math.round(baselineMs),
+        profileName: profile.name,
+        tier: tierOf(ratio),
+      };
+    }
+  }
+  return worst;
 }
 
 /**
@@ -117,7 +118,7 @@ export function formatDivergence(ratio: number): string {
   return Math.min(ratio, 9.999999).toFixed(6);
 }
 
-/** 累计缓存率：六位小数，与分歧仪同一套「过度精确」的读数语言。 */
+/** 缓存率沿用分歧仪的固定位数读数，保留六位小数。 */
 export function formatRate(value?: number): string {
   if (value === undefined || !Number.isFinite(value)) return "———";
   return value.toFixed(6);
@@ -130,16 +131,20 @@ export function formatTokenTotal(value?: number): string {
 }
 
 /**
- * 最近一小时的缓存命中率。
+ * 本地当天的缓存命中率，0 点自然重置。
  *
  * 直接从请求记录聚合，而不是用方案上的终身累计：仪表三格统一为近期视角，
  * 终身数字会把当下的异常淹没在历史里。
  *
- * @param requests 请求记录（监控服务保留最近一小时）。
- * @returns 0–1 的比值；窗口内没有可用输入 Token 时返回 undefined。
+ * @param requests 请求记录（监控服务保留最近三天）。
+ * @param now 当前本地时间，测试可注入。
+ * @returns 0–1 的比值；当天没有可用输入 Token 时返回 undefined。
  */
-export function recentCacheRate(requests: ActiveRequest[]): number | undefined {
-  const cutoff = Date.now() - BASELINE_WINDOW_MS;
+export function todayCacheRate(
+  requests: ActiveRequest[],
+  now = new Date(),
+): number | undefined {
+  const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
   let input = 0;
   let cached = 0;
   for (const request of requests) {
@@ -150,6 +155,14 @@ export function recentCacheRate(requests: ActiveRequest[]): number | undefined {
   }
   if (input <= 0) return undefined;
   return Math.min(1, cached / input);
+}
+
+export function todayRequestCount(requests: ActiveRequest[], now = new Date()): number {
+  const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  return requests.filter((request) => {
+    const startedAt = Date.parse(request.startedAt);
+    return Number.isFinite(startedAt) && startedAt >= cutoff;
+  }).length;
 }
 
 /**

@@ -1,4 +1,6 @@
-const { autoUpdater } = require('electron-updater')
+const electronUpdater = require('electron-updater')
+
+const RELEASE_DOWNLOAD_URL = 'https://github.com/trygn35-ui/agentgate/releases/latest'
 
 /** 便携版无法就地替换自身，只能引导用户手动下载。 */
 const PORTABLE = Boolean(process.env.PORTABLE_EXECUTABLE_FILE)
@@ -20,12 +22,12 @@ const STATE = Object.freeze({
  * 所有网络错误都转换为公开状态，不会中断应用运行。
  */
 class UpdateService {
-  constructor({ app, shell, onChanged, updater = autoUpdater, portable = PORTABLE } = {}) {
+  constructor({ app, shell, onChanged, updater, portable = PORTABLE } = {}) {
     if (!app) throw new Error('UpdateService requires app')
     this.app = app
     this.shell = shell
     this.onChanged = onChanged
-    this.updater = updater
+    this.updater = updater || electronUpdater.autoUpdater
     this.portable = portable
     this.state = {
       state: STATE.IDLE,
@@ -40,6 +42,7 @@ class UpdateService {
       state: STATE.AVAILABLE,
       version: info?.version,
       releaseNotes: typeof info?.releaseNotes === 'string' ? info.releaseNotes : undefined,
+      releaseUrl: RELEASE_DOWNLOAD_URL,
     }))
     this.updater.on('update-not-available', () => this._set({ state: STATE.UP_TO_DATE }))
     this.updater.on('download-progress', (progress) => this._set({
@@ -71,7 +74,11 @@ class UpdateService {
       this._set({ state: STATE.IDLE, message: '开发模式不检查更新' })
       return this.getPublicState()
     }
+    if (this.state.state === STATE.CHECKING || this.state.state === STATE.DOWNLOADING) {
+      return this.getPublicState()
+    }
     try {
+      this._set({ state: STATE.CHECKING })
       await this.updater.checkForUpdates()
     } catch (error) {
       this._set({ state: STATE.ERROR, message: String(error?.message || error) })
@@ -86,10 +93,12 @@ class UpdateService {
    */
   async download() {
     if (this.portable) {
-      const url = this.state.releaseUrl
-      if (url) await this.shell?.openExternal(url)
+      if (!this.shell?.openExternal) throw new Error('Download page is unavailable')
+      await this.shell.openExternal(this.state.releaseUrl || RELEASE_DOWNLOAD_URL)
       return this.getPublicState()
     }
+    if (this.state.state === STATE.DOWNLOADING) return this.getPublicState()
+    if (this.state.state !== STATE.AVAILABLE) return this.getPublicState()
     try {
       this._set({ state: STATE.DOWNLOADING, percent: 0 })
       await this.updater.downloadUpdate()
@@ -106,8 +115,12 @@ class UpdateService {
    */
   quitAndInstall() {
     if (this.portable || this.state.state !== STATE.READY) return false
-    this.updater.quitAndInstall()
-    return true
+    try {
+      this.updater.quitAndInstall()
+      return true
+    } catch {
+      return false
+    }
   }
 
   _set(patch) {
@@ -123,6 +136,7 @@ class UpdateService {
 }
 
 module.exports = {
+  RELEASE_DOWNLOAD_URL,
   PORTABLE,
   STATE,
   UpdateService,

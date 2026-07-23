@@ -5,6 +5,7 @@ const require = createRequire(import.meta.url);
 const {
   AutoSwitchService,
   MINIMUM_IMPROVEMENT_MS,
+  candidateEndpoints,
 } = require("../electron/services/auto-switch-service.cjs");
 
 const PROFILE_ID = "profile-auto-switch";
@@ -355,6 +356,33 @@ describe("自动 URL 切换服务", () => {
     expect(applyService.apply).not.toHaveBeenCalled();
   });
 
+  it("滚动健康候选也排除不支持当前模型的端点", () => {
+    const tested = profile({
+      endpoints: [
+        endpoint(CURRENT_URL, { status: "unhealthy", latencyMs: 900 }),
+        endpoint(FAST_URL, { latencyMs: 30, models: ["another-model"] }),
+      ],
+    });
+
+    expect(candidateEndpoints(tested, { allowCold: true })).toEqual([]);
+  });
+
+  it("按方案配置的检测周期判断是否到期", () => {
+    let now = 9 * 60_000;
+    const tested = profile({
+      endpoints: [
+        { ...endpoint(CURRENT_URL), health: undefined },
+        { ...endpoint(FAST_URL), health: undefined },
+      ],
+      autoSwitch: { enabled: true, intervalMinutes: 10 },
+    });
+    const { service } = createHarness({ tested, now: () => now });
+
+    expect(service.isDue(tested)).toBe(false);
+    now = 10 * 60_000;
+    expect(service.isDue(tested)).toBe(true);
+  });
+
   it("前一轮 tick 未完成时不会重入", async () => {
     const dueProfile = profile({
       endpoints: [
@@ -364,6 +392,7 @@ describe("自动 URL 切换服务", () => {
     });
     const { service, profileService } = createHarness({
       tested: dueProfile,
+      gatewayTargets: ["codex"],
       now: () => 120_000,
     });
     let finishRun;
@@ -386,6 +415,29 @@ describe("自动 URL 切换服务", () => {
     await Promise.all([firstTick, secondTick]);
   });
 
+  it("未分配给任何客户端的备用方案仍在后台扫描，但不刷新客户端路由", async () => {
+    const dueProfile = profile({
+      endpoints: [
+        { ...endpoint(CURRENT_URL), health: undefined },
+        { ...endpoint(FAST_URL), health: undefined },
+      ],
+    });
+    const { service, healthService, gatewayService, applyService } = createHarness({
+      tested: dueProfile,
+      gatewayTargets: [],
+      now: () => 120_000,
+    });
+
+    await service.tick();
+
+    expect(healthService.testWithSnapshot).toHaveBeenCalledOnce();
+    expect(healthService.testWithSnapshot).toHaveBeenCalledWith(PROFILE_ID, {
+      signal: expect.any(AbortSignal),
+    });
+    expect(gatewayService.refreshProfile).not.toHaveBeenCalled();
+    expect(applyService.apply).not.toHaveBeenCalled();
+  });
+
   it("stopAndWait 会中止运行中的检测且不切换 URL", async () => {
     const dueProfile = profile({
       endpoints: [
@@ -393,7 +445,10 @@ describe("自动 URL 切换服务", () => {
         { ...endpoint(FAST_URL), health: undefined },
       ],
     });
-    const { service, healthService, profileService } = createHarness({ tested: dueProfile });
+    const { service, healthService, profileService } = createHarness({
+      tested: dueProfile,
+      gatewayTargets: ["codex"],
+    });
     healthService.testWithSnapshot.mockImplementation((_id, { signal }) => (
       new Promise((_resolve, reject) => {
         signal.addEventListener("abort", () => {

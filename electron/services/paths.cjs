@@ -20,6 +20,38 @@ function chooseOpenCodeConfig(directory) {
   return jsonPath
 }
 
+function resolveVsCodeUserSettings(env, homeDir) {
+  let configRoot
+  if (env.APPDATA) {
+    configRoot = resolveUserPath(env.APPDATA, homeDir)
+  } else if (process.platform === 'darwin') {
+    configRoot = path.join(homeDir, 'Library', 'Application Support')
+  } else {
+    configRoot = resolveUserPath(env.XDG_CONFIG_HOME, homeDir)
+      || path.join(homeDir, '.config')
+  }
+  const candidate = path.join(configRoot, 'Code', 'User', 'settings.json')
+  return fs.existsSync(candidate) ? candidate : undefined
+}
+
+function resolveClaudeDesktopConfig(env, homeDir) {
+  const localAppData = resolveUserPath(env.LOCALAPPDATA, homeDir)
+  if (!localAppData) return undefined
+  const library = path.join(localAppData, 'Claude-3p', 'configLibrary')
+  if (!fs.existsSync(library)) return undefined
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(library, '_meta.json'), 'utf8'))
+    const appliedId = meta?.appliedId
+    if (typeof appliedId !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        .test(appliedId)) return { library }
+    const candidate = path.join(library, `${appliedId}.json`)
+    return fs.existsSync(candidate) ? { config: candidate, library } : { library }
+  } catch {
+    return { library }
+  }
+}
+
 /**
  * 根据客户端环境变量和用户目录解析所有受支持的配置路径。
  *
@@ -34,6 +66,8 @@ function resolveClientPaths(env = process.env, homeDir = os.homedir()) {
     || path.join(homeDir, '.codex')
   const geminiDirectory = resolveUserPath(env.GEMINI_CLI_HOME, homeDir)
     || path.join(homeDir, '.gemini')
+  const vscodeConfig = resolveVsCodeUserSettings(env, homeDir)
+  const desktopConfig = resolveClaudeDesktopConfig(env, homeDir)
 
   let openCodeConfig
   if (env.OPENCODE_CONFIG) {
@@ -57,6 +91,9 @@ function resolveClientPaths(env = process.env, homeDir = os.homedir()) {
   return {
     claude: {
       config: path.join(claudeDirectory, 'settings.json'),
+      ...(vscodeConfig ? { vscodeConfig } : {}),
+      ...(desktopConfig?.config ? { desktopConfig: desktopConfig.config } : {}),
+      ...(desktopConfig?.library ? { desktopLibrary: desktopConfig.library } : {}),
     },
     codex: {
       config: path.join(codexDirectory, 'config.toml'),

@@ -148,7 +148,7 @@ Path overrides via `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `OPENCO
 
 This tool handles API keys, so each claim below is written as a **verifiable fact**, not a promise:
 
-- **No server, no account, no telemetry.** Apart from the upstreams you configure, Agent;Gate makes no network requests — confirm it yourself with a packet capture.
+- **No server, no account, no telemetry.** Network requests go only to your configured upstreams and, when you explicitly check or download an update in Settings, GitHub Releases. You can confirm this with a packet capture.
 - **Keys are encrypted with Windows DPAPI** (Electron `safeStorage`, bound to your Windows user), stored as ciphertext in `%APPDATA%\agentgate\data\profiles.json`. A different user or machine cannot decrypt them.
 - **Real keys are never written to client configs.** Clients only see a `127.0.0.1` address and a random local token. List/state IPC never returns plaintext keys; the copy action writes to the system clipboard directly from the main process.
 - **Request bodies are never stored.** Monitoring records latency, token counts, and model names — request and response content never touches disk.
@@ -240,7 +240,7 @@ If managed fields were modified externally, it refuses to stop rather than overw
 <br>
 
 Those are **server-side** relay/dispatch platforms: deployed, with databases, built for multiple users.
-Agent;Gate is a **single-user desktop tool**: nothing to deploy, nothing phones home, serving only your own CLI clients.
+Agent;Gate is a **single-user desktop tool**: nothing to deploy and no telemetry; only explicit update checks contact GitHub, and the gateway serves your own CLI clients.
 Its core value is "switch providers without touching client configs" and "keys encrypted, never on disk in plaintext".
 
 </details>

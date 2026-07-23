@@ -39,7 +39,7 @@ interface ProfileEditorProps {
   /** 正在识别模型。 */
   discovering?: boolean;
   /** 识别模型：用当前 Key 请求上游模型列表；返回最新可用模型。 */
-  onDiscoverModels?: () => Promise<string[] | undefined>;
+  onDiscoverModels?: (input: SaveProfileInput) => Promise<string[] | undefined>;
   onClose: () => void;
   onSave: (input: SaveProfileInput, applyAfter: boolean) => Promise<void>;
 }
@@ -151,7 +151,7 @@ function endpointStatus(
  * 新建或编辑连接方案，并在提交前完成客户端兼容性和必填项校验。
  *
  * 编辑已有方案时，空 Key 表示保留主进程中的原密文；组件不会读取已有明文。
- * 保存并使用会先保存方案，再由父级将它分配给本地网关。
+ * 保存并分配会先保存方案，再由父级将它分配给本地网关。
  *
  * @param props 可选现有方案、保存状态及关闭/保存回调。
  * @returns 居中弹出的方案编辑对话框。
@@ -167,6 +167,7 @@ export function ProfileEditor({
   const { m, fill } = useI18n();
   const initialForm = useRef(createEditorInput(profile));
   const [form, setForm] = useState<SaveProfileInput>(() => initialForm.current);
+  const formRef = useRef(form);
   const [showKey, setShowKey] = useState(false);
   const [error, setError] = useState<ValidationCode>();
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -187,6 +188,10 @@ export function ProfileEditor({
     : models;
 
   useEffect(() => {
+    formRef.current = form;
+  }, [form]);
+
+  useEffect(() => {
     if (!modelMenuOpen) return undefined;
     function handlePointerDown(event: MouseEvent): void {
       if (!(event.target instanceof Node)) return;
@@ -199,8 +204,10 @@ export function ProfileEditor({
 
   async function discoverModels(): Promise<void> {
     if (!onDiscoverModels || discovering) return;
-    const discovered = await onDiscoverModels();
+    const draft = form;
+    const discovered = await onDiscoverModels(draft);
     if (!discovered) return;
+    if (JSON.stringify(formRef.current) !== JSON.stringify(draft)) return;
     setModels(discovered);
     setModelQuery(undefined);
     setModelMenuOpen(discovered.length > 0);
@@ -707,14 +714,14 @@ export function ProfileEditor({
           <button type="button" className="btn-ghost" disabled={busy} onClick={requestClose}>
             {m.editor.cancel}
           </button>
-          <button type="submit" className="btn-save" disabled={busy}>
+          <button type="submit" className="btn-save" disabled={busy || discovering}>
             {busy ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}
             {busy ? m.editor.saving : m.editor.save}
           </button>
           <button
             type="button"
             className="btn-primary"
-            disabled={busy}
+            disabled={busy || discovering}
             onClick={(event) => void submit(event, true)}
           >
             {busy ? (

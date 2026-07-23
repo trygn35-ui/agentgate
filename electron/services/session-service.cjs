@@ -1,9 +1,10 @@
 const fs = require('node:fs')
 const readline = require('node:readline')
 const fsp = require('node:fs/promises')
+const crypto = require('node:crypto')
 const os = require('node:os')
 const path = require('node:path')
-const writeFileAtomic = require('write-file-atomic')
+const { SerialExecutor } = require('./storage.cjs')
 
 /**
  * 本机 agent 的会话管理：列出、演练、删除。
@@ -43,6 +44,117 @@ const MAX_MESSAGE_CHARS = 4000
 /** 从尾巴上先截这么多，不够就翻倍，最多截到这么大。正文能有 279 MB。 */
 const TAIL_SCAN_BYTES = 256 * 1024
 const MAX_TAIL_BYTES = 8 * 1024 * 1024
+const FILE_REWRITE_ATTEMPTS = 3
+const SESSION_SOURCE = Symbol('sessionSource')
+
+function hashText(value) {
+  return crypto.createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+async function readUtf8IfExists(file) {
+  try {
+    return await fsp.readFile(file, 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+async function replaceTextIfUnchanged(file, expectedHash, content) {
+  const stats = await fsp.stat(file)
+  const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
+  const claimed = `${file}.agentgate-claim-${crypto.randomUUID()}`
+  let handle
+  let claimedExists = false
+  try {
+    handle = await fsp.open(temporary, 'wx', stats.mode)
+    await handle.writeFile(content, { encoding: 'utf8' })
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+
+    try {
+      await fsp.rename(file, claimed)
+      claimedExists = true
+    } catch (error) {
+      if (error.code === 'ENOENT') return false
+      throw error
+    }
+
+    const claimedContent = await readUtf8IfExists(claimed)
+    if (claimedContent === undefined) return false
+    if (hashText(claimedContent) !== expectedHash) {
+      try {
+        await fsp.link(claimed, file)
+        await fsp.unlink(claimed)
+        claimedExists = false
+        return false
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error
+        throw new Error(
+          `Session state changed during atomic commit; recovery copy kept as ${path.basename(claimed)}`,
+        )
+      }
+    }
+
+    try {
+      await fsp.link(temporary, file)
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      throw new Error(
+        `Session state changed during atomic commit; recovery copy kept as ${path.basename(claimed)}`,
+      )
+    }
+
+    if (hashText(await fsp.readFile(claimed, 'utf8')) !== expectedHash) {
+      throw new Error(
+        `Session state changed during atomic commit; recovery copy kept as ${path.basename(claimed)}`,
+      )
+    }
+    await fsp.unlink(claimed)
+    claimedExists = false
+    return true
+  } finally {
+    await handle?.close().catch(() => {})
+    await fsp.unlink(temporary).catch(() => {})
+    if (claimedExists && !await existsPath(file)) {
+      await fsp.rename(claimed, file).then(() => {
+        claimedExists = false
+      }).catch(() => {})
+    }
+  }
+}
+
+async function existsPath(file) {
+  try {
+    await fsp.access(file)
+    return true
+  } catch (error) {
+    // 无法确认不存在时按“仍存在”处理，绝不冒险把 recovery 覆盖回去。
+    return error.code !== 'ENOENT'
+  }
+}
+
+/** 基于最新文本快照重算内容；文件持续变化时拒绝覆盖。 */
+async function rewriteTextWithRetry(file, transform) {
+  for (let attempt = 0; attempt < FILE_REWRITE_ATTEMPTS; attempt += 1) {
+    const source = await readUtf8IfExists(file)
+    if (source === undefined) return
+    const next = transform(source)
+    const sourceHash = hashText(source)
+
+    if (next === undefined || next === source) {
+      const current = await readUtf8IfExists(file)
+      if (current === undefined || hashText(current) === sourceHash) return
+      continue
+    }
+
+    if (!await replaceTextIfUnchanged(file, sourceHash, next)) continue
+    const committed = await readUtf8IfExists(file)
+    if (committed === undefined || hashText(committed) === hashText(next)) return
+  }
+  throw new Error(`Session state kept changing while it was being updated: ${path.basename(file)}`)
+}
 
 function clampText(value) {
   const text = String(value).trim()
@@ -154,6 +266,36 @@ async function statOrUndefined(file) {
   }
 }
 
+async function readDirOrEmpty(dir) {
+  try {
+    return await fsp.readdir(dir)
+  } catch (error) {
+    if (error.code === 'ENOENT') return []
+    throw error
+  }
+}
+
+function attachSessionSource(session, source) {
+  if (source) {
+    Object.defineProperty(session, SESSION_SOURCE, {
+      configurable: false,
+      enumerable: false,
+      value: source,
+      writable: false,
+    })
+  }
+  return session
+}
+
+function statFileOrAbsent(file) {
+  try {
+    return fs.statSync(file)
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
 /** 读文件头尾各一段。会话正文能有 279 MB，绝不整个读进来。 */
 async function readEnds(file, headBytes = HEAD_BYTES, tailBytes = TAIL_BYTES) {
   let handle
@@ -174,12 +316,10 @@ async function readEnds(file, headBytes = HEAD_BYTES, tailBytes = TAIL_BYTES) {
   }
 }
 
-/** 逐行喂 JSON。头尾截断出来的半行直接丢掉，别让它毒到解析。 */
-function* jsonLines(source, dropFirst = false) {
+/** 逐行喂 JSON。头尾截断出来的半行会因解析失败被丢掉，完整边界行保留。 */
+function* jsonLines(source, _dropFirst = false) {
   const lines = source.split('\n')
   for (let index = 0; index < lines.length; index += 1) {
-    // 尾段的第一行八成是被截断的半行
-    if (dropFirst && index === 0) continue
     const line = lines[index].trim()
     if (!line.startsWith('{')) continue
     try {
@@ -223,6 +363,7 @@ class SessionService {
   constructor({ home = os.homedir(), openDatabase = defaultOpenDatabase } = {}) {
     this.home = home
     this.openDatabase = openDatabase
+    this.serial = new SerialExecutor()
     /** 发言条数缓存，键是 路径:大小:改动时间——文件没变就不重扫。 */
     this.counts = new Map()
     this.roots = {
@@ -238,7 +379,27 @@ class SessionService {
       path.join(home, 'AppData', 'Local', 'opencode'),
       path.join(home, 'AppData', 'Roaming', 'opencode'),
     ]
-    return candidates.find((dir) => fs.existsSync(path.join(dir, 'opencode.db'))) ?? candidates[0]
+    const existing = candidates.map((dir, index) => {
+      const file = path.join(dir, 'opencode.db')
+      try {
+        const database = fs.statSync(file)
+        let activeAt = database.mtimeMs
+        try {
+          activeAt = Math.max(activeAt, fs.statSync(`${file}-wal`).mtimeMs)
+        } catch {
+          // 没有 WAL 时以主数据库的改动时间为准。
+        }
+        return {
+          dir,
+          index,
+          activeAt,
+        }
+      } catch {
+        return undefined
+      }
+    }).filter(Boolean)
+    existing.sort((left, right) => right.activeAt - left.activeAt || left.index - right.index)
+    return existing[0]?.dir ?? candidates[0]
   }
 
   /** 每一条要删的路径都得过这道闸：必须真的在该客户端的根目录里面。 */
@@ -249,23 +410,89 @@ class SessionService {
     return resolved !== root && !rel.startsWith('..') && !path.isAbsolute(rel)
   }
 
-  async list() {
-    const results = await Promise.all([
-      this._listClaude().catch(() => []),
-      this._listCodex().catch(() => []),
-      this._listOpenCode().catch(() => []),
-    ])
-    return results.flat().sort((left, right) => (
+  /** 路径本身和符号链接的最终目标都必须留在客户端根目录内。 */
+  async _withinReal(client, target) {
+    if (!this._within(client, target)) return false
+    try {
+      const [root, resolved] = await Promise.all([
+        fsp.realpath(this.roots[client]),
+        fsp.realpath(target),
+      ])
+      const rel = path.relative(root, resolved)
+      return resolved !== root && !rel.startsWith('..') && !path.isAbsolute(rel)
+    } catch {
+      return false
+    }
+  }
+
+  async _codexRollout(target) {
+    if (typeof target !== 'string' || !target || !await this._withinReal('codex', target)) {
+      return undefined
+    }
+    const stats = await statOrUndefined(target)
+    return stats?.isFile() ? { path: path.resolve(target), stats } : undefined
+  }
+
+  /**
+   * 扫描三家的会话，并保留“哪一家扫描失败”的信息。
+   *
+   * `list()` 仍返回旧版数组，供现有 IPC/渲染端直接使用；新调用方可使用这个
+   * 明确的结果对象，不再把损坏数据库或权限错误误认成空列表。
+   */
+  async listDetailed() {
+    const sources = [
+      ['claude', () => this._listClaude()],
+      ['codex', () => this._listCodex()],
+      ['opencode', () => this._listOpenCode()],
+    ]
+    const settled = await Promise.allSettled(sources.map(([, scan]) => scan()))
+    const sessions = []
+    const errors = []
+    for (let index = 0; index < settled.length; index += 1) {
+      const [client] = sources[index]
+      const result = settled[index]
+      if (result.status === 'fulfilled') {
+        sessions.push(...result.value)
+        continue
+      }
+      const error = result.reason
+      errors.push({
+        client,
+        reason: error instanceof Error ? error.message : String(error),
+      })
+    }
+    sessions.sort((left, right) => (
       (right.updatedAt ?? '').localeCompare(left.updatedAt ?? '')
     ))
+    return { sessions, errors }
+  }
+
+  async list() {
+    const { sessions, errors } = await this.listDetailed()
+    // Keep the historical `AgentSession[]` shape while making scan failures
+    // observable to callers that know to inspect the optional property.
+    Object.defineProperty(sessions, 'scanErrors', {
+      configurable: false,
+      enumerable: true,
+      value: errors,
+      writable: false,
+    })
+    return sessions
   }
 
   /** 演练：把要删的东西、和特意不删的东西，都摆出来。 */
   async plan(ids) {
     const sessions = await this.list()
+    const requestedClients = new Set(ids.map((id) => String(id).split(':', 1)[0]))
+    const scanErrors = (sessions.scanErrors ?? [])
+      .filter((error) => requestedClients.has(error.client))
+    if (scanErrors.length > 0) {
+      throw new Error(scanErrors.map((error) => `${error.client}: ${error.reason}`).join('; '))
+    }
     const index = new Map(sessions.map((session) => [session.id, session]))
+    const expandedIds = this._expandCodexDescendants(ids, index)
     const plans = []
-    for (const id of ids) {
+    for (const id of expandedIds) {
       const session = index.get(id)
       if (!session) continue
       const plan = await this._plan(session)
@@ -274,49 +501,109 @@ class SessionService {
     return plans
   }
 
-  async remove(ids) {
-    const plans = await this.plan(ids)
-    const removed = []
-    const failed = []
-    for (const plan of plans) {
-      try {
-        await this._execute(plan)
-        removed.push(plan.id)
-      } catch (error) {
-        failed.push({ id: plan.id, reason: error instanceof Error ? error.message : String(error) })
-      }
+  _expandCodexDescendants(ids, index) {
+    if (!ids.some((id) => index.get(id)?.client === 'codex')) return [...new Set(ids)]
+
+    const children = new Map()
+    // _listCodex 已经从 thread_spawn_edges 取出每个实际线程的直接父级；
+    // 复用这份快照，避免删除前再次打开可能正在被 Codex 更新的数据库。
+    for (const session of index.values()) {
+      if (session.client !== 'codex' || !session.parentNativeId) continue
+      const parent = `codex:${session.parentNativeId}`
+      if (!index.has(parent) || parent === session.id) continue
+      const siblings = children.get(parent) ?? []
+      siblings.push(session.id)
+      children.set(parent, siblings)
     }
-    return { removed, failed }
+
+    const visiting = new Set()
+    const included = new Set()
+    const result = []
+    const append = (id) => {
+      if (included.has(id) || visiting.has(id)) return
+      visiting.add(id)
+      for (const child of children.get(id) ?? []) append(child)
+      visiting.delete(id)
+      included.add(id)
+      result.push(id)
+    }
+    for (const id of ids) append(id)
+    return result
+  }
+
+  async remove(ids) {
+    return this.serial.run(async () => {
+      let plans
+      try {
+        plans = await this.plan(ids)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        return {
+          removed: [],
+          failed: ids.map((id) => ({ id, reason })),
+        }
+      }
+      const removed = []
+      const failed = []
+      for (const plan of plans) {
+        try {
+          await this._execute(plan)
+          removed.push(plan.id)
+        } catch (error) {
+          failed.push({ id: plan.id, reason: error instanceof Error ? error.message : String(error) })
+        }
+      }
+      return { removed, failed }
+    })
   }
 
   // ————————————————————————————— Claude Code —————————————————————————————
 
   async _listClaude() {
     const projectsRoot = path.join(this.roots.claude, 'projects')
-    const projects = await fsp.readdir(projectsRoot).catch(() => [])
+    const projects = await readDirOrEmpty(projectsRoot)
     const sessions = []
     for (const project of projects) {
       const dir = path.join(projectsRoot, project)
-      const files = await fsp.readdir(dir).catch(() => [])
+      // Claude projects may contain junctions.  Never follow one outside .claude.
+      if (!await this._withinReal('claude', dir)) continue
+      const files = await readDirOrEmpty(dir)
       for (const file of files) {
         if (!file.endsWith('.jsonl')) continue
         const full = path.join(dir, file)
+        if (!await this._withinReal('claude', full)) continue
         const stats = await statOrUndefined(full)
         if (!stats?.isFile()) continue
         const uuid = file.slice(0, -'.jsonl'.length)
         const { head, tail } = await readEnds(full)
-        sessions.push({
-          id: `claude:${uuid}`,
+        sessions.push(attachSessionSource({
+          project,
+          uuid,
           client: 'claude',
           nativeId: uuid,
           title: this._claudeTitle(head, tail) || uuid.slice(0, 8),
           workspace: this._claudeWorkspace(head),
           updatedAt: stats.mtime.toISOString(),
           sizeBytes: stats.size,
-        })
+        }, full))
       }
     }
-    return sessions
+    const occurrences = new Map()
+    for (const session of sessions) {
+      occurrences.set(session.uuid, (occurrences.get(session.uuid) ?? 0) + 1)
+    }
+    return sessions.map((source) => {
+      const { uuid, ...session } = source
+      return attachSessionSource({
+        ...session,
+        // Keep the historic id for the common case.  A UUID is only unique
+        // within a Claude project, so include a fixed-length project digest
+        // when it is repeated (the IPC session-id schema caps ids at 200 chars).
+        id: occurrences.get(uuid) === 1
+          ? `claude:${uuid}`
+          : `claude:${hashText(session.project)}:${uuid}`,
+      }, source[SESSION_SOURCE])
+    })
   }
 
   /**
@@ -335,14 +622,20 @@ class SessionService {
   }
 
   _claudeTitle(head, tail) {
-    // 真标题（用户自己起的 > 模型起的）是后写的，在尾巴上；绝大多数会话根本没有
+    // 标题可能写在头部（短会话），也可能写在尾部；按文件顺序保留最后一个有效值。
+    let customTitle = ''
     let aiTitle = ''
-    for (const record of jsonLines(tail, true)) {
-      if (typeof record.customTitle === 'string' && record.customTitle.trim()) {
-        return trimTitle(record.customTitle)
+    const scanTitles = (source, dropFirst) => {
+      for (const record of jsonLines(source, dropFirst)) {
+        if (typeof record.customTitle === 'string' && record.customTitle.trim()) {
+          customTitle = record.customTitle
+        }
+        if (typeof record.aiTitle === 'string' && record.aiTitle.trim()) aiTitle = record.aiTitle
       }
-      if (typeof record.aiTitle === 'string' && record.aiTitle.trim()) aiTitle = record.aiTitle
     }
+    scanTitles(head, false)
+    if (tail) scanTitles(tail, true)
+    if (customTitle) return trimTitle(customTitle)
     if (aiTitle) return trimTitle(aiTitle)
 
     // 退回首条真人消息。开头那几条常是 <command-name> 之类的桩子，得跳过。
@@ -367,43 +660,72 @@ class SessionService {
     const rows = []
 
     const projectsRoot = path.join(root, 'projects')
-    const projects = await fsp.readdir(projectsRoot).catch(() => [])
-    for (const project of projects) {
-      // 正文，以及同名的侧车目录（子代理、工具结果、工作流）
-      for (const candidate of [
-        path.join(projectsRoot, project, `${uuid}.jsonl`),
-        path.join(projectsRoot, project, uuid),
-      ]) {
-        const stats = await statOrUndefined(candidate)
-        if (stats) files.push({ path: candidate, bytes: stats.size })
+    let project = typeof session.project === 'string' && session.project
+      ? session.project
+      : undefined
+    // All listed sessions carry their project.  Keep a narrow fallback for
+    // callers holding an older session object, without scanning every project
+    // (which could delete another project sharing this UUID).
+    if (!project) {
+      const file = await this._claudeFile(uuid)
+      project = file ? path.basename(path.dirname(file)) : undefined
+    }
+    if (project) {
+      const projectDir = path.join(projectsRoot, project)
+      if (await this._withinReal('claude', projectDir)) {
+        // 正文，以及同名的侧车目录（子代理、工具结果、工作流）
+        for (const candidate of [
+          path.join(projectDir, `${uuid}.jsonl`),
+          path.join(projectDir, uuid),
+        ]) {
+          if (!await this._withinReal('claude', candidate)) continue
+          const stats = await statOrUndefined(candidate)
+          if (stats) files.push({ path: candidate, bytes: stats.size })
+        }
       }
     }
 
-    // 待办
-    const tasks = path.join(root, 'tasks', uuid)
-    const taskStats = await statOrUndefined(tasks)
-    if (taskStats) files.push({ path: tasks, bytes: taskStats.size })
+    // tasks, telemetry and history are keyed only by UUID.  When the UUID is
+    // repeated across projects they are ambiguous, so leave them untouched.
+    const sharedUuid = session.id !== `claude:${uuid}`
+    if (!sharedUuid) {
+      const tasks = path.join(root, 'tasks', uuid)
+      if (await this._withinReal('claude', tasks)) {
+        const taskStats = await statOrUndefined(tasks)
+        if (taskStats) files.push({ path: tasks, bytes: taskStats.size })
+      }
 
-    // 遥测里按会话 id 命名的失败事件——官方的 purge 也不清它，正在这儿常年堆积
-    const telemetryDir = path.join(root, 'telemetry')
-    for (const name of await fsp.readdir(telemetryDir).catch(() => [])) {
-      if (!name.includes(uuid)) continue
-      const full = path.join(telemetryDir, name)
-      const stats = await statOrUndefined(full)
-      if (stats) files.push({ path: full, bytes: stats.size })
+      // 遥测里按会话 id 命名的失败事件——官方的 purge 也不清它，正在这儿常年堆积
+      const telemetryDir = path.join(root, 'telemetry')
+      if (await this._withinReal('claude', telemetryDir)) {
+        for (const name of await fsp.readdir(telemetryDir).catch(() => [])) {
+          if (!name.includes(uuid)) continue
+          const full = path.join(telemetryDir, name)
+          if (!await this._withinReal('claude', full)) continue
+          const stats = await statOrUndefined(full)
+          if (stats) files.push({ path: full, bytes: stats.size })
+        }
+      }
+
+      const history = path.join(root, 'history.jsonl')
+      if (await this._withinReal('claude', history)
+        && await statOrUndefined(history)) {
+        rows.push({ kind: 'jsonl-filter', file: history, id: uuid })
+      }
     }
-
-    const history = path.join(root, 'history.jsonl')
-    if (await statOrUndefined(history)) rows.push({ kind: 'jsonl-filter', file: history, id: uuid })
 
     return {
       id: session.id,
+      nativeId: session.nativeId,
       client: 'claude',
       title: session.title,
       workspace: session.workspace,
-      files: files.filter((entry) => this._within('claude', entry.path)),
+      project,
+      files,
       rows,
-      kept: ['memory', 'settings', 'credentials'],
+      kept: sharedUuid
+        ? ['memory', 'settings', 'credentials', 'tasks', 'telemetry', 'history']
+        : ['memory', 'settings', 'credentials'],
     }
   }
 
@@ -416,17 +738,35 @@ class SessionService {
 
   async _listCodex() {
     const file = this._codexDb()
-    if (!fs.existsSync(file)) return []
+    if (!statFileOrAbsent(file)?.isFile()) return []
     const db = this.openDatabase(file, { readonly: true })
     try {
-      const rows = db.all(`SELECT id, title, preview, first_user_message, cwd, rollout_path,
-                                  updated_at_ms, created_at_ms, archived
-                           FROM threads`)
+      const threadColumns = new Set(
+        db.all('PRAGMA table_info(threads)').map((column) => column.name),
+      )
+      const metadataColumns = ['thread_source', 'agent_nickname', 'agent_role']
+        .map((column) => threadColumns.has(column) ? `t.${column}` : `NULL AS ${column}`)
+        .join(', ')
+      const hasSpawnEdges = new Set(db.tables()).has('thread_spawn_edges')
+      const parentColumn = hasSpawnEdges
+        ? 'edge.parent_native_id'
+        : 'NULL AS parent_native_id'
+      const parentJoin = hasSpawnEdges
+        ? `LEFT JOIN (
+             SELECT child_thread_id, MIN(parent_thread_id) AS parent_native_id
+             FROM thread_spawn_edges
+             GROUP BY child_thread_id
+           ) edge ON edge.child_thread_id = t.id`
+        : ''
+      const rows = db.all(`SELECT t.id, t.title, t.preview, t.first_user_message, t.cwd,
+                                  t.rollout_path, t.updated_at_ms, t.created_at_ms, t.archived,
+                                  ${metadataColumns}, ${parentColumn}
+                           FROM threads t
+                           ${parentJoin}`)
       const sessions = []
       for (const row of rows) {
-        const rollout = typeof row.rollout_path === 'string' ? row.rollout_path : ''
-        const stats = rollout ? await statOrUndefined(rollout) : undefined
-        sessions.push({
+        const rollout = await this._codexRollout(row.rollout_path)
+        sessions.push(attachSessionSource({
           id: `codex:${row.id}`,
           client: 'codex',
           nativeId: String(row.id),
@@ -434,9 +774,15 @@ class SessionService {
             || String(row.id).slice(0, 8),
           workspace: stripExtendedPrefix(row.cwd),
           updatedAt: isoOrUndefined(row.updated_at_ms ?? row.created_at_ms),
-          sizeBytes: stats?.size ?? 0,
+          sizeBytes: rollout?.stats.size ?? 0,
           archived: row.archived === 1,
-        })
+          threadSource: typeof row.thread_source === 'string' ? row.thread_source : undefined,
+          agentNickname: typeof row.agent_nickname === 'string' ? row.agent_nickname : undefined,
+          agentRole: typeof row.agent_role === 'string' ? row.agent_role : undefined,
+          parentNativeId: typeof row.parent_native_id === 'string'
+            ? row.parent_native_id
+            : undefined,
+        }, rollout?.path))
       }
       return sessions
     } finally {
@@ -450,7 +796,19 @@ class SessionService {
     const files = []
     const rows = []
 
-    const db = this.openDatabase(this._codexDb(), { readonly: true })
+    const stateFile = this._codexDb()
+    if (!fs.existsSync(stateFile)) {
+      throw new Error(`Required session database is missing: ${path.basename(stateFile)}`)
+    }
+    let db
+    try {
+      db = this.openDatabase(stateFile, { readonly: true })
+    } catch (error) {
+      if (!fs.existsSync(stateFile)) {
+        throw new Error(`Required session database is missing: ${path.basename(stateFile)}`)
+      }
+      throw error
+    }
     let rollout = ''
     try {
       const row = db.get('SELECT rollout_path FROM threads WHERE id = ?', id)
@@ -461,34 +819,40 @@ class SessionService {
     // 正文路径只从库里取，绝不按日期自己拼——归档过的会话躺在 archived_sessions/ 里，
     // 是平铺的；而且文件名上的时间戳是本地时间，文件内部却全是 UTC。
     if (rollout) {
-      const stats = await statOrUndefined(rollout)
-      if (stats) files.push({ path: rollout, bytes: stats.size })
+      const safeRollout = await this._codexRollout(rollout)
+      if (safeRollout) files.push({ path: safeRollout.path, bytes: safeRollout.stats.size })
     }
 
     rows.push({
       kind: 'sqlite',
       file: this._codexDb(),
+      required: true,
+      requiredTables: ['threads'],
       statements: [
         // thread_dynamic_tools 靠外键级联；spawn_edges 没有外键，得自己动手，
         // 否则删掉父线程会把子代理树整棵孤儿化。
-        ['DELETE FROM threads WHERE id = ?', id],
         ['DELETE FROM thread_spawn_edges WHERE child_thread_id = ? OR parent_thread_id = ?', id, id],
+        // 先断边再删线程：某些版本给 spawn_edges 加了 RESTRICT 外键，顺序反过来会失败。
+        ['DELETE FROM threads WHERE id = ?', id],
       ],
     })
     // 会话删了，它蒸馏出来的记忆不能留着——那是隐私泄漏。
     rows.push({
       kind: 'sqlite',
       file: path.join(root, 'memories_1.sqlite'),
+      required: false,
       statements: [['DELETE FROM stage1_outputs WHERE thread_id = ?', id]],
     })
     rows.push({
       kind: 'sqlite',
       file: path.join(root, 'goals_1.sqlite'),
+      required: false,
       statements: [['DELETE FROM thread_goals WHERE thread_id = ?', id]],
     })
     rows.push({
       kind: 'sqlite',
       file: path.join(root, 'sqlite', 'codex-dev.db'),
+      required: false,
       statements: [
         ['DELETE FROM local_thread_catalog WHERE thread_id = ?', id],
         ['DELETE FROM inbox_items WHERE thread_id = ?', id],
@@ -507,6 +871,7 @@ class SessionService {
 
     return {
       id: session.id,
+      nativeId: session.nativeId,
       client: 'codex',
       title: session.title,
       workspace: session.workspace,
@@ -526,12 +891,12 @@ class SessionService {
 
   async _listOpenCode() {
     const file = this._openCodeDb()
-    if (!fs.existsSync(file)) return []
+    if (!statFileOrAbsent(file)?.isFile()) return []
     const db = this.openDatabase(file, { readonly: true })
     try {
       // 发言条数不在这儿算：口径统一交给 countMessages，免得列表和正文各说各的
       const rows = db.all(`SELECT s.id, s.title, s.directory, s.time_created, s.time_updated,
-                                  (SELECT COALESCE(SUM(LENGTH(p.data)), 0) FROM part p
+                                  (SELECT COALESCE(SUM(LENGTH(CAST(p.data AS BLOB))), 0) FROM part p
                                     WHERE p.session_id = s.id) AS bytes
                            FROM session s`)
       return rows.map((row) => ({
@@ -557,6 +922,7 @@ class SessionService {
 
     return {
       id: session.id,
+      nativeId: session.nativeId,
       client: 'opencode',
       title: session.title,
       workspace: session.workspace,
@@ -564,6 +930,8 @@ class SessionService {
       rows: [{
         kind: 'sqlite',
         file: this._openCodeDb(),
+        required: true,
+        requiredTables: ['session'],
         statements: [
           /*
            * part 的外键指向 message，不是 session——级联只能顺着 message 走下去。
@@ -617,9 +985,7 @@ class SessionService {
   async _count(session) {
     if (session.client === 'opencode') return this._countOpenCode(session)
 
-    const file = session.client === 'claude'
-      ? await this._claudeFile(session.nativeId)
-      : await this._codexFile(session.nativeId)
+    const file = await this._sessionSourceFile(session)
     if (!file) return 0
     const stats = await statOrUndefined(file)
     if (!stats) return 0
@@ -666,7 +1032,12 @@ class SessionService {
           WHERE m.session_id = ?
             AND EXISTS (SELECT 1 FROM part p
                          WHERE p.message_id = m.id
-                           AND json_extract(p.data, '$.type') = 'text')`,
+                           AND CASE WHEN json_valid(p.data)
+                                    THEN json_extract(p.data, '$.type') END = 'text'
+                           AND typeof(CASE WHEN json_valid(p.data)
+                                           THEN json_extract(p.data, '$.text') END) = 'text'
+                           AND trim(CASE WHEN json_valid(p.data)
+                                         THEN json_extract(p.data, '$.text') END) <> '')`,
         session.nativeId,
       )
       return Number(row?.total) || 0
@@ -686,16 +1057,14 @@ class SessionService {
    * @param limit 要几条。0 表示尽量多（仍受 MAX_MESSAGES 与 MAX_TAIL_BYTES 限制）。
    */
   async readMessages(id, { limit = 30 } = {}) {
-    const sessions = await this.list()
+    const { sessions } = await this.listDetailed()
     const session = sessions.find((item) => item.id === id)
     if (!session) return { messages: [], truncated: false }
     const want = limit > 0 ? Math.min(limit, MAX_MESSAGES) : MAX_MESSAGES
 
     if (session.client === 'opencode') return this._readOpenCodeMessages(session, want)
 
-    const file = session.client === 'claude'
-      ? await this._claudeFile(session.nativeId)
-      : await this._codexFile(session.nativeId)
+    const file = await this._sessionSourceFile(session)
     if (!file) return { messages: [], truncated: false }
 
     const pick = session.client === 'claude' ? claudeMessage : codexMessage
@@ -721,21 +1090,41 @@ class SessionService {
     }
   }
 
-  async _claudeFile(uuid) {
+  async _claudeFile(uuid, project) {
     const projectsRoot = path.join(this.roots.claude, 'projects')
-    for (const project of await fsp.readdir(projectsRoot).catch(() => [])) {
-      const candidate = path.join(projectsRoot, project, `${uuid}.jsonl`)
-      if (await statOrUndefined(candidate)) return candidate
+    const projects = project
+      ? [project]
+      : await fsp.readdir(projectsRoot).catch(() => [])
+    for (const name of projects) {
+      const projectDir = path.join(projectsRoot, name)
+      const candidate = path.join(projectDir, `${uuid}.jsonl`)
+      if (!await this._withinReal('claude', projectDir)
+        || !await this._withinReal('claude', candidate)) continue
+      const stats = await statOrUndefined(candidate)
+      if (stats?.isFile()) return candidate
     }
     return undefined
+  }
+
+  /**
+   * 列表扫描已经拿到了正文路径；读取时只再次确认边界和文件类型，不重新查索引。
+   * 这既避免切换会话时重复全量 I/O，也保留符号链接越界保护。
+   */
+  async _sessionSourceFile(session) {
+    const source = session?.[SESSION_SOURCE]
+    if (typeof source !== 'string') return undefined
+    const client = session.client
+    if (client !== 'claude' && client !== 'codex') return undefined
+    if (!await this._withinReal(client, source)) return undefined
+    const stats = await statOrUndefined(source)
+    return stats?.isFile() ? source : undefined
   }
 
   async _codexFile(id) {
     const db = this.openDatabase(this._codexDb(), { readonly: true })
     try {
       const row = db.get('SELECT rollout_path FROM threads WHERE id = ?', id)
-      const file = typeof row?.rollout_path === 'string' ? row.rollout_path : ''
-      return file && await statOrUndefined(file) ? file : undefined
+      return (await this._codexRollout(row?.rollout_path))?.path
     } finally {
       db.close()
     }
@@ -744,36 +1133,78 @@ class SessionService {
   _readOpenCodeMessages(session, want) {
     const db = this.openDatabase(this._openCodeDb(), { readonly: true })
     try {
+      const messageColumns = new Set(
+        db.all('PRAGMA table_info(message)').map((column) => column.name),
+      )
+      const partColumns = new Set(
+        db.all('PRAGMA table_info(part)').map((column) => column.name),
+      )
+      const messageTime = messageColumns.has('time_created') ? 'm.time_created' : 'NULL'
+      const partTime = partColumns.has('time_created') ? 'p.time_created' : 'NULL'
       const rows = db.all(
-        `SELECT m.id, m.data AS message, m.time_created,
-                (SELECT COUNT(*) FROM message x WHERE x.session_id = ?) AS total
-           FROM message m WHERE m.session_id = ?
-          ORDER BY m.time_created DESC LIMIT ?`,
+        `WITH parsed_parts AS (
+                SELECT p.message_id,
+                       CASE WHEN json_valid(p.data)
+                            THEN json_extract(p.data, '$.type') END AS part_type,
+                       CASE WHEN json_valid(p.data)
+                            THEN json_extract(p.data, '$.text') END AS text,
+                       ${partTime} AS part_time,
+                       p.rowid AS part_rowid
+                  FROM part p
+                 WHERE p.session_id = ?
+              ), valid_parts AS (
+                SELECT message_id, text, part_time, part_rowid
+                  FROM parsed_parts
+                 WHERE part_type = 'text'
+                   AND typeof(text) = 'text'
+                   AND trim(text) <> ''
+              ), combined_parts AS (
+                SELECT message_id,
+                       group_concat(text, char(10)) OVER (
+                         PARTITION BY message_id
+                         ORDER BY part_time, part_rowid
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                       ) AS text,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY message_id
+                         ORDER BY part_time DESC, part_rowid DESC
+                       ) AS final_part
+                  FROM valid_parts
+              ), text_messages AS (
+                SELECT m.id, m.data AS message, ${messageTime} AS time_created,
+                       m.rowid AS message_rowid, c.text
+                  FROM message m
+                  JOIN combined_parts c
+                    ON c.message_id = m.id
+                   AND c.final_part = 1
+                 WHERE m.session_id = ?
+              ), ranked_messages AS (
+                SELECT id, message, time_created, text,
+                       COUNT(*) OVER () AS total,
+                       ROW_NUMBER() OVER (
+                         ORDER BY time_created DESC, message_rowid DESC
+                       ) AS recency
+                  FROM text_messages
+              )
+              SELECT id, message, time_created, text, total
+                FROM ranked_messages
+               WHERE recency <= ?
+               ORDER BY recency DESC`,
         session.nativeId, session.nativeId, want,
       )
       const messages = []
-      for (const row of [...rows].reverse()) {
+      for (const row of rows) {
         let role = 'assistant'
         try {
           role = JSON.parse(row.message)?.role === 'user' ? 'user' : 'assistant'
         } catch {}
-        // 正文在 part 里，只要 text 那种；tool / step-start 之类不是发言
-        const parts = db.all(
-          `SELECT data FROM part WHERE message_id = ? ORDER BY time_created`,
-          row.id,
-        )
-        const text = parts.map((part) => {
-          try {
-            const data = JSON.parse(part.data)
-            return data?.type === 'text' && typeof data.text === 'string' ? data.text : ''
-          } catch {
-            return ''
-          }
-        }).filter(Boolean).join('\n').trim()
-        if (!text) continue
-        messages.push({ role, text: clampText(text), at: isoOrUndefined(row.time_created) })
+        messages.push({
+          role,
+          text: clampText(row.text),
+          at: isoOrUndefined(row.time_created),
+        })
       }
-      const total = rows[0]?.total ?? messages.length
+      const total = Number(rows[0]?.total) || 0
       return { messages, truncated: total > messages.length }
     } finally {
       db.close()
@@ -790,14 +1221,50 @@ class SessionService {
 
   async _execute(plan) {
     for (const row of plan.rows) {
-      if (row.kind === 'sqlite') this._applySqlite(row)
-      else if (row.kind === 'json-purge') await this._applyJsonPurge(row)
-      else if (row.kind === 'jsonl-filter') await this._applyJsonlFilter(row)
+      if (row.kind === 'sqlite' && !row.required && fs.existsSync(row.file)) {
+        this._preflightSqlite(row)
+      }
     }
-    for (const entry of plan.files) {
-      if (!this._within(plan.client, entry.path)) continue
-      await fsp.rm(entry.path, { recursive: true, force: true })
+    const authority = []
+    let failure
+    let failed = false
+    try {
+      // 先用最终提交会使用的同一个连接拿到写锁并准备删除。清理阶段任何一步失败，
+      // 这个事务都会回滚；也不再存在“正文删完后才发现权威库打不开”的窗口。
+      for (const row of plan.rows) {
+        if (row.kind === 'sqlite' && row.required) authority.push(this._stageSqlite(row))
+      }
+      for (const row of plan.rows) {
+        if (row.kind === 'sqlite' && !row.required) this._applySqlite(row)
+        else if (row.kind === 'json-purge') await this._applyJsonPurge(row)
+        else if (row.kind === 'jsonl-filter') await this._applyJsonlFilter(row)
+      }
+      for (const entry of plan.files) {
+        if (!await this._withinReal(plan.client, entry.path)) continue
+        await fsp.rm(entry.path, { recursive: true, force: true })
+      }
+      for (const transaction of authority) transaction.commit()
+    } catch (error) {
+      failure = error
+      failed = true
+      for (let index = authority.length - 1; index >= 0; index -= 1) {
+        try {
+          authority[index].rollback()
+        } catch {}
+      }
+    } finally {
+      for (const transaction of authority) {
+        try {
+          transaction.close()
+        } catch (error) {
+          if (!failed) {
+            failure = error
+            failed = true
+          }
+        }
+      }
     }
+    if (failed) throw failure
   }
 
   /**
@@ -805,70 +1272,159 @@ class SessionService {
    * 一次事务包住：要么这个库全改，要么一行不动。
    */
   _applySqlite(row) {
-    if (!fs.existsSync(row.file)) return
-    let db
-    try {
-      db = this.openDatabase(row.file)
-    } catch {
+    if (!fs.existsSync(row.file)) {
+      if (row.required) throw new Error(`Required session database is missing: ${path.basename(row.file)}`)
       return
     }
+    let db
+    let active = false
+    let failure
+    let failed = false
     try {
-      const tables = new Set(db.tables())
-      const runnable = row.statements.filter(([sql]) => {
-        const table = /\bFROM\s+([A-Za-z_][\w]*)/i.exec(sql)?.[1]
-        return table ? tables.has(table) : false
-      })
-      if (runnable.length === 0) return
-      db.exec('BEGIN IMMEDIATE')
-      try {
+      db = this.openDatabase(row.file)
+      const runnable = this._runnableSqlite(row, db)
+      if (runnable.length > 0) {
+        db.exec('BEGIN IMMEDIATE')
+        active = true
         for (const [sql, ...params] of runnable) db.run(sql, ...params)
         db.exec('COMMIT')
-      } catch (error) {
-        db.exec('ROLLBACK')
-        throw error
+        active = false
       }
+    } catch (error) {
+      failure = error
+      failed = true
+      if (active) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {} finally {
+          active = false
+        }
+      }
+    } finally {
+      try {
+        db?.close()
+      } catch (error) {
+        if (!failed) {
+          failure = error
+          failed = true
+        }
+      }
+    }
+    if (failed) throw failure
+  }
+
+  _stageSqlite(row) {
+    if (!fs.existsSync(row.file)) {
+      throw new Error(`Required session database is missing: ${path.basename(row.file)}`)
+    }
+    const db = this.openDatabase(row.file)
+    let active = false
+    try {
+      const runnable = this._runnableSqlite(row, db)
+      if (runnable.length > 0) {
+        db.exec('BEGIN IMMEDIATE')
+        active = true
+        for (const [sql, ...params] of runnable) db.run(sql, ...params)
+      }
+      return {
+        commit: () => {
+          if (!active) return
+          db.exec('COMMIT')
+          active = false
+        },
+        rollback: () => {
+          if (!active) return
+          try {
+            db.exec('ROLLBACK')
+          } finally {
+            active = false
+          }
+        },
+        close: () => db.close(),
+      }
+    } catch (error) {
+      if (active) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {}
+      }
+      try {
+        db.close()
+      } catch {}
+      throw error
+    }
+  }
+
+  _runnableSqlite(row, db) {
+    const tables = new Set(db.tables())
+    this._assertRequiredTables(row, tables)
+    return row.statements.filter(([sql]) => {
+      const table = /\bFROM\s+([A-Za-z_][\w]*)/i.exec(sql)?.[1]
+      return table ? tables.has(table) : false
+    })
+  }
+
+  _preflightSqlite(row) {
+    if (!fs.existsSync(row.file)) {
+      if (row.required) {
+        throw new Error(`Required session database is missing: ${path.basename(row.file)}`)
+      }
+      return
+    }
+    const db = this.openDatabase(row.file)
+    try {
+      this._assertRequiredTables(row, new Set(db.tables()))
+      db.exec('BEGIN IMMEDIATE')
+      db.exec('ROLLBACK')
     } finally {
       db.close()
     }
   }
 
-  async _applyJsonPurge(row) {
-    const raw = await fsp.readFile(row.file, 'utf8').catch(() => undefined)
-    if (raw === undefined) return
-    let parsed
-    try {
-      parsed = JSON.parse(raw)
-    } catch {
-      return // 解不开就别动它，宁可留下一条陈迹也不能把状态文件写坏
+  _assertRequiredTables(row, tables) {
+    for (const table of row.requiredTables || []) {
+      if (!tables.has(table)) {
+        throw new Error(`Required session table is missing: ${table}`)
+      }
     }
-    const purged = purgeId(parsed, row.id)
-    if (!purged.changed) return
-    await writeFileAtomic(row.file, `${JSON.stringify(purged.value, null, 2)}\n`)
+  }
+
+  async _applyJsonPurge(row) {
+    await rewriteTextWithRetry(row.file, (raw) => {
+      let parsed
+      try {
+        parsed = JSON.parse(raw)
+      } catch {
+        return undefined // 解不开就别动它，宁可留下一条陈迹也不能把状态文件写坏
+      }
+      const purged = purgeId(parsed, row.id)
+      return purged.changed ? `${JSON.stringify(purged.value, null, 2)}\n` : raw
+    })
   }
 
   async _applyJsonlFilter(row) {
-    const raw = await fsp.readFile(row.file, 'utf8').catch(() => undefined)
-    if (raw === undefined) return
-    const kept = []
-    let dropped = 0
-    for (const line of raw.split('\n')) {
-      if (!line.trim()) continue
-      let record
-      try {
-        record = JSON.parse(line)
-      } catch {
-        kept.push(line) // 解不开的行原样留着，不是我们的行就别碰
-        continue
+    await rewriteTextWithRetry(row.file, (raw) => {
+      const kept = []
+      let dropped = 0
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue
+        let record
+        try {
+          record = JSON.parse(line)
+        } catch {
+          kept.push(line) // 解不开的行原样留着，不是我们的行就别碰
+          continue
+        }
+        const owner = record.sessionId ?? record.session_id ?? record.id ?? record.thread_id
+        if (owner === row.id) {
+          dropped += 1
+          continue
+        }
+        kept.push(line)
       }
-      const owner = record.sessionId ?? record.session_id ?? record.id ?? record.thread_id
-      if (owner === row.id) {
-        dropped += 1
-        continue
-      }
-      kept.push(line)
-    }
-    if (dropped === 0) return
-    await writeFileAtomic(row.file, kept.length ? `${kept.join('\n')}\n` : '')
+      if (dropped === 0) return raw
+      return kept.length ? `${kept.join('\n')}\n` : ''
+    })
   }
 }
 

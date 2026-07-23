@@ -9,6 +9,9 @@ const { SerialExecutor } = require('./storage.cjs')
 const {
   MAX_REQUEST_BODY_BYTES,
   convertRequestBuffer,
+  convertResponseObject,
+  createResponsesToolBridgeJsonTransform,
+  createResponsesSseJsonTransform,
   createResponsesToolBridgeTransform,
 } = require('./responses-tool-bridge.cjs')
 const { extractRequestMetadata } = require('./request-monitor-service.cjs')
@@ -22,9 +25,30 @@ const LOCAL_MAX_CONNECTIONS = 128
 const REJECTED_BODY_LIMIT_BYTES = 64 * 1024
 const REJECTED_BODY_DRAIN_MS = 1_000
 const UPSTREAM_HEADERS_TIMEOUT_MS = 120_000
+// count_tokens 需要先完整读入才能做本地保守估算；把这条兼容路径单独限流，
+// 避免 128 个普通网关连接各自占满一份大缓冲。
+const ANTHROPIC_COUNT_BODY_LIMIT_BYTES = 16 * 1024 * 1024
+const ANTHROPIC_COUNT_BODY_SLOTS = 2
+const ANTHROPIC_COUNT_UNSUPPORTED_CACHE_MS = 30 * 60_000
+const RESPONSES_FALLBACK_BODY_LIMIT_BYTES = 32 * 1024 * 1024
+const RESPONSES_FALLBACK_BODY_SLOTS = 4
+const RESPONSES_FALLBACK_IDLE_TIMEOUT_MS = 5 * 60_000
+const RESPONSES_FALLBACK_TOTAL_TIMEOUT_MS = 30 * 60_000
+const BRIDGE_INVALIDATED_HEADERS = [
+  'content-length',
+  'etag',
+  'digest',
+  'content-digest',
+  'repr-digest',
+  'content-md5',
+]
+const AGGREGATED_RESPONSE_INVALIDATED_HEADERS = [
+  ...BRIDGE_INVALIDATED_HEADERS,
+  'content-encoding',
+]
 const MAX_MODEL_METADATA_LENGTH = 240
 const MAX_REASONING_METADATA_LENGTH = 32
-const GATEWAY_VERSION = 3
+const GATEWAY_VERSION = 4
 const TARGET_SET = new Set(TARGETS)
 const ProfileIdSchema = z.string().trim().uuid()
 const HOP_BY_HOP_HEADERS = new Set([
@@ -162,6 +186,8 @@ const CanonicalGatewayStoreSchema = z.object({
    * 连不想动的也一起改。拆开之后可以只接管其中一个。
    */
   engaged: z.array(z.enum(TARGETS)).max(TARGETS.length),
+  /** 用户希望下次启动时继续接管的目标，独立于当前进程是否正在监听。 */
+  resumeTargets: z.array(z.enum(TARGETS)).max(TARGETS.length),
   routes: z.record(z.enum(TARGETS), ProfileIdSchema),
   encryptedToken: z.string().optional(),
   encryptedRouteToken: z.string().optional(),
@@ -182,6 +208,10 @@ function migrateGatewayStore(value) {
     ? value.engaged.filter((target) => TARGET_SET.has(target))
     : enabled ? targets : []
   ).filter((target) => targetSet.has(target))
+  const resumeTargets = (Array.isArray(value.resumeTargets)
+    ? value.resumeTargets.filter((target) => TARGET_SET.has(target))
+    : engaged
+  ).filter((target) => targetSet.has(target))
   const normalized = {
     version: GATEWAY_VERSION,
     enabled,
@@ -190,6 +220,7 @@ function migrateGatewayStore(value) {
       : DEFAULT_GATEWAY_PORT,
     targets,
     engaged: [...new Set(engaged)],
+    resumeTargets: [...new Set(resumeTargets)],
     routes,
   }
   if (typeof value.encryptedToken === 'string' && value.encryptedToken) {
@@ -210,6 +241,7 @@ function defaultGatewayStore() {
     port: DEFAULT_GATEWAY_PORT,
     targets: [],
     engaged: [],
+    resumeTargets: [],
     routes: {},
   }
 }
@@ -392,18 +424,96 @@ function upstreamUrl(profile, suffix, incomingSearchParams) {
   return url
 }
 
-async function readRequestBody(request) {
+async function readRequestBody(request, limit = MAX_REQUEST_BODY_BYTES) {
   const chunks = []
   let size = 0
   for await (const chunk of request) {
     const buffer = Buffer.from(chunk)
     size += buffer.length
-    if (size > MAX_REQUEST_BODY_BYTES) {
-      throw new Error('Responses request body is too large for experimental tool compatibility mode')
+    if (size > limit) {
+      throw new Error('Gateway request body is too large')
     }
     chunks.push(buffer)
   }
   return Buffer.concat(chunks, size)
+}
+
+function hasUncountableAnthropicInput(value, parentKey) {
+  if (!value || typeof value !== 'object') return false
+  if (Array.isArray(value)) {
+    return value.some((item) => hasUncountableAnthropicInput(item, parentKey))
+  }
+  if (parentKey === 'source' && ['url', 'file'].includes(value.type)) return true
+  if (['image', 'document', 'container_upload', 'mcp_toolset'].includes(value.type)) return true
+  return Object.entries(value).some(([key, item]) => hasUncountableAnthropicInput(item, key))
+}
+
+/**
+ * 上游没有 count_tokens 时的保守估算。它不是计费 tokenizer，只用于阻止 Claude Code
+ * 再发一次 Haiku 请求来计数；媒体和远程引用无法可靠本地估算，因此拒绝伪造。
+ */
+function conservativeAnthropicInputTokens(body) {
+  let value
+  let text
+  try {
+    text = body.toString('utf8')
+    value = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !Array.isArray(value.messages)
+    || hasUncountableAnthropicInput(value)) return undefined
+
+  let weightedCharacters = 0
+  for (const character of text) {
+    const codePoint = character.codePointAt(0)
+    if (codePoint <= 0x7f) weightedCharacters += 0.4
+    else if ((codePoint >= 0x3400 && codePoint <= 0x9fff)
+      || (codePoint >= 0x3040 && codePoint <= 0x30ff)
+      || (codePoint >= 0xac00 && codePoint <= 0xd7af)) weightedCharacters += 1.25
+    else if (codePoint <= 0xffff) weightedCharacters += 1.5
+    else weightedCharacters += 3
+  }
+
+  const messageOverhead = value.messages.length * 4
+  const toolCount = Array.isArray(value.tools) ? value.tools.length : 0
+  const toolOverhead = toolCount === 0
+    ? 0
+    : toolCount === 1
+      ? 400
+      : toolCount <= 5
+        ? 150 + toolCount * 150
+        : 250 + toolCount * 80
+  return Math.max(1, Math.ceil(weightedCharacters * 1.1) + 64 + messageOverhead + toolOverhead)
+}
+
+function anthropicCountResponse(inputTokens) {
+  return Buffer.from(JSON.stringify({ input_tokens: inputTokens }), 'utf8')
+}
+
+function anthropicCountErrorSupportsFallback(statusCode) {
+  return statusCode === 501
+}
+
+function forceResponsesStreaming(body, bridgeEnabled) {
+  let payloadBody = body
+  try {
+    if (bridgeEnabled) payloadBody = convertRequestBuffer(payloadBody)
+    const payload = JSON.parse(payloadBody.toString('utf8'))
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+      || payload.stream === true) {
+      return { body: payloadBody, changed: false }
+    }
+    payload.stream = true
+    return {
+      body: Buffer.from(JSON.stringify(payload), 'utf8'),
+      changed: true,
+    }
+  } catch {
+    // 已经消费了请求体时，仍把原字节交给上游；只有可确认的 JSON 才改写。
+    return { body: payloadBody, changed: false }
+  }
 }
 
 /**
@@ -420,6 +530,8 @@ class GatewayService {
     host = DEFAULT_GATEWAY_HOST,
     onStateChanged,
     requestMonitor,
+    responsesFallbackIdleTimeoutMs = RESPONSES_FALLBACK_IDLE_TIMEOUT_MS,
+    responsesFallbackTotalTimeoutMs = RESPONSES_FALLBACK_TOTAL_TIMEOUT_MS,
   }) {
     if (!profileService || !store || !vault) {
       throw new Error('GatewayService requires profileService, store, and vault')
@@ -430,6 +542,14 @@ class GatewayService {
     this.host = host
     this.onStateChanged = onStateChanged
     this.requestMonitor = requestMonitor
+    this.responsesFallbackIdleTimeoutMs = Number.isFinite(responsesFallbackIdleTimeoutMs)
+      && responsesFallbackIdleTimeoutMs > 0
+      ? responsesFallbackIdleTimeoutMs
+      : RESPONSES_FALLBACK_IDLE_TIMEOUT_MS
+    this.responsesFallbackTotalTimeoutMs = Number.isFinite(responsesFallbackTotalTimeoutMs)
+      && responsesFallbackTotalTimeoutMs > 0
+      ? responsesFallbackTotalTimeoutMs
+      : RESPONSES_FALLBACK_TOTAL_TIMEOUT_MS
     this.serial = new SerialExecutor()
     this.server = undefined
     this.sockets = new Set()
@@ -442,6 +562,9 @@ class GatewayService {
     this.localToken = undefined
     this.routeToken = undefined
     this.connectionCache = new Map()
+    this.anthropicCountFallbacks = new Map()
+    this.anthropicCountBodyActive = 0
+    this.responsesFallbackBodyActive = 0
     this.experimentalToolBridgeEnabled = false
   }
 
@@ -452,7 +575,7 @@ class GatewayService {
       try {
         return await this._startLoaded({
           port: this.persisted.port,
-          targets: this.persisted.targets,
+          engage: this.persisted.engaged,
         })
       } catch (error) {
         this.status = 'error'
@@ -478,6 +601,7 @@ class GatewayService {
     port = this.persisted.port,
     engage,
     targets,
+    resumeTargets,
   } = {}) {
     const requestedPort = validatePort(port, true)
 
@@ -498,6 +622,9 @@ class GatewayService {
     const requestedEngaged = normalizeTargets(
       engage ?? targets ?? this.persisted.engaged,
     ).filter((target) => assigned.has(target))
+    const requestedResumeTargets = normalizeTargets(
+      resumeTargets ?? [...new Set([...this.persisted.resumeTargets, ...requestedEngaged])],
+    ).filter((target) => assigned.has(target))
 
     if (this.server) {
       const currentPort = this.persisted.port
@@ -508,6 +635,7 @@ class GatewayService {
           ...this.persisted,
           enabled: true,
           engaged: requestedEngaged,
+          resumeTargets: requestedResumeTargets,
         })
         this._evictUnroutedConnections()
         this.status = 'running'
@@ -576,6 +704,7 @@ class GatewayService {
           port: boundPort,
           targets: this.persisted.targets,
           engaged: requestedEngaged,
+          resumeTargets: requestedResumeTargets,
           routes: this.persisted.routes,
           encryptedToken: this.persisted.encryptedToken || this.vault.encrypt(token),
           encryptedRouteToken: this.persisted.encryptedRouteToken
@@ -603,19 +732,24 @@ class GatewayService {
     }
   }
 
-  async stop({ clearRoutes = false } = {}) {
+  async stop({ clearRoutes = false, preserveResumeIntent = false, resumeTargets } = {}) {
     return this.serial.run(async () => {
       await this._ensureLoaded()
       this.status = 'stopping'
       this._notify()
       try {
         await this._closeServer()
+        const assigned = new Set(clearRoutes ? [] : this.persisted.targets)
+        const nextResumeTargets = normalizeTargets(
+          resumeTargets ?? (preserveResumeIntent ? this.persisted.resumeTargets : []),
+        ).filter((target) => assigned.has(target))
         this.persisted = await this.store.write({
           ...this.persisted,
           enabled: false,
           targets: clearRoutes ? [] : this.persisted.targets,
           // 服务器停了就没有任何客户端还被接管着
           engaged: [],
+          resumeTargets: nextResumeTargets,
           routes: clearRoutes ? {} : this.persisted.routes,
         })
         this.status = 'stopped'
@@ -771,6 +905,8 @@ class GatewayService {
       const connection = await this.profileService.getConnection(profileId)
       const previous = {
         targets: [...this.persisted.targets],
+        engaged: [...this.persisted.engaged],
+        resumeTargets: [...this.persisted.resumeTargets],
         routes: { ...this.persisted.routes },
       }
       const routes = { ...previous.routes }
@@ -783,7 +919,7 @@ class GatewayService {
       })
       this._evictUnroutedConnections()
       if (this.status === 'running' && this.server
-        && Object.values(this.persisted.routes).includes(profileId)) {
+        && this._isProfileEngaged(profileId)) {
         this.connectionCache.set(profileId, connection)
       }
       this._notify()
@@ -797,6 +933,8 @@ class GatewayService {
       const selected = new Set(normalizeTargets(Array.isArray(targets) ? targets : [targets]))
       const previous = {
         targets: [...this.persisted.targets],
+        engaged: [...this.persisted.engaged],
+        resumeTargets: [...this.persisted.resumeTargets],
         routes: { ...this.persisted.routes },
       }
       const routes = Object.fromEntries(
@@ -808,6 +946,7 @@ class GatewayService {
         targets: nextTargets,
         // 取消分配的同时必须取消接管，否则会留下一个指向空路由的接管项
         engaged: this.persisted.engaged.filter((target) => !selected.has(target)),
+        resumeTargets: this.persisted.resumeTargets.filter((target) => !selected.has(target)),
         routes,
       })
       this._evictUnroutedConnections()
@@ -827,8 +966,13 @@ class GatewayService {
       this.persisted = await this.store.write({
         ...this.persisted,
         targets,
-        // 回滚后接管集合可能指向已经不存在的分配，收回到子集内
-        engaged: this.persisted.engaged.filter((target) => assigned.has(target)),
+        // 回滚后接管集合和恢复意图都必须指向仍存在的分配
+        engaged: Array.isArray(snapshot?.engaged)
+          ? normalizeTargets(snapshot.engaged).filter((target) => assigned.has(target))
+          : this.persisted.engaged.filter((target) => assigned.has(target)),
+        resumeTargets: Array.isArray(snapshot?.resumeTargets)
+          ? normalizeTargets(snapshot.resumeTargets).filter((target) => assigned.has(target))
+          : this.persisted.resumeTargets.filter((target) => assigned.has(target)),
         routes: this._routesForTargets(routes, targets),
       })
       this._evictUnroutedConnections()
@@ -851,17 +995,32 @@ class GatewayService {
    * target 只是 URL 路径上的一段，isTargetEnabled 是运行期闸门——增删它不影响
    * 已建立的连接，也不必换端口或重新签发令牌。越界（未分配方案）的项直接丢掉。
    */
-  async setEngagedTargets(targets) {
+  async setEngagedTargets(targets, { preserveResumeIntent = false, resumeTargets } = {}) {
     return this.serial.run(async () => {
       await this._ensureLoaded()
       const assigned = new Set(this.persisted.targets)
       const next = normalizeTargets(targets).filter((target) => assigned.has(target))
-      this.persisted = await this.store.write({ ...this.persisted, engaged: next })
+      const nextResumeTargets = normalizeTargets(
+        resumeTargets ?? (preserveResumeIntent ? this.persisted.resumeTargets : next),
+      ).filter((target) => assigned.has(target))
+      this.persisted = await this.store.write({
+        ...this.persisted,
+        engaged: next,
+        resumeTargets: nextResumeTargets,
+      })
       // 放掉客户端后，指向它的方案明文不该继续留在缓存里
       this._evictUnroutedConnections()
       this._notify()
       return this.getPublicState()
     })
+  }
+
+  getLifecycleState() {
+    return {
+      enabled: this.persisted.enabled,
+      engaged: [...this.persisted.engaged],
+      resumeTargets: [...this.persisted.resumeTargets],
+    }
   }
 
   /**
@@ -909,11 +1068,11 @@ class GatewayService {
       if (this.status !== 'running'
         || !this.server
         || !profileId
-        || this.activeTargetsForProfile(profileId).length === 0) return
+        || !this._isProfileEngaged(profileId)) return
       const connection = await this.profileService.getConnection(profileId)
       if (this.status !== 'running'
         || !this.server
-        || this.activeTargetsForProfile(profileId).length === 0) return
+        || !this._isProfileEngaged(profileId)) return
       this.connectionCache.set(profileId, connection)
     })
   }
@@ -950,7 +1109,9 @@ class GatewayService {
   }
 
   async _preloadRouteConnections() {
-    const profileIds = [...new Set(Object.values(this.persisted.routes))]
+    const profileIds = [...new Set(
+      this.persisted.engaged.map((target) => this.persisted.routes[target]).filter(Boolean),
+    )]
     await Promise.all(profileIds.map(async (profileId) => {
       try {
         const connection = await this.profileService.getConnection(profileId)
@@ -979,12 +1140,16 @@ class GatewayService {
     }
   }
 
+  _isProfileEngaged(profileId) {
+    return this.persisted.engaged.some((target) => this.persisted.routes[target] === profileId)
+  }
+
   async _connection(profileId) {
     const cached = this.connectionCache.get(profileId)
     if (cached) return cached
     const connection = await this.profileService.getConnection(profileId)
     if (this.status !== 'running'
-      || !Object.values(this.persisted.routes).includes(profileId)) {
+      || !this._isProfileEngaged(profileId)) {
       throw new Error('Gateway route changed while loading its connection')
     }
     this.connectionCache.set(profileId, connection)
@@ -1001,6 +1166,28 @@ class GatewayService {
       throw new Error('Local gateway is not running')
     }
     this._assertEnabledTarget(target)
+  }
+
+  _tryAcquireResponsesFallbackBody() {
+    if (this.responsesFallbackBodyActive >= RESPONSES_FALLBACK_BODY_SLOTS) return undefined
+    this.responsesFallbackBodyActive += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.responsesFallbackBodyActive = Math.max(0, this.responsesFallbackBodyActive - 1)
+    }
+  }
+
+  _tryAcquireAnthropicCountBody() {
+    if (this.anthropicCountBodyActive >= ANTHROPIC_COUNT_BODY_SLOTS) return undefined
+    this.anthropicCountBodyActive += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.anthropicCountBodyActive = Math.max(0, this.anthropicCountBodyActive - 1)
+    }
   }
 
   _notify() {
@@ -1112,24 +1299,112 @@ class GatewayService {
         model: connection.profile.model || undefined,
       })
     } catch {}
+    const normalizedResponsesSuffix = suffix.replace(/\/+$/, '') || '/'
     const bridgeEnabled = this.experimentalToolBridgeEnabled
       && target === 'codex'
       && connection.profile.protocol === 'openai-responses'
       && request.method === 'POST'
-      && suffix === '/responses'
+      && normalizedResponsesSuffix === '/responses'
+    const responsesSyncCandidate = target === 'codex'
+      && connection.profile.protocol === 'openai-responses'
+      && request.method === 'POST'
+      && normalizedResponsesSuffix === '/responses'
+      && !request.headers['content-encoding']
+    const anthropicCountRequest = target === 'claude'
+      && connection.profile.protocol === 'anthropic'
+      && request.method === 'POST'
+      && /^\/v1\/messages\/count_tokens\/?$/.test(suffix)
+      && !request.headers['content-encoding']
     let requestBody
-    if (bridgeEnabled) {
+    let responsesStreamFallback = false
+    let originalRequestBody
+    let releaseResponsesBodySlot
+    let releaseAnthropicCountBodySlot
+    // Responses 上游默认走流式。客户端仍可要求同步；这种情况下网关把 SSE
+    // 收拢成 JSON 再返回，避免每个新端点都先用 stream=false 失败一次。
+    const needsResponsesFallbackBody = responsesSyncCandidate
+    if (bridgeEnabled || anthropicCountRequest || needsResponsesFallbackBody) {
+      if (anthropicCountRequest) {
+        releaseAnthropicCountBodySlot = this._tryAcquireAnthropicCountBody()
+        if (!releaseAnthropicCountBodySlot) {
+          endMonitor('failed')
+          rejectRequest(request, response, 503,
+            'Anthropic token count compatibility capacity is temporarily full')
+          return
+        }
+      }
+      if (needsResponsesFallbackBody) {
+        releaseResponsesBodySlot = this._tryAcquireResponsesFallbackBody()
+        if (!releaseResponsesBodySlot) {
+          endMonitor('failed')
+          rejectRequest(request, response, 503,
+            'Responses compatibility capacity is temporarily full')
+          return
+        }
+      }
       try {
-        requestBody = convertRequestBuffer(await readRequestBody(request))
+        requestBody = await readRequestBody(
+          request,
+          anthropicCountRequest
+            ? ANTHROPIC_COUNT_BODY_LIMIT_BYTES
+            : needsResponsesFallbackBody
+              ? RESPONSES_FALLBACK_BODY_LIMIT_BYTES
+              : MAX_REQUEST_BODY_BYTES,
+        )
+        originalRequestBody = requestBody
+        if (bridgeEnabled) requestBody = convertRequestBuffer(requestBody)
+        if (needsResponsesFallbackBody) {
+          const forced = forceResponsesStreaming(requestBody, false)
+          requestBody = forced.body
+          responsesStreamFallback = forced.changed
+        }
       } catch {
+        releaseResponsesBodySlot?.()
+        releaseAnthropicCountBodySlot?.()
         endMonitor(request.aborted ? 'aborted' : 'failed')
-        rejectRequest(request, response, 502, 'Responses tool bridge request conversion failed')
+        rejectRequest(request, response, 502,
+          bridgeEnabled
+            ? 'Responses tool bridge request conversion failed'
+            : anthropicCountRequest
+              ? 'Anthropic token count compatibility request failed'
+              : 'Responses streaming compatibility request failed')
         return
       }
       if (request.aborted || response.destroyed) {
+        releaseResponsesBodySlot?.()
+        releaseAnthropicCountBodySlot?.()
         endMonitor('aborted')
         return
       }
+    }
+    const countEstimate = anthropicCountRequest
+      ? conservativeAnthropicInputTokens(requestBody)
+      : undefined
+    const countFallbackKey = anthropicCountRequest
+      ? `${profileId}\0${destination.origin}${destination.pathname}`
+      : undefined
+    const fallbackUntil = countFallbackKey
+      ? this.anthropicCountFallbacks.get(countFallbackKey)
+      : undefined
+    if (countEstimate !== undefined && fallbackUntil && fallbackUntil > Date.now()) {
+      const localBody = anthropicCountResponse(countEstimate)
+      try {
+        this.requestMonitor?.responseStarted?.(monitorId, {
+          statusCode: 200,
+          contentType: 'application/json',
+        })
+        this.requestMonitor?.observeChunk?.(monitorId, localBody)
+      } catch {}
+      response.writeHead(200, {
+        'content-type': 'application/json',
+        'content-length': String(localBody.length),
+        'cache-control': 'no-store',
+        'x-agentgate-token-count': 'conservative-estimate',
+      })
+      response.end(localBody)
+      releaseAnthropicCountBodySlot?.()
+      endMonitor()
+      return
     }
     /*
      * 转发期间豁免本地 socket 的空闲回收。
@@ -1149,7 +1424,10 @@ class GatewayService {
     // Keep the monitoring side-channel readable; the gateway forwards the
     // response bytes unchanged to the client, but asks upstream for identity.
     headers['accept-encoding'] = 'identity'
-    if (bridgeEnabled) headers['content-length'] = String(requestBody.length)
+    if (responsesStreamFallback) headers.accept = 'text/event-stream'
+    if (requestBody !== undefined) {
+      headers['content-length'] = String(requestBody.length)
+    }
     injectUpstreamCredential(headers, connection.profile, connection.apiKey)
     const transport = destination.protocol === 'https:' ? https : http
     let upstreamRequest
@@ -1159,11 +1437,14 @@ class GatewayService {
         headers,
       })
     } catch {
+      releaseResponsesBodySlot?.()
+      releaseAnthropicCountBodySlot?.()
       endMonitor('failed')
       rejectRequest(request, response, 502, 'Upstream request configuration is invalid')
       return
     }
     let upstreamTimedOut = false
+    let fallbackTotalTimer
     const upstreamTimer = setTimeout(() => {
       upstreamTimedOut = true
       upstreamRequest.destroy(new Error('Upstream response headers timed out'))
@@ -1173,29 +1454,110 @@ class GatewayService {
     let responseReceived = false
     upstreamRequest.once('close', () => {
       clearTimeout(upstreamTimer)
+      clearTimeout(fallbackTotalTimer)
+      releaseResponsesBodySlot?.()
+      releaseAnthropicCountBodySlot?.()
       this.upstreamRequests.delete(upstreamRequest)
-      if (!responseReceived) endMonitor('failed')
+      if (!responseReceived) {
+        endMonitor('failed')
+      }
     })
     upstreamRequest.on('response', (upstreamResponse) => {
       responseReceived = true
       clearTimeout(upstreamTimer)
       const contentType = String(upstreamResponse.headers['content-type'] || '')
       const responseIsEventStream = contentType.toLowerCase().includes('text/event-stream')
-      const bridgeResponse = bridgeEnabled && responseIsEventStream
+      const responseIsJson = contentType.toLowerCase().includes('json')
+      const aggregatedResponse = responsesStreamFallback && responseIsEventStream
+      const bridgeResponse = bridgeEnabled && (responseIsEventStream || responseIsJson)
+      const contentEncoding = String(upstreamResponse.headers['content-encoding'] || '')
+        .trim()
+        .toLowerCase()
+      const transformedResponse = bridgeResponse || aggregatedResponse
+      const unsupportedBridgeEncoding = transformedResponse
+        && contentEncoding
+        && contentEncoding !== 'identity'
       const responseHeaders = stripHeaders(
         upstreamResponse.headers,
-        bridgeResponse ? ['content-length'] : [],
+        aggregatedResponse
+          ? AGGREGATED_RESPONSE_INVALIDATED_HEADERS
+          : bridgeResponse ? BRIDGE_INVALIDATED_HEADERS : [],
       )
-      try {
-        this.requestMonitor?.responseStarted?.(monitorId, {
-          statusCode: upstreamResponse.statusCode || 502,
-          contentType,
-          streaming: responseIsEventStream ? true : undefined,
+      const upstreamStatus = upstreamResponse.statusCode || 502
+      const updateCountCapability = (useCountFallback) => {
+        if (!countFallbackKey) return
+        if (useCountFallback) {
+          this.anthropicCountFallbacks.set(
+            countFallbackKey,
+            Date.now() + ANTHROPIC_COUNT_UNSUPPORTED_CACHE_MS,
+          )
+        } else {
+          this.anthropicCountFallbacks.delete(countFallbackKey)
+        }
+      }
+      const startMonitoredResponse = (useCountFallback) => {
+        try {
+          this.requestMonitor?.responseStarted?.(monitorId, {
+            statusCode: useCountFallback ? 200 : upstreamStatus,
+            contentType: useCountFallback ? 'application/json' : contentType,
+            streaming: responseIsEventStream ? true : undefined,
+          })
+        } catch {}
+      }
+      const respondWithCountFallback = () => {
+        const localBody = anthropicCountResponse(countEstimate)
+        try { this.requestMonitor?.observeChunk?.(monitorId, localBody) } catch {}
+        response.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': String(localBody.length),
+          'cache-control': 'no-store',
+          'x-agentgate-token-count': 'conservative-estimate',
         })
-      } catch {}
-      upstreamResponse.once('end', () => endMonitor())
-      upstreamResponse.once('aborted', () => endMonitor('aborted'))
-      upstreamResponse.once('error', () => endMonitor('failed'))
+        response.end(localBody)
+        endMonitor()
+      }
+      const useCountFallback = countEstimate !== undefined
+        && anthropicCountErrorSupportsFallback(upstreamStatus)
+      updateCountCapability(useCountFallback)
+      startMonitoredResponse(useCountFallback)
+      if (useCountFallback) {
+        upstreamResponse.resume()
+        respondWithCountFallback()
+        return
+      }
+
+      let fallbackIdleTimerActive = false
+      const clearFallbackTimers = () => {
+        if (fallbackIdleTimerActive) {
+          if (upstreamResponse.socket) upstreamResponse.setTimeout?.(0)
+          fallbackIdleTimerActive = false
+        }
+        clearTimeout(fallbackTotalTimer)
+        fallbackTotalTimer = undefined
+      }
+      if (aggregatedResponse) {
+        fallbackIdleTimerActive = true
+        upstreamResponse.setTimeout?.(this.responsesFallbackIdleTimeoutMs, () => {
+          if (!fallbackIdleTimerActive) return
+          upstreamTimedOut = true
+          upstreamResponse.destroy(new Error('Responses compatibility stream idle timeout'))
+        })
+        fallbackTotalTimer = setTimeout(() => {
+          if (!fallbackTotalTimer) return
+          upstreamTimedOut = true
+          upstreamRequest.destroy(new Error('Responses compatibility stream completion timeout'))
+        }, this.responsesFallbackTotalTimeoutMs)
+        fallbackTotalTimer.unref?.()
+      }
+
+      if (unsupportedBridgeEncoding) {
+        clearFallbackTimers()
+        endMonitor('failed')
+        upstreamResponse.resume()
+        response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
+        response.end('Responses compatibility requires an identity-encoded upstream response')
+        return
+      }
 
       /*
        * 统计挂在转发之后。
@@ -1204,15 +1566,24 @@ class GatewayService {
        * 原本统计先注册，于是每一片都要先被统计跑完才轮到转发——统计再快也是白白
        * 顶在客户端前面。挪到后面，字节先出门，统计随后。
        */
-      const attachMonitor = () => {
-        upstreamResponse.on('data', (chunk) => {
+      upstreamResponse.once('end', clearFallbackTimers)
+      upstreamResponse.once('aborted', () => {
+        clearFallbackTimers()
+        endMonitor('aborted')
+      })
+      upstreamResponse.once('error', () => {
+        clearFallbackTimers()
+        endMonitor('failed')
+      })
+      const attachMonitor = (stream) => {
+        stream.on('data', (chunk) => {
           try {
             this.requestMonitor?.observeChunk?.(monitorId, chunk)
           } catch {}
         })
       }
-
-      if (!bridgeResponse) {
+      if (!bridgeResponse && !aggregatedResponse) {
+        upstreamResponse.once('end', () => endMonitor())
         response.writeHead(
           upstreamResponse.statusCode || 502,
           upstreamResponse.statusMessage,
@@ -1221,7 +1592,7 @@ class GatewayService {
         pipeline(upstreamResponse, response, (error) => {
           if (error && !response.destroyed) response.destroy(error)
         })
-        attachMonitor()
+        attachMonitor(upstreamResponse)
         return
       }
 
@@ -1230,20 +1601,42 @@ class GatewayService {
       for (const [name, value] of Object.entries(responseHeaders)) {
         if (value !== undefined) response.setHeader(name, value)
       }
-      const transform = createResponsesToolBridgeTransform()
-      pipeline(upstreamResponse, transform, response, (error) => {
-        if (!error) return
+      if (aggregatedResponse) {
+        response.setHeader('content-type', 'application/json; charset=utf-8')
+      }
+      const transform = aggregatedResponse
+        ? createResponsesSseJsonTransform({
+            ...(bridgeEnabled ? { mapResponse: convertResponseObject } : {}),
+          })
+        : responseIsEventStream
+          ? createResponsesToolBridgeTransform()
+          : createResponsesToolBridgeJsonTransform()
+      transform.pipe(response)
+      pipeline(upstreamResponse, transform, (error) => {
+        if (!error) {
+          clearFallbackTimers()
+          endMonitor()
+          return
+        }
+        clearFallbackTimers()
+        endMonitor('failed')
         if (!response.headersSent) {
           for (const name of response.getHeaderNames()) response.removeHeader(name)
           response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
-          response.end('Responses tool bridge response conversion failed')
+          response.end(aggregatedResponse
+            ? 'Responses streaming compatibility conversion failed'
+            : 'Responses tool bridge response conversion failed')
         } else if (!response.destroyed) {
           response.destroy(error)
         }
       })
-      attachMonitor()
+      // 同步客户端的 Responses 请求在上游已经是 SSE；监控原始流，才能记录
+      // 真正的首个可见正文事件，而不是等收拢后的完整 JSON 才误报“首字”。
+      attachMonitor(aggregatedResponse ? upstreamResponse : transform)
     })
     upstreamRequest.on('error', () => {
+      releaseResponsesBodySlot?.()
+      releaseAnthropicCountBodySlot?.()
       endMonitor('failed')
       if (!response.headersSent) {
         response.writeHead(upstreamTimedOut ? 504 : 502, {
@@ -1263,14 +1656,17 @@ class GatewayService {
     response.on('close', () => {
       if (!response.writableEnded) upstreamRequest.destroy()
     })
-    if (bridgeEnabled) {
+    if (requestBody !== undefined) {
       try {
         this.requestMonitor?.updateMetadata?.(
           monitorId,
-          extractRequestMetadata(JSON.parse(requestBody.toString('utf8'))),
+          extractRequestMetadata(JSON.parse((originalRequestBody || requestBody).toString('utf8'))),
         )
       } catch {}
-      upstreamRequest.end(requestBody)
+      upstreamRequest.end(requestBody, () => {
+        releaseResponsesBodySlot?.()
+        releaseAnthropicCountBodySlot?.()
+      })
     } else {
       const requestContentType = String(request.headers['content-type'] || '').toLowerCase()
       const requestEncoding = String(request.headers['content-encoding'] || '').toLowerCase()
@@ -1290,11 +1686,14 @@ class GatewayService {
 }
 
 module.exports = {
+  ANTHROPIC_COUNT_BODY_LIMIT_BYTES,
+  ANTHROPIC_COUNT_BODY_SLOTS,
   DEFAULT_GATEWAY_HOST,
   DEFAULT_GATEWAY_PORT,
   GatewayStoreSchema,
   defaultGatewayStore,
   GatewayService,
+  conservativeAnthropicInputTokens,
   createRequestMetadataTap,
   localBaseUrl,
 }

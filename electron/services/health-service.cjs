@@ -1,4 +1,10 @@
-const { AUTH_MODE, PROTOCOL } = require('./schemas.cjs')
+const {
+  AUTH_MODE,
+  PROTOCOL,
+  ProfileConnectionSchema,
+  normalizeHttpUrl,
+  validationMessage,
+} = require('./schemas.cjs')
 const { extractTokenUsage } = require('./request-monitor-service.cjs')
 
 const HEALTH_TIMEOUT_MS = 8_000
@@ -402,6 +408,30 @@ class HealthService {
   async test(id, options = {}) {
     const committed = await this.testWithSnapshot(id, options)
     return committed.profile
+  }
+
+  /** 使用编辑器当前草稿识别模型，不保存草稿或检测结果。 */
+  async discoverDraftModels(rawInput, options = {}) {
+    const parsed = ProfileConnectionSchema.safeParse(rawInput)
+    if (!parsed.success) throw new Error(validationMessage(parsed.error))
+    const input = parsed.data
+    const suppliedKey = input.apiKey?.trim()
+    const apiKey = suppliedKey || (input.id
+      ? await this.profileService.getSecret(input.id)
+      : '')
+    if (!apiKey) throw new Error('API key is required for model discovery')
+
+    const activeUrl = normalizeHttpUrl(input.baseUrl)
+    const endpoints = [...(input.endpoints || [{ url: activeUrl }])]
+    if (!endpoints.some((endpoint) => normalizeHttpUrl(endpoint.url) === activeUrl)) {
+      endpoints.unshift({ url: activeUrl })
+    }
+    const profile = { ...input, baseUrl: activeUrl, endpoints }
+    const results = await Promise.all(endpoints.map((endpoint) => (
+      probeEndpoint(profile, apiKey, endpoint, this.fetch, options.signal)
+    )))
+    assertEndpointTestActive(options.signal)
+    return results.find((result) => normalizeHttpUrl(result.url) === activeUrl)?.models || []
   }
 
   /**

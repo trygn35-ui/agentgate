@@ -33,7 +33,7 @@ async function fileExists(filePath) {
 }
 
 function sameBaseUrl(left, right) {
-  if (!left || !right) return false
+  if (typeof left !== 'string' || typeof right !== 'string' || !left || !right) return false
   try {
     const normalize = (value) => {
       const url = new URL(value)
@@ -96,19 +96,34 @@ class ClientService {
       let inspection = {}
       if (valid) {
         try {
-          inspection = adapter.inspect(sources)
+          const inspected = adapter.inspect(sources) || {}
+          if (inspected.baseUrl !== undefined && typeof inspected.baseUrl !== 'string') {
+            throw new Error(`${adapter.name} base URL must be a string`)
+          }
+          inspection = inspected
         } catch (inspectionError) {
           valid = false
           error = inspectionError.message
         }
       }
-      const gatewayRoute = inspection.baseUrl
+      const matchesLocalGateway = inspection.baseUrl
         && this.gatewayService?.matchesLocalBase(inspection.baseUrl, adapter.id)
-        ? this.gatewayService.getPublicState().routes.find((route) => route.target === adapter.id)
+      const gatewayState = matchesLocalGateway ? this.gatewayService.getPublicState() : undefined
+      const gatewayRoute = gatewayState?.status === 'running'
+        && gatewayState.engaged?.includes(adapter.id)
+        ? gatewayState.routes.find((route) => route.target === adapter.id)
         : undefined
+      if (matchesLocalGateway && !gatewayRoute) {
+        valid = false
+        error = 'Configuration points to an inactive local gateway'
+      }
       const routedProfile = gatewayRoute
         ? profiles.find((profile) => profile.id === gatewayRoute.profileId)
         : undefined
+      if (gatewayRoute && !routedProfile) {
+        valid = false
+        error = 'Local gateway route points to an unavailable profile'
+      }
       const matchingProfiles = !routedProfile && inspection.baseUrl
         ? profiles.filter((profile) => (
           Boolean(profile.lastAppliedAt)

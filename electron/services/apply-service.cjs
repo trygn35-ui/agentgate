@@ -13,6 +13,7 @@ const {
 const { SerialExecutor } = require('./storage.cjs')
 const {
   atomicWriteText,
+  hashText,
   readTextSnapshot,
   restoreSnapshot,
 } = require('./config-utils.cjs')
@@ -27,11 +28,13 @@ const HISTORY_LIMIT = 100
 const FAILURE_MESSAGE_LIMIT = 240
 const GATEWAY_RECOVERY_ATTEMPTS = 3
 const GATEWAY_BASELINE_VERSION = 2
+const GATEWAY_CONTRACT_VERSION = 2
 
 const GatewayBaselineEntrySchema = z.object({
   capturedAt: z.string(),
   encryptedState: z.string(),
   encryptedBackup: z.string().optional(),
+  contractVersion: z.number().int().positive().optional(),
 })
 
 const CurrentGatewayBaselineStoreSchema = z.object({
@@ -85,12 +88,36 @@ function clientContract(profile, target) {
   })
 }
 
-async function readAdapterSources(adapter) {
-  const snapshots = await Promise.all(adapter.paths.map((filePath) => readTextSnapshot(filePath)))
-  return {
-    snapshots,
-    sources: new Map(snapshots.map((snapshot) => [snapshot.path, snapshot.content])),
+async function readAdapterSources(adapter, baseline) {
+  const samePaths = (left, right) => left.length === right.length
+    && left.every((filePath, index) => (
+      path.resolve(filePath).toLowerCase() === path.resolve(right[index]).toLowerCase()
+    ))
+  const sameSnapshots = (left, right) => left.length === right.length
+    && left.every((snapshot, index) => (
+      path.resolve(snapshot.path).toLowerCase()
+        === path.resolve(right[index].path).toLowerCase()
+      && snapshot.existed === right[index].existed
+      && snapshot.hash === right[index].hash
+    ))
+
+  const resolvePaths = () => (typeof adapter.pathsForBaseline === 'function'
+    ? adapter.pathsForBaseline(baseline)
+    : adapter.paths)
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const filePaths = resolvePaths()
+    const first = await Promise.all(filePaths.map((filePath) => readTextSnapshot(filePath)))
+    if (!samePaths(filePaths, resolvePaths())) continue
+    const snapshots = await Promise.all(filePaths.map((filePath) => readTextSnapshot(filePath)))
+    if (!samePaths(filePaths, resolvePaths()) || !sameSnapshots(first, snapshots)) continue
+    return {
+      snapshots,
+      sources: new Map(snapshots.map((snapshot) => [snapshot.path, snapshot.content])),
+      snapshotSources: new Map(snapshots.map((snapshot) => [snapshot.path, snapshot])),
+    }
   }
+  throw new Error(`Configuration changed while preparing the switch: ${adapter.id || 'client'}`)
 }
 
 function sanitizedFailure(error, apiKey) {
@@ -108,11 +135,32 @@ function uniquePaths(drafts) {
   }
 }
 
+async function restoreSnapshotIfCurrent(snapshot, expected) {
+  const current = await readTextSnapshot(snapshot.path)
+  if (current.existed !== expected.existed || current.hash !== expected.hash) return false
+  await restoreSnapshot(snapshot)
+  return true
+}
+
 function isConfigurationRace(error) {
   const message = error instanceof Error ? error.message : ''
   return message.includes('Configuration no longer matches the last Agent;Gate write:')
     || message.includes('Configuration changed while preparing the switch:')
     || message.includes('Configuration changed before it could be written:')
+}
+
+function comparableValue(value) {
+  if (Array.isArray(value)) return value.map(comparableValue)
+  if (!value || typeof value !== 'object') return value
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, comparableValue(value[key])]),
+  )
+}
+
+function managedStateMatches(left, right) {
+  return JSON.stringify(comparableValue(left)) === JSON.stringify(comparableValue(right))
 }
 
 /**
@@ -244,9 +292,14 @@ class ApplyService {
         if (!error?.rollbackIncomplete) {
           // 只回退这次新接管的；之前就接管着的客户端不该被牵连着放掉
           if (alreadyEngaged.size > 0) {
-            await this.gatewayService.setEngagedTargets([...alreadyEngaged]).catch(() => {})
+            await this.gatewayService.setEngagedTargets([...alreadyEngaged], {
+              preserveResumeIntent: settings.preserveResumeIntent === true,
+            }).catch(() => {})
           } else {
-            await this.gatewayService.stop({ clearRoutes: false }).catch(() => {})
+            await this.gatewayService.stop({
+              clearRoutes: false,
+              preserveResumeIntent: settings.preserveResumeIntent === true,
+            }).catch(() => {})
           }
         }
         throw error
@@ -264,12 +317,36 @@ class ApplyService {
     return this.serial.run(async () => {
       const allGroups = this.gatewayService.getRouteGroups()
       const gatewayState = this.gatewayService.getPublicState()
+      const preserveResumeIntent = settings.preserveResumeIntent === true
+      const lifecycle = typeof this.gatewayService.getLifecycleState === 'function'
+        ? this.gatewayService.getLifecycleState()
+        : { resumeTargets: [] }
       // 只放掉被点名的客户端；省略时放掉全部（「全部断开」按钮）
       const engaged = new Set(gatewayState.engaged || [])
       const releasing = new Set(settings.targets === undefined
         ? engaged
         : settings.targets.filter((target) => engaged.has(target)))
-      if (releasing.size === 0) return { ...gatewayState, skippedTargets: [] }
+      const nextResumeTargets = preserveResumeIntent
+        ? (lifecycle.resumeTargets || [])
+        : settings.targets === undefined
+          ? []
+          : (lifecycle.resumeTargets || []).filter((target) => !settings.targets.includes(target))
+      if (releasing.size === 0) {
+        if (preserveResumeIntent) {
+          if (gatewayState.status === 'running' || gatewayState.status === 'starting') {
+            const state = await this.gatewayService.stop({
+              preserveResumeIntent: true,
+              resumeTargets: nextResumeTargets,
+            })
+            return { ...state, skippedTargets: [] }
+          }
+          return { ...gatewayState, skippedTargets: [] }
+        }
+        const state = await this.gatewayService.setEngagedTargets([], {
+          resumeTargets: nextResumeTargets,
+        })
+        return { ...state, skippedTargets: [] }
+      }
 
       // 恢复流程按 group 走，把它裁剪到只剩要放掉的客户端
       const groups = allGroups
@@ -314,8 +391,12 @@ class ApplyService {
       }
       // 还有客户端接管着就让服务器继续跑，只把这几个从接管集合里摘掉
       const state = remaining.length > 0
-        ? await this.gatewayService.setEngagedTargets(remaining)
-        : await this.gatewayService.stop({ clearRoutes: false })
+        ? await this.gatewayService.setEngagedTargets(remaining, { resumeTargets: nextResumeTargets })
+        : await this.gatewayService.stop({
+            clearRoutes: false,
+            preserveResumeIntent,
+            resumeTargets: nextResumeTargets,
+          })
       const nextBaselines = { ...baselineData.baselines }
       for (const target of recovery.clearedTargets) delete nextBaselines[target]
       await this.gatewayBaselineStore.write({
@@ -327,6 +408,36 @@ class ApplyService {
         skippedTargets: [...new Set(recovery.skippedTargets)],
       }
     })
+  }
+
+  /**
+   * 启动时修复上次进程留下的接管事实，再按独立的恢复意图决定是否重新接管。
+   *
+   * `GatewayService.initialize({ start: false })` 只负责加载 store；所有客户端文件
+   * 的恢复和重新写入都必须经过这里，沿用同一套基线校验与端口冲突处理。
+   */
+  async reconcileGatewayOnLaunch({ start = false } = {}) {
+    if (!this.gatewayService) throw new Error('Local gateway is unavailable')
+    const lifecycle = typeof this.gatewayService.getLifecycleState === 'function'
+      ? this.gatewayService.getLifecycleState()
+      : {
+          engaged: this.gatewayService.getPublicState().engaged || [],
+          resumeTargets: this.gatewayService.getPublicState().engaged || [],
+        }
+    const desired = [...new Set([
+      ...(lifecycle.resumeTargets || []),
+      ...(lifecycle.engaged || []),
+    ])]
+    if ((lifecycle.engaged || []).length > 0) {
+      await this.stopGateway({
+        targets: lifecycle.engaged,
+        preserveResumeIntent: true,
+      })
+    }
+    if (start && desired.length > 0) {
+      return this.startGateway({ targets: desired, preserveResumeIntent: true })
+    }
+    return this.gatewayService.getPublicState()
   }
 
   async _prepareGatewayRecovery({ groups, gatewayState, localToken, baselineData }) {
@@ -347,7 +458,6 @@ class ApplyService {
         if (!adapter?.gatewayOwnership) {
           throw new Error(`Cannot verify local gateway configuration ownership: ${target}`)
         }
-        const current = await readAdapterSources(adapter)
         const storedBaseline = baselineData.baselines[target]
         let baseline
         if (storedBaseline) {
@@ -357,11 +467,17 @@ class ApplyService {
             throw new Error(`Cannot unlock the pre-gateway baseline for ${target}`, { cause: error })
           }
         }
+        const current = await readAdapterSources(adapter, baseline)
         const state = await adapter.gatewayOwnership(
           { ...profile, baseUrl: localBaseUrl },
           localToken,
           current.sources,
-          { gateway: true, baseline },
+          {
+            gateway: true,
+            baseline,
+            allowLegacyModelDiscovery: target === TARGET.CLAUDE
+              && storedBaseline?.contractVersion === undefined,
+          },
         )
         if (state === GATEWAY_OWNERSHIP.CONFLICT) {
           throw new Error(
@@ -379,7 +495,7 @@ class ApplyService {
         if (typeof adapter.buildRestore !== 'function') {
           throw new Error(`Cannot restore local gateway configuration ownership: ${target}`)
         }
-        drafts.push(...await adapter.buildRestore(baseline, current.sources))
+        drafts.push(...await adapter.buildRestore(baseline, current.snapshotSources))
         if (typeof adapter.verifyManagedState === 'function') {
           verifications.push({ target, adapter, baseline })
         }
@@ -399,7 +515,7 @@ class ApplyService {
 
   async _verifyGatewayRecovery(verifications) {
     for (const { target, adapter, baseline } of verifications) {
-      const current = await readAdapterSources(adapter)
+      const current = await readAdapterSources(adapter, baseline)
       if (!await adapter.verifyManagedState(baseline, current.sources)) {
         throw new Error(`Cannot verify restored local gateway configuration: ${target}`)
       }
@@ -452,6 +568,8 @@ class ApplyService {
         const writeTargets = []
         if (before.status === 'running') {
           for (const target of targets) {
+            // 已分配但尚未接管的目标只更新路由；它的客户端配置仍归用户所有。
+            if (!before.engaged?.includes(target)) continue
             const route = before.routes.find((item) => item.target === target)
             const previousProfile = route?.profileId === profile.id
               ? profile
@@ -513,7 +631,15 @@ class ApplyService {
 
     for (const { profile, apiKey, target, ownershipProfile } of entries) {
       const adapter = this.adapters[target]
-      const current = await readAdapterSources(adapter)
+      let trustedBaseline
+      if (nextBaselines[target]) {
+        try {
+          trustedBaseline = JSON.parse(this.vault.decrypt(nextBaselines[target].encryptedState))
+        } catch (error) {
+          throw new Error(`Cannot unlock the pre-gateway baseline for ${target}`, { cause: error })
+        }
+      }
+      const current = await readAdapterSources(adapter, trustedBaseline)
       const effective = await this.gatewayService.prepareConnection(profile, apiKey, target)
       const currentManagedState = target === TARGET.CODEX
         ? await adapter.captureManagedState(current.sources)
@@ -522,14 +648,6 @@ class ApplyService {
       // 会按方案协议整段新建，协议断言只对「改现有 provider」的路径有意义。
       if (currentManagedState && !currentManagedState.fresh) {
         assertCodexGatewayProtocol(profile, currentManagedState)
-      }
-      let trustedBaseline
-      if (nextBaselines[target]) {
-        try {
-          trustedBaseline = JSON.parse(this.vault.decrypt(nextBaselines[target].encryptedState))
-        } catch (error) {
-          throw new Error(`Cannot unlock the pre-gateway baseline for ${target}`, { cause: error })
-        }
       }
       const ownershipContract = ownershipProfile
         ? { ...ownershipProfile, baseUrl: effective.profile.baseUrl }
@@ -540,15 +658,29 @@ class ApplyService {
         current.sources,
         { gateway: true, baseline: trustedBaseline },
       )
+      let releasedMatchesBaseline = false
+      if (trustedBaseline
+        && currentOwnership === GATEWAY_OWNERSHIP.RELEASED
+        && typeof adapter.captureManagedState === 'function') {
+        try {
+          releasedMatchesBaseline = managedStateMatches(
+            await adapter.captureManagedState(current.sources),
+            trustedBaseline,
+          )
+        } catch {
+          releasedMatchesBaseline = false
+        }
+      }
       if (target === TARGET.CODEX
         && trustedBaseline
-        && currentOwnership === GATEWAY_OWNERSHIP.RELEASED) {
+        && currentOwnership === GATEWAY_OWNERSHIP.RELEASED
+        && !releasedMatchesBaseline) {
         throw new Error(
           'Codex gateway ownership was released; stop the gateway before taking it over again',
         )
       }
       const shouldCapture = !trustedBaseline
-        || (target !== TARGET.CODEX && currentOwnership === GATEWAY_OWNERSHIP.RELEASED)
+        || (currentOwnership === GATEWAY_OWNERSHIP.RELEASED && !releasedMatchesBaseline)
       if (currentOwnership === GATEWAY_OWNERSHIP.CONFLICT) {
         throw new Error(
           `Local gateway configuration conflict for ${target}; managed fields changed outside Agent;Gate`,
@@ -567,6 +699,7 @@ class ApplyService {
         trustedBaseline = managedState
         nextBaselines[target] = {
           capturedAt: new Date().toISOString(),
+          contractVersion: GATEWAY_CONTRACT_VERSION,
           encryptedState: this.vault.encrypt(JSON.stringify(managedState)),
           encryptedBackup: this.vault.encrypt(JSON.stringify({
             files: current.snapshots.map((snapshot) => ({
@@ -581,6 +714,7 @@ class ApplyService {
         gateway: true,
         baseline: trustedBaseline,
         ...(effective.adapterOptions || {}),
+        sources: current.snapshotSources,
       }))
     }
 
@@ -621,7 +755,11 @@ class ApplyService {
       let rollbackComplete = true
       for (const item of written.reverse()) {
         try {
-          await restoreSnapshot(item.before)
+          const restored = await restoreSnapshotIfCurrent(item.before, {
+            existed: true,
+            hash: item.afterHash,
+          })
+          if (!restored) rollbackComplete = false
         } catch {
           rollbackComplete = false
         }
@@ -963,7 +1101,11 @@ class ApplyService {
           }
           for (const item of written.reverse()) {
             try {
-              await restoreSnapshot(item.before)
+              const restored = await restoreSnapshotIfCurrent(item.before, {
+                existed: true,
+                hash: item.afterHash,
+              })
+              if (!restored) rollbackComplete = false
             } catch {
               rollbackComplete = false
             }
@@ -1043,9 +1185,15 @@ class ApplyService {
 
       const restored = []
       try {
-        for (const original of originals) {
-          await restoreSnapshot(original)
-          restored.push(original)
+        for (let i = 0; i < originals.length; i += 1) {
+          const restoredOwnedFile = await restoreSnapshotIfCurrent(originals[i], {
+            existed: true,
+            hash: history.changes[i].afterHash,
+          })
+          if (!restoredOwnedFile) {
+            throw new Error(`Configuration changed while undoing: ${originals[i].path}`)
+          }
+          restored.push(originals[i])
         }
         history.status = 'undone'
         history.undoneAt = new Date().toISOString()
@@ -1055,7 +1203,11 @@ class ApplyService {
         let rollbackComplete = true
         for (let i = restored.length - 1; i >= 0; i -= 1) {
           try {
-            await restoreSnapshot(currentSnapshots[i])
+            const restoredAppliedState = await restoreSnapshotIfCurrent(currentSnapshots[i], {
+              existed: restored[i].existed,
+              hash: hashText(restored[i].content),
+            })
+            if (!restoredAppliedState) rollbackComplete = false
           } catch {
             rollbackComplete = false
           }

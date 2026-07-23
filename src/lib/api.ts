@@ -1,5 +1,6 @@
 import type {
   AgentSession,
+  SessionListResult,
   SessionMessage,
   BootstrapData,
   ClientStatus,
@@ -67,7 +68,7 @@ let mockProfiles: Profile[] = [
     updatedAt: minutesAgo(18),
     lastAppliedAt: minutesAgo(18),
     health: { status: "healthy", latencyMs: 186, checkedAt: minutesAgo(2) },
-    tokenUsageTotal: 12_480_000,
+    tokenUsageTotal: 1_248_000_000,
     tokenInputTotal: 11_260_000,
     tokenCachedTotal: 10_620_000,
     tokenCacheWriteTotal: 384_000,
@@ -273,6 +274,19 @@ let mockSessions: AgentSession[] = [
     sizeBytes: 41_003_520,
   },
   {
+    id: "codex:019f5fe0-1e64-7ca1-9128-8e74f5f0d3f2",
+    client: "codex",
+    nativeId: "019f5fe0-1e64-7ca1-9128-8e74f5f0d3f2",
+    title: "先探索理解一下当前项目内的东西",
+    workspace: "E:\\godot的游戏\\怪物区驿站",
+    updatedAt: hoursAgo(0.3),
+    sizeBytes: 6_410_240,
+    threadSource: "subagent",
+    agentNickname: "Bacon",
+    agentRole: "reviewer",
+    parentNativeId: "019f5fdc-7324-7911-8c9d-7e39f784efa6",
+  },
+  {
     id: "claude:e8fee807-a093-449b-95bc-512795b85513",
     client: "claude",
     nativeId: "e8fee807-a093-449b-95bc-512795b85513",
@@ -432,6 +446,14 @@ const mockBridge: AgentGateBridge = {
     };
     mockProfiles = mockProfiles.map((profile) => profile.id === id ? tested : profile);
     return clone(tested);
+  },
+
+  async testProfileDraft(input: SaveProfileInput): Promise<string[]> {
+    return input.protocol === "gemini"
+      ? ["gemini-2.5-flash", "gemini-2.5-pro"]
+      : input.protocol === "anthropic"
+        ? ["claude-sonnet-4-5", "claude-opus-4-1"]
+        : ["gpt-5.2-codex", "gpt-5.2"];
   },
 
   async probeProfile(id: string) {
@@ -618,7 +640,7 @@ const mockBridge: AgentGateBridge = {
 
   async listSessions() {
     await new Promise((resolve) => setTimeout(resolve, 260));
-    return clone(mockSessions);
+    return clone<SessionListResult>({ sessions: mockSessions, errors: [] });
   },
 
   async readSessionMessages(id: string, limit = 30) {
@@ -655,6 +677,7 @@ const mockBridge: AgentGateBridge = {
   async planSessionRemoval(ids: string[]) {
     return clone(mockSessions.filter((s) => ids.includes(s.id)).map((s) => ({
       id: s.id,
+      nativeId: s.nativeId,
       client: s.client,
       title: s.title,
       workspace: s.workspace,

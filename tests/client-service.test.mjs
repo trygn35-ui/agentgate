@@ -37,6 +37,8 @@ describe("客户端方案匹配", () => {
     const gatewayService = {
       matchesLocalBase: () => true,
       getPublicState: () => ({
+        status: "running",
+        engaged: ["codex"],
         routes: [{ target: "codex", profileId: "gateway-profile" }],
       }),
     };
@@ -107,5 +109,102 @@ describe("客户端方案匹配", () => {
     const [client] = await service.scan(profiles);
     expect(client.activeProfileId).toBe("source");
     expect(client.activeProfileName).toBe("当前方案");
+  });
+
+  it("配置中的 baseUrl 类型错误时标记漂移而不拒绝整个扫描", async () => {
+    const configPath = path.join(root, "invalid-base-url.json");
+    await fs.writeFile(configPath, "{}\n", "utf8");
+    const adapters = {
+      codex: {
+        id: "codex",
+        name: "Codex",
+        command: "codex-not-used-in-test",
+        paths: [configPath],
+        primaryPath: configPath,
+        validate() {},
+        inspect() {
+          return { baseUrl: 123 };
+        },
+      },
+    };
+    const service = new ClientService(adapters, {});
+
+    await expect(service.scan([{
+      id: "profile",
+      name: "方案",
+      targets: ["codex"],
+      endpoints: [{ url: "https://relay.example/v1" }],
+      lastAppliedAt: new Date().toISOString(),
+    }])).resolves.toEqual([
+      expect.objectContaining({
+        target: "codex",
+        drifted: true,
+        warning: expect.stringMatching(/base URL/i),
+      }),
+    ]);
+  });
+
+  it("本地地址未处于 running+engaged 时标记为失效网关配置", async () => {
+    const configPath = path.join(root, "dead-gateway.json");
+    await fs.writeFile(configPath, "{}\n", "utf8");
+    const adapters = {
+      codex: {
+        id: "codex",
+        name: "Codex",
+        command: "codex-not-used-in-test",
+        paths: [configPath],
+        primaryPath: configPath,
+        validate() {},
+        inspect: () => ({ baseUrl: "http://127.0.0.1:17863/codex/token" }),
+      },
+    };
+    const gatewayService = {
+      matchesLocalBase: () => true,
+      getPublicState: () => ({
+        status: "stopped",
+        engaged: [],
+        routes: [{ target: "codex", profileId: "gateway-profile" }],
+      }),
+    };
+    const [client] = await new ClientService(adapters, {}, gatewayService).scan([]);
+
+    expect(client.viaGateway).toBeUndefined();
+    expect(client).toMatchObject({
+      drifted: true,
+      warning: expect.stringMatching(/local gateway/i),
+    });
+  });
+
+  it("运行中的网关路由指向已删除方案时标记漂移", async () => {
+    const configPath = path.join(root, "missing-route-profile.json");
+    await fs.writeFile(configPath, "{}\n", "utf8");
+    const adapters = {
+      codex: {
+        id: "codex",
+        name: "Codex",
+        command: "codex-not-used-in-test",
+        paths: [configPath],
+        primaryPath: configPath,
+        validate() {},
+        inspect: () => ({ baseUrl: "http://127.0.0.1:17863/codex/token" }),
+      },
+    };
+    const gatewayService = {
+      matchesLocalBase: () => true,
+      getPublicState: () => ({
+        status: "running",
+        engaged: ["codex"],
+        routes: [{ target: "codex", profileId: "deleted-profile" }],
+      }),
+    };
+    const [client] = await new ClientService(adapters, {}, gatewayService).scan([]);
+
+    expect(client).toMatchObject({
+      target: "codex",
+      drifted: true,
+      warning: expect.stringMatching(/unavailable profile/i),
+    });
+    expect(client.activeProfileId).toBeUndefined();
+    expect(client.viaGateway).toBeUndefined();
   });
 });

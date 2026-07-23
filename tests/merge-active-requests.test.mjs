@@ -28,9 +28,29 @@ describe("增量请求合并", () => {
     expect(mergeActiveRequests(current, [])).toBe(current);
   });
 
-  it("列表里还没有的请求忽略掉——下一次全量通知会带上它", () => {
+  it("列表里还没有的请求也追加进去，避免 bootstrap 与事件交错时丢失", () => {
     const current = [row("a", 1)];
     const merged = mergeActiveRequests(current, [row("未知", 5)]);
-    expect(merged.map((r) => r.id)).toEqual(["a"]);
+    expect(merged.map((r) => r.id)).toEqual(["a", "未知"]);
+    expect(merged[0]).toBe(current[0]);
+  });
+
+  it("删除过期历史时只移除指定 ID，其他对象引用保持不变", () => {
+    const current = [row("live", 10), row("stale", 99), row("keep", 88)];
+    const merged = mergeActiveRequests(current, [row("live", 42)], ["stale"]);
+    expect(merged.map((r) => r.id)).toEqual(["live", "keep"]);
+    expect(merged[0].tokenUsage.outputTokens).toBe(42);
+    expect(merged[1]).toBe(current[2]);
+  });
+
+  it("bootstrap 竞态追加未知请求时仍保持最新开始时间在前", () => {
+    const current = [
+      { ...row("old", 1), startedAt: "2026-07-14T10:00:00.000Z" },
+      { ...row("older", 2), startedAt: "2026-07-14T09:00:00.000Z" },
+    ];
+    const merged = mergeActiveRequests(current, [
+      { ...row("new", 3), startedAt: "2026-07-14T11:00:00.000Z" },
+    ]);
+    expect(merged.map((entry) => entry.id)).toEqual(["new", "old", "older"]);
   });
 });

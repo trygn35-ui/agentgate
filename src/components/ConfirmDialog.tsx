@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { ReactElement, ReactNode } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactElement, ReactNode } from "react";
 import { useI18n } from "../i18n";
 
 interface ConfirmDialogProps {
@@ -30,29 +30,99 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps): ReactElement {
   const { m } = useI18n();
+  const layerRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const confirmRef = useRef<HTMLButtonElement>(null);
   const cancelText = cancelLabel ?? m.confirm.cancel;
 
   useEffect(() => {
+    const layer = layerRef.current;
+    const backgroundState: Array<{
+      element: HTMLElement;
+      inert: boolean;
+      ariaHidden: string | null;
+    }> = [];
+    let branch: HTMLElement | null = layer;
+    while (branch?.parentElement) {
+      const parent = branch.parentElement;
+      for (const element of parent.children) {
+        if (!(element instanceof HTMLElement) || element === branch) continue;
+        backgroundState.push({
+          element,
+          inert: element.inert,
+          ariaHidden: element.getAttribute("aria-hidden"),
+        });
+      }
+      branch = parent;
+      if (parent === document.body) break;
+    }
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : undefined;
+    for (const state of backgroundState) {
+      state.element.inert = true;
+      state.element.setAttribute("aria-hidden", "true");
+    }
     confirmRef.current?.focus();
+    return () => {
+      for (const state of backgroundState) {
+        state.element.inert = state.inert;
+        if (typeof state.ariaHidden === "string") {
+          state.element.setAttribute("aria-hidden", state.ariaHidden);
+        } else {
+          state.element.removeAttribute("aria-hidden");
+        }
+      }
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
   }, []);
+
+  function handleKeyDown(event: ReactKeyboardEvent<HTMLDivElement>): void {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onCancel();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = [...dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )].filter((element) => element.offsetParent !== null);
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!dialog.contains(document.activeElement)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   return (
     <div
+      ref={layerRef}
       className="editor-layer"
       role="alertdialog"
       aria-modal="true"
       aria-label={title}
       style={{ zIndex: 85 }}
-      onKeyDown={(event) => {
-        if (event.key !== "Escape") return;
-        event.preventDefault();
-        event.stopPropagation();
-        onCancel();
-      }}
+      onKeyDown={handleKeyDown}
     >
-      <button type="button" className="editor-scrim" aria-label={cancelText} onClick={onCancel} />
-      <div className="confirm-dialog">
+      <button
+        type="button"
+        className="editor-scrim"
+        aria-label={cancelText}
+        tabIndex={-1}
+        onClick={onCancel}
+      />
+      <div className="confirm-dialog" ref={dialogRef}>
         <h2>{title}</h2>
         <p>{message}</p>
         {details}

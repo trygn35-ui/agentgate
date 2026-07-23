@@ -5,8 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
 const {
+  ANTHROPIC_COUNT_BODY_LIMIT_BYTES,
+  ANTHROPIC_COUNT_BODY_SLOTS,
   GatewayService,
   GatewayStoreSchema,
+  conservativeAnthropicInputTokens,
   createRequestMetadataTap,
   defaultGatewayStore,
 } = require("../electron/services/gateway-service.cjs");
@@ -51,6 +54,52 @@ it("请求元数据 Tap 丢弃超长字段且保持请求字节不变", async ()
 
   expect(Buffer.concat(chunks)).toEqual(body);
   expect(metadata).toEqual([]);
+});
+
+it("Anthropic 本地计数对英文、中文和工具定义保守估算且拒绝媒体输入", () => {
+  const englishText = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+  const englishBody = Buffer.from(JSON.stringify({
+    model: "claude-test",
+    messages: [{ role: "user", content: englishText }],
+  }), "utf8");
+  const chineseText = "修复网关令牌统计问题，保持上下文准确。".repeat(20);
+  const chineseBody = Buffer.from(JSON.stringify({
+    model: "claude-test",
+    messages: [{ role: "user", content: chineseText }],
+  }), "utf8");
+  const toolBody = Buffer.from(JSON.stringify({
+    model: "claude-test",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{
+      name: "read_file",
+      description: "Read a UTF-8 file from disk",
+      input_schema: {
+        type: "object",
+        properties: { path: { type: "string" } },
+      },
+    }],
+  }), "utf8");
+  const noToolBody = Buffer.from(JSON.stringify({
+    model: "claude-test",
+    messages: [{ role: "user", content: "hi" }],
+  }), "utf8");
+
+  const english = conservativeAnthropicInputTokens(englishBody);
+  const chinese = conservativeAnthropicInputTokens(chineseBody);
+  const tool = conservativeAnthropicInputTokens(toolBody);
+  const noTool = conservativeAnthropicInputTokens(noToolBody);
+  expect(english).toBeGreaterThan(Math.ceil(Buffer.byteLength(englishText, "utf8") / 3));
+  expect(english).toBeLessThan(englishBody.length);
+  expect(chinese).toBeGreaterThan([...chineseText].length);
+  expect(tool).toBeGreaterThan(noTool + 350);
+  expect(conservativeAnthropicInputTokens(Buffer.from("not json"))).toBeUndefined();
+  expect(conservativeAnthropicInputTokens(Buffer.from(JSON.stringify({
+    model: "claude-test",
+    messages: [{
+      role: "user",
+      content: [{ type: "image", source: { type: "base64", data: "AA==" } }],
+    }],
+  })))).toBeUndefined();
 });
 
 const PROFILE_A = "11111111-1111-4111-8111-111111111111";
@@ -185,6 +234,12 @@ async function createGateway(connections, options = {}) {
     store,
     vault,
     ...(options.requestMonitor ? { requestMonitor: options.requestMonitor } : {}),
+    ...(options.responsesFallbackIdleTimeoutMs
+      ? { responsesFallbackIdleTimeoutMs: options.responsesFallbackIdleTimeoutMs }
+      : {}),
+    ...(options.responsesFallbackTotalTimeoutMs
+      ? { responsesFallbackTotalTimeoutMs: options.responsesFallbackTotalTimeoutMs }
+      : {}),
   });
   activeServices.add(service);
   if (options.initialize) await service.initialize();
@@ -210,7 +265,7 @@ afterEach(async () => {
 });
 
 describe("GatewayService", () => {
-  it("将旧版或未知版本网关状态归一化为 staged routes 的 v3 结构", () => {
+  it("将旧版或未知版本网关状态归一化为 staged routes 的 v4 结构", () => {
     expect(GatewayStoreSchema.parse({
       version: 0,
       enabled: true,
@@ -222,12 +277,13 @@ describe("GatewayService", () => {
       encryptedToken: "ciphertext",
       legacyField: "ignored",
     })).toEqual({
-      version: 3,
+      version: 4,
       enabled: true,
       port: 17863,
       targets: ["codex"],
       // 老库没有 engaged 字段：当年「开着就全接管」，照此还原
       engaged: ["codex"],
+      resumeTargets: ["codex"],
       routes: { codex: PROFILE_A },
       encryptedToken: "ciphertext",
     });
@@ -247,13 +303,41 @@ describe("GatewayService", () => {
         gemini: "  ",
       },
     })).toEqual({
-      version: 3,
+      version: 4,
       enabled: true,
       port: 17863,
       targets: ["codex", "claude", "gemini"],
       engaged: ["codex", "claude", "gemini"],
+      resumeTargets: ["codex", "claude", "gemini"],
       routes: { claude: PROFILE_A },
     });
+  });
+
+  it("正常退出可清掉当前接管但保留独立恢复意图，显式停止则清掉意图", async () => {
+    const store = memoryStore({
+      ...defaultGatewayStore(),
+      targets: ["codex"],
+      engaged: ["codex"],
+      resumeTargets: ["codex"],
+      routes: { codex: PROFILE_A },
+    });
+    const service = new GatewayService({
+      profileService: profileService({}),
+      store,
+      vault,
+    });
+    await service.initialize({ start: false });
+
+    await service.stop({ preserveResumeIntent: true });
+    expect(store.current()).toMatchObject({
+      enabled: false,
+      engaged: [],
+      resumeTargets: ["codex"],
+    });
+
+    await service.setEngagedTargets(["codex"]);
+    await service.stop();
+    expect(store.current().resumeTargets).toEqual([]);
   });
 
   it("Codex 路径令牌加密持久化并在重启监听后保持不变", async () => {
@@ -278,6 +362,46 @@ describe("GatewayService", () => {
     expect(service.getPublicState().localBaseUrls.codex).toBe(firstUrl);
   });
 
+  it("initialize 恢复已启用网关时保留 engaged 子集", async () => {
+    const reservation = await listen((_request, response) => response.end());
+    const restoredPort = reservation.port;
+    await closeServer(reservation.server);
+    const profileA = {
+      id: PROFILE_A,
+      name: "Codex route",
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: "http://127.0.0.1:1",
+      targets: ["codex"],
+    };
+    const profileB = {
+      id: PROFILE_B,
+      name: "Claude route",
+      protocol: "anthropic",
+      authMode: "bearer",
+      baseUrl: "http://127.0.0.1:2",
+      targets: ["claude"],
+    };
+    const store = memoryStore({
+      version: 3,
+      enabled: true,
+      port: restoredPort,
+      targets: ["codex", "claude"],
+      engaged: ["codex"],
+      routes: { codex: PROFILE_A, claude: PROFILE_B },
+    });
+
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile: profileA, apiKey: "key-a" },
+      [PROFILE_B]: { profile: profileB, apiKey: "key-b" },
+    }, { store, initialize: true });
+
+    expect(service.getPublicState().engaged).toEqual(["codex"]);
+    expect(service.isTargetEnabled("codex")).toBe(true);
+    expect(service.isTargetEnabled("claude")).toBe(false);
+    expect([...service.connectionCache.keys()]).toEqual([PROFILE_A]);
+  });
+
   it("停止状态可预先分配路由并验证方案密钥，不启动监听器", async () => {
     const profile = {
       id: PROFILE_A,
@@ -297,7 +421,12 @@ describe("GatewayService", () => {
 
     const previous = await service.assignRoutes(profile.id, ["codex"]);
 
-    expect(previous).toEqual({ targets: [], routes: {} });
+    expect(previous).toEqual({
+      targets: [],
+      engaged: [],
+      resumeTargets: [],
+      routes: {},
+    });
     expect(getConnection).toHaveBeenCalledWith(PROFILE_A);
     expect(service.getPublicState()).toMatchObject({
       status: "stopped",
@@ -463,6 +592,730 @@ describe("GatewayService", () => {
     expect(sseResponse.chunks[0]).toEqual(sseChunks[0]);
   });
 
+  it("Responses 同步请求从第一次起就改走流式并还原 JSON", async () => {
+    let upstreamCalls = 0;
+    const receivedBodies = [];
+    const upstream = await listen((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const body = Buffer.concat(chunks);
+        receivedBodies.push(JSON.parse(body.toString("utf8")));
+        upstreamCalls += 1;
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          "event: response.output_text.delta\n",
+          'data: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+          "event: response.completed\n",
+          'data: {"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":2,"output_tokens":1}}}\n\n',
+          "data: [DONE]\n\n",
+        ].join(""));
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const monitor = new RequestMonitorService();
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    }, { requestMonitor: monitor });
+    await service.activateRoutes(profile);
+    const url = `${service.getPublicState().localBaseUrls.codex}/responses`;
+    const body = Buffer.from(JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: false,
+      input: [{ role: "user", content: "hello" }],
+    }), "utf8");
+    const options = {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(body.length) },
+      body,
+    };
+
+    const first = await rawRequest(url, options);
+    const second = await rawRequest(url, options);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(JSON.parse(first.body.toString("utf8"))).toMatchObject({ id: "resp_1" });
+    expect(JSON.parse(second.body.toString("utf8"))).toMatchObject({ id: "resp_1" });
+    expect(receivedBodies).toHaveLength(2);
+    expect(receivedBodies.map((item) => item.stream)).toEqual([true, true]);
+    expect(monitor.list().map((entry) => [entry.statusCode, entry.streaming, entry.outcome]))
+      .toEqual([[200, true, "completed"], [200, true, "completed"]]);
+    expect(monitor.list().every((entry) => Number.isFinite(entry.firstTokenLatencyMs))).toBe(true);
+  });
+
+  it("重启后从最近的同步 502 历史恢复流式兼容能力", async () => {
+    const now = Date.now();
+    let upstreamCalls = 0;
+    const upstream = await listen((request, response) => {
+      upstreamCalls += 1;
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        expect(JSON.parse(Buffer.concat(chunks).toString("utf8")).stream).toBe(true);
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          "event: response.completed\n",
+          'data: {"type":"response.completed","response":{"id":"resp_history","output":[]}}\n\n',
+        ].join(""));
+      });
+    });
+    const monitor = new RequestMonitorService({ now: () => now });
+    const historyId = monitor.start({
+      client: "codex",
+      profileId: PROFILE_A,
+      profileName: "Lucen",
+      upstreamUrl: `${upstream.baseUrl}/v1/responses`,
+      protocol: "openai-responses",
+    });
+    monitor.responseStarted(historyId, { statusCode: 502, contentType: "application/json" });
+    monitor.observeChunk(historyId, Buffer.from('{"error":{"type":"upstream_error"}}'));
+    monitor.end(historyId, { outcome: "failed" });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    }, { requestMonitor: monitor });
+    await service.activateRoutes(profile);
+    const body = Buffer.from(JSON.stringify({ model: "gpt-5.6-sol", stream: false }), "utf8");
+    const result = await rawRequest(`${service.getPublicState().localBaseUrls.codex}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(body.length) },
+      body,
+    });
+    expect(result.status).toBe(200);
+    expect(JSON.parse(result.body.toString("utf8")).id).toBe("resp_history");
+    expect(upstreamCalls).toBe(1);
+  });
+
+  it("Responses 把显式或省略 stream 的同步请求都默认改为流式并还原 JSON", async () => {
+    let upstreamCalls = 0;
+    const receivedBodies = [];
+    const upstream = await listen((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        receivedBodies.push(body);
+        upstreamCalls += 1;
+        if (body.stream !== true) {
+          response.writeHead(502, { "content-type": "application/json" });
+          response.end(JSON.stringify({
+            error: { message: "sync unavailable", type: "upstream_error" },
+          }));
+          return;
+        }
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          "event: response.completed\n",
+          'data: {"type":"response.completed","response":{"id":"resp_omitted","output":[]}}\n\n',
+          "data: [DONE]\n\n",
+        ].join(""));
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    });
+    await service.activateRoutes(profile);
+    const url = `${service.getPublicState().localBaseUrls.codex}/responses`;
+    const firstBody = Buffer.from(JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: false,
+      input: "hello",
+    }), "utf8");
+    const secondBody = Buffer.from(JSON.stringify({
+      model: "gpt-5.6-sol",
+      input: "hello",
+    }), "utf8");
+
+    const first = await rawRequest(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(firstBody.length) },
+      body: firstBody,
+    });
+    const second = await rawRequest(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(secondBody.length) },
+      body: secondBody,
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(JSON.parse(first.body.toString("utf8"))).toMatchObject({ id: "resp_omitted" });
+    expect(JSON.parse(second.body.toString("utf8"))).toMatchObject({ id: "resp_omitted" });
+    expect(receivedBodies).toHaveLength(2);
+    expect(receivedBodies.map((item) => item.stream)).toEqual([true, true]);
+    expect(upstreamCalls).toBe(2);
+  });
+
+  it("Responses 默认流式不依赖失败缓存或同步探测", async () => {
+    let upstreamCalls = 0;
+    const receivedBodies = [];
+    const upstream = await listen((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        receivedBodies.push(body);
+        upstreamCalls += 1;
+        if (body.stream !== true) {
+          response.writeHead(409, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: { type: "unexpected_sync_request" } }));
+          return;
+        }
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          "event: response.completed\n",
+          'data: {"type":"response.completed","response":{"id":"resp_default_stream","output":[]}}\n\n',
+          "data: [DONE]\n\n",
+        ].join(""));
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    });
+    await service.activateRoutes(profile);
+    const url = `${service.getPublicState().localBaseUrls.codex}/responses`;
+    const body = Buffer.from(JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: false,
+      input: "hello",
+    }), "utf8");
+    const options = {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(body.length) },
+      body,
+    };
+
+    const first = await rawRequest(url, options);
+    const second = await rawRequest(url, options);
+    const third = await rawRequest(url, options);
+
+    expect([first.status, second.status, third.status]).toEqual([200, 200, 200]);
+    expect(JSON.parse(third.body.toString("utf8"))).toMatchObject({ id: "resp_default_stream" });
+    expect(receivedBodies.map((item) => item.stream)).toEqual([true, true, true]);
+  });
+
+  it("Responses 默认流式会从第一次起协商 text/event-stream", async () => {
+    let upstreamCalls = 0;
+    const receivedHeaders = [];
+    const receivedBodies = [];
+    const upstream = await listen((request, response) => {
+      const chunks = [];
+      receivedHeaders.push(request.headers);
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        receivedBodies.push(body);
+        upstreamCalls += 1;
+        if (body.stream !== true
+          || !String(request.headers.accept || "").toLowerCase().includes("text/event-stream")) {
+          response.writeHead(406, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: { type: "stream_accept_required" } }));
+          return;
+        }
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          "event: response.completed\n",
+          'data: {"type":"response.completed","response":{"id":"resp_accept","output":[]}}\n\n',
+          "data: [DONE]\n\n",
+        ].join(""));
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    });
+    await service.activateRoutes(profile);
+    const url = `${service.getPublicState().localBaseUrls.codex}/responses`;
+    const body = Buffer.from(JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: false,
+      input: "hello",
+    }), "utf8");
+    const options = {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "content-length": String(body.length),
+      },
+      body,
+    };
+
+    const first = await rawRequest(url, options);
+    const second = await rawRequest(url, options);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(JSON.parse(first.body.toString("utf8"))).toMatchObject({ id: "resp_accept" });
+    expect(JSON.parse(second.body.toString("utf8"))).toMatchObject({ id: "resp_accept" });
+    expect(receivedBodies.map((item) => item.stream)).toEqual([true, true]);
+    expect(receivedHeaders[0].accept).toContain("text/event-stream");
+    expect(receivedHeaders[1].accept).toContain("text/event-stream");
+  });
+
+  it("Responses 并发同步请求全部直接走流式，不发送 stream=false 探测", async () => {
+    const receivedBodies = [];
+    const upstream = await listen((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        receivedBodies.push(body);
+        if (body.stream !== true) {
+          response.writeHead(502, { "content-type": "application/json" });
+          response.end(JSON.stringify({
+            error: { message: "unexpected sync request", type: "upstream_error" },
+          }));
+          return;
+        }
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end([
+          "event: response.completed\n",
+          'data: {"type":"response.completed","response":{"id":"resp_concurrent","output":[]}}\n\n',
+          "data: [DONE]\n\n",
+        ].join(""));
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    });
+    await service.activateRoutes(profile);
+    const url = `${service.getPublicState().localBaseUrls.codex}/responses`;
+    const body = Buffer.from(JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: false,
+      input: "hello",
+    }), "utf8");
+    const options = {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(body.length) },
+      body,
+    };
+
+    const results = await Promise.all([
+      rawRequest(url, options),
+      rawRequest(url, options),
+      rawRequest(url, options),
+    ]);
+
+    expect(results.map((result) => result.status)).toEqual([200, 200, 200]);
+    expect(receivedBodies.filter((item) => item.stream === false)).toHaveLength(0);
+    expect(receivedBodies.filter((item) => item.stream === true)).toHaveLength(3);
+  });
+
+  it("Responses 默认流式仍能透传返回 JSON 的兼容上游", async () => {
+    let requestCount = 0;
+    const upstream = await listen((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        expect(body.stream).toBe(true);
+        requestCount += 1;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ id: `resp_json_${requestCount}`, output: [] }));
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    });
+    await service.activateRoutes(profile);
+    const url = `${service.getPublicState().localBaseUrls.codex}/responses`;
+    const body = Buffer.from(JSON.stringify({ model: "gpt-5.6-sol", stream: false }), "utf8");
+    const options = {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(body.length) },
+      body,
+    };
+
+    const results = await Promise.all([
+      rawRequest(url, options),
+      rawRequest(url, options),
+      rawRequest(url, options),
+    ]);
+
+    expect(results.map((result) => result.status)).toEqual([200, 200, 200]);
+    expect(results.map((result) => JSON.parse(result.body.toString("utf8")).id).sort())
+      .toEqual(["resp_json_1", "resp_json_2", "resp_json_3"]);
+    expect(requestCount).toBe(3);
+  });
+
+  it("Responses 默认流式的 SSE 空闲超时会结束请求并清除能力缓存", async () => {
+    let upstreamCalls = 0;
+    const upstream = await listen((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        upstreamCalls += 1;
+        if (body.stream !== true) {
+          response.writeHead(502, { "content-type": "application/json" });
+          response.end('{"error":{"type":"upstream_error"}}');
+          return;
+        }
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write(": waiting\n\n");
+      });
+      request.once("close", () => {
+        if (!response.writableEnded) response.destroy();
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    }, {
+      responsesFallbackIdleTimeoutMs: 50,
+      responsesFallbackTotalTimeoutMs: 1_000,
+    });
+    await service.activateRoutes(profile);
+    const url = `${service.getPublicState().localBaseUrls.codex}/responses`;
+    const body = Buffer.from(JSON.stringify({ model: "gpt-5.6-sol", stream: false }), "utf8");
+    const options = {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(body.length) },
+      body,
+    };
+
+    const timedOut = await Promise.race([
+      rawRequest(url, options),
+      new Promise((_resolve, reject) => setTimeout(
+        () => reject(new Error("fallback SSE idle timeout did not fire")),
+        1_000,
+      )),
+    ]);
+
+    expect(timedOut.status).toBe(502);
+    expect(timedOut.body.toString("utf8")).toContain("compatibility conversion failed");
+    expect(upstreamCalls).toBe(1);
+  });
+
+  it("Anthropic count_tokens 明确不受支持时返回保守计数并缓存端点能力", async () => {
+    let upstreamCalls = 0;
+    let received;
+    const upstream = await listen((request, response) => {
+      upstreamCalls += 1;
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        received = {
+          url: request.url,
+          headers: request.headers,
+          body: Buffer.concat(chunks),
+        };
+        response.writeHead(501, { "content-type": "application/json" });
+        response.end('{"type":"error","error":{"type":"not_supported"}}');
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      name: "Anthropic relay",
+      protocol: "anthropic",
+      authMode: "api-key",
+      baseUrl: upstream.baseUrl,
+      targets: ["claude"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "real-anthropic-key" },
+    }, { targets: ["claude"] });
+    await service.activateRoutes(profile, ["claude"]);
+    const token = await localCredential(service, profile, "claude");
+    const payload = Buffer.from(JSON.stringify({
+      model: "claude-test",
+      messages: [{ role: "user", content: "Count this tool definition" }],
+      tools: [{
+        name: "read_file",
+        description: "Read one file",
+        input_schema: { type: "object", properties: { path: { type: "string" } } },
+      }],
+    }), "utf8");
+    const url = `${service.getPublicState().localBaseUrls.claude}/v1/messages/count_tokens?beta=true`;
+    const options = {
+      method: "POST",
+      headers: {
+        "x-api-key": token,
+        "content-type": "application/json",
+        "content-length": String(payload.length),
+      },
+      body: payload,
+    };
+
+    const first = await rawRequest(url, options);
+    const second = await rawRequest(url, options);
+    expect(first.status).toBe(200);
+    expect(first.headers["x-agentgate-token-count"]).toBe("conservative-estimate");
+    expect(JSON.parse(first.body.toString("utf8"))).toEqual({
+      input_tokens: conservativeAnthropicInputTokens(payload),
+    });
+    expect(second.status).toBe(200);
+    expect(upstreamCalls).toBe(1);
+    expect(received.url).toBe("/v1/messages/count_tokens?beta=true");
+    expect(received.headers["x-api-key"]).toBe("real-anthropic-key");
+    expect(received.body).toEqual(payload);
+  });
+
+  it("Anthropic count_tokens 独立限制单请求和并发缓冲预算", async () => {
+    expect(ANTHROPIC_COUNT_BODY_LIMIT_BYTES).toBe(16 * 1024 * 1024);
+    expect(ANTHROPIC_COUNT_BODY_LIMIT_BYTES * ANTHROPIC_COUNT_BODY_SLOTS)
+      .toBe(32 * 1024 * 1024);
+
+    let upstreamCalls = 0;
+    const upstream = await listen((request, response) => {
+      upstreamCalls += 1;
+      request.resume();
+      request.once("end", () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end('{"input_tokens":12}');
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "anthropic",
+      authMode: "api-key",
+      baseUrl: upstream.baseUrl,
+      targets: ["claude"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "real-key" },
+    }, { targets: ["claude"] });
+    await service.activateRoutes(profile, ["claude"]);
+    const token = await localCredential(service, profile, "claude");
+    const body = Buffer.from(JSON.stringify({
+      model: "claude-test",
+      messages: [{ role: "user", content: "hello" }],
+    }));
+    const url = `${service.getPublicState().localBaseUrls.claude}/v1/messages/count_tokens`;
+    const options = {
+      method: "POST",
+      headers: { "x-api-key": token, "content-type": "application/json" },
+      body,
+    };
+
+    const releases = Array.from(
+      { length: ANTHROPIC_COUNT_BODY_SLOTS },
+      () => service._tryAcquireAnthropicCountBody(),
+    );
+    expect(releases.every((release) => typeof release === "function")).toBe(true);
+    expect(service._tryAcquireAnthropicCountBody()).toBeUndefined();
+
+    const saturated = await rawRequest(url, options);
+    expect(saturated.status).toBe(503);
+    expect(saturated.body.toString("utf8")).toContain("capacity is temporarily full");
+    expect(upstreamCalls).toBe(0);
+
+    releases.shift()();
+    const forwarded = await rawRequest(url, options);
+    expect(forwarded.status).toBe(200);
+    expect(JSON.parse(forwarded.body.toString("utf8"))).toEqual({ input_tokens: 12 });
+    expect(upstreamCalls).toBe(1);
+
+    for (const release of releases) release();
+    expect(service.anthropicCountBodyActive).toBe(0);
+  });
+
+  it("Anthropic count_tokens 原样透传临时故障、路由、鉴权和限流错误", async () => {
+    let status = 503;
+    let upstreamCalls = 0;
+    const upstream = await listen((request, response) => {
+      upstreamCalls += 1;
+      request.resume();
+      request.once("end", () => {
+        response.writeHead(status, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { type: `status_${status}` } }));
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "anthropic",
+      authMode: "api-key",
+      baseUrl: upstream.baseUrl,
+      targets: ["claude"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "real-key" },
+    }, { targets: ["claude"] });
+    await service.activateRoutes(profile, ["claude"]);
+    const token = await localCredential(service, profile, "claude");
+    const payload = Buffer.from(JSON.stringify({
+      model: "claude-test",
+      messages: [{ role: "user", content: "hello" }],
+    }));
+    const url = `${service.getPublicState().localBaseUrls.claude}/v1/messages/count_tokens`;
+    const options = {
+      method: "POST",
+      headers: { "x-api-key": token, "content-type": "application/json" },
+      body: payload,
+    };
+
+    const failureStatuses = [503, 503, 503, 503, 404, 405, 401, 403, 429, 500];
+    for (const failureStatus of failureStatuses) {
+      status = failureStatus;
+      const result = await rawRequest(url, options);
+      expect(result.status).toBe(failureStatus);
+      expect(JSON.parse(result.body.toString("utf8"))).toEqual({
+        error: { type: `status_${failureStatus}` },
+      });
+    }
+    expect(upstreamCalls).toBe(failureStatuses.length);
+    expect(service.anthropicCountFallbacks.size).toBe(0);
+  });
+
+  it("Anthropic count_tokens 不把通用 upstream_error 400 视为不支持", async () => {
+    let upstreamError = true;
+    let upstreamCalls = 0;
+    const upstream = await listen((request, response) => {
+      upstreamCalls += 1;
+      request.resume();
+      request.once("end", () => {
+        const body = upstreamError
+          ? '{"error":{"message":"Upstream request failed","type":"upstream_error"},"type":"error"}'
+          : '{"error":{"message":"invalid model","type":"invalid_request_error"},"type":"error"}';
+        response.writeHead(400, {
+          "content-type": "application/json; charset=utf-8",
+          "content-length": String(Buffer.byteLength(body)),
+        });
+        response.end(body);
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "anthropic",
+      authMode: "api-key",
+      baseUrl: upstream.baseUrl,
+      targets: ["claude"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "real-key" },
+    }, { targets: ["claude"] });
+    await service.activateRoutes(profile, ["claude"]);
+    const token = await localCredential(service, profile, "claude");
+    const payload = Buffer.from(JSON.stringify({
+      model: "claude-test",
+      messages: [{ role: "user", content: "hello" }],
+    }));
+    const options = {
+      method: "POST",
+      headers: { "x-api-key": token, "content-type": "application/json" },
+      body: payload,
+    };
+    const url = `${service.getPublicState().localBaseUrls.claude}/v1/messages/count_tokens`;
+
+    const genericError = await rawRequest(url, options);
+    expect(genericError.status).toBe(400);
+    expect(JSON.parse(genericError.body.toString("utf8"))).toEqual({
+      error: { message: "Upstream request failed", type: "upstream_error" },
+      type: "error",
+    });
+
+    upstreamError = false;
+    const invalid = await rawRequest(url, options);
+    expect(invalid.status).toBe(400);
+    expect(JSON.parse(invalid.body.toString("utf8"))).toEqual({
+      error: { message: "invalid model", type: "invalid_request_error" },
+      type: "error",
+    });
+    expect(upstreamCalls).toBe(2);
+    expect(service.anthropicCountFallbacks.size).toBe(0);
+  });
+
+  it("Anthropic count_tokens 不为媒体输入或其他协议伪造计数", async () => {
+    const upstream = await listen((request, response) => {
+      request.resume();
+      request.once("end", () => {
+        response.writeHead(501, { "content-type": "application/json" });
+        response.end('{"error":"unsupported"}');
+      });
+    });
+    const mediaProfile = {
+      id: PROFILE_A,
+      protocol: "anthropic",
+      authMode: "api-key",
+      baseUrl: upstream.baseUrl,
+      targets: ["claude"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile: mediaProfile, apiKey: "real-key" },
+    }, { targets: ["claude"] });
+    await service.activateRoutes(mediaProfile, ["claude"]);
+    const token = await localCredential(service, mediaProfile, "claude");
+    const url = `${service.getPublicState().localBaseUrls.claude}/v1/messages/count_tokens`;
+    const body = Buffer.from(JSON.stringify({
+      model: "claude-test",
+      messages: [{
+        role: "user",
+        content: [{ type: "document", source: { type: "url", url: "https://example.test/a.pdf" } }],
+      }],
+    }));
+
+    expect((await rawRequest(url, {
+      method: "POST",
+      headers: { "x-api-key": token, "content-type": "application/json" },
+      body,
+    })).status).toBe(501);
+
+    mediaProfile.protocol = "openai-chat";
+    await service.refreshProfile(mediaProfile.id);
+    expect((await rawRequest(url, {
+      method: "POST",
+      headers: { "x-api-key": token, "content-type": "application/json" },
+      body: Buffer.from(JSON.stringify({
+        model: "claude-test",
+        messages: [{ role: "user", content: "plain text" }],
+      })),
+    })).status).toBe(501);
+  });
+
   it("转发期间豁免本地 socket 空闲计时，响应收尾后恢复", async () => {
     // 真实事故：推理长静默期间 SSE 上下行都没有字节，五分钟空闲回收
     // 把活跃请求掐断，客户端报 stream disconnected（直连不受影响）。
@@ -620,9 +1473,11 @@ describe("GatewayService", () => {
     ]);
     const upstreamSse = [
       'event: response.output_item.added\n',
-      'data: {"type":"response.output_item.added","item":{"id":"item_1","type":"function_call","name":"exec","call_id":"call_1","arguments":"{\\"input\\":\\"Get-Date\\"}"}}\n\n',
+      'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","name":"exec","call_id":"call_1","arguments":"{\\"input\\":\\"Get-Date\\"}"}}\n\n',
       'event: response.output_item.done\n',
-      'data: {"type":"response.output_item.done","item":{"id":"item_1","type":"function_call","name":"exec","call_id":"call_1","arguments":"{\\"input\\":\\"Get-Date\\"}"}}\n\n',
+      'data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","name":"exec","call_id":"call_1","arguments":"{\\"input\\":\\"Get-Date\\"}"}}\n\n',
+      'event: response.completed\n',
+      'data: {"type":"response.completed","response":{"id":"resp_tools","output":[{"id":"fc_1","type":"function_call","name":"exec","call_id":"call_1","arguments":"{\\"input\\":\\"Get-Date\\"}"}]}}\n\n',
       'data: [DONE]\n\n',
     ].join("");
     const upstream = await listen((request, response) => {
@@ -670,6 +1525,7 @@ describe("GatewayService", () => {
     expect(Number(received[1].headers["content-length"])).toBe(received[1].body.length);
     expect(bridged.body.toString("utf8")).toContain('"type":"custom_tool_call"');
     expect(bridged.body.toString("utf8")).toContain('"input":"Get-Date"');
+    expect(bridged.body.toString("utf8")).not.toContain('"id":"fc_1"');
 
     const failed = await within(rawRequest(url, {
       method: "POST",
@@ -679,6 +1535,184 @@ describe("GatewayService", () => {
     expect(failed.status).toBe(502);
     expect(failed.body.toString("utf8")).toBe("Responses tool bridge request conversion failed");
     expect(received).toHaveLength(2);
+  });
+
+  it("实验工具桥反向转换非流式 Responses JSON", async () => {
+    let received;
+    const upstream = await listen((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        received = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const body = JSON.stringify({
+          output: [{
+            id: "fc_1",
+            type: "function_call",
+            name: "exec",
+            call_id: "call_1",
+            arguments: '{"input":"Get-Date"}',
+          }],
+        });
+        response.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(body)),
+          etag: '"upstream"',
+          digest: "sha-256=:invalid-after-transform:",
+          "content-md5": "invalid-after-transform",
+        });
+        response.end(body);
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    });
+    await service.activateRoutes(profile);
+    service.setExperimentalToolBridgeEnabled(true);
+    const payload = Buffer.from(JSON.stringify({
+      stream: false,
+      tools: [{ type: "custom", name: "exec" }],
+      input: [],
+    }), "utf8");
+
+    const response = await rawRequest(
+      `${service.getPublicState().localBaseUrls.codex}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "content-length": String(payload.length) },
+        body: payload,
+      },
+    );
+
+    expect(received.tools[0]).toMatchObject({ type: "function", name: "exec" });
+    expect(JSON.parse(response.body.toString("utf8")).output[0]).toMatchObject({
+      type: "custom_tool_call",
+      name: "exec",
+      call_id: "call_1",
+      input: "Get-Date",
+    });
+    expect(JSON.parse(response.body.toString("utf8")).output[0].id).toBeUndefined();
+    expect(response.headers["content-length"]).toBeUndefined();
+    expect(response.headers.etag).toBeUndefined();
+    expect(response.headers.digest).toBeUndefined();
+    expect(response.headers["content-md5"]).toBeUndefined();
+  });
+
+  it("工具桥转换或 content-encoding 校验失败时监控记为 failed", async () => {
+    const monitor = {
+      start: vi.fn()
+        .mockReturnValueOnce("invalid-json-tool")
+        .mockReturnValueOnce("encoded-json"),
+      responseStarted: vi.fn(),
+      observeChunk: vi.fn(),
+      updateMetadata: vi.fn(),
+      end: vi.fn(),
+      clear: vi.fn(),
+    };
+    const upstream = await listen((request, response) => {
+      request.resume();
+      request.once("end", () => {
+        const encoded = new URL(request.url, upstream.baseUrl).searchParams.has("encoded");
+        response.writeHead(200, {
+          "content-type": "application/json",
+          ...(encoded ? { "content-encoding": "gzip" } : {}),
+        });
+        response.end(JSON.stringify({
+          output: [{
+            type: "function_call",
+            name: "exec",
+            call_id: "call_1",
+            arguments: encoded ? '{"input":"ok"}' : '{"command":"invalid"}',
+          }],
+        }));
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    }, { requestMonitor: monitor });
+    await service.activateRoutes(profile);
+    service.setExperimentalToolBridgeEnabled(true);
+    const payload = Buffer.from(JSON.stringify({
+      stream: false,
+      tools: [{ type: "custom", name: "exec" }],
+      input: [],
+    }));
+    const url = `${service.getPublicState().localBaseUrls.codex}/responses`;
+
+    expect((await rawRequest(url, { method: "POST", body: payload })).status).toBe(502);
+    expect((await rawRequest(`${url}?encoded=1`, { method: "POST", body: payload })).status).toBe(502);
+    expect(monitor.end).toHaveBeenCalledWith("invalid-json-tool", { outcome: "failed" });
+    expect(monitor.end).toHaveBeenCalledWith("encoded-json", { outcome: "failed" });
+  });
+
+  it("工具桥 TTFC 以实际转发的首个可见文本为准", async () => {
+    let now = 1_000;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const upstream = await listen((request, response) => {
+      request.resume();
+      request.once("end", () => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write([
+          'event: response.output_item.added\n',
+          'data: {"item":{"id":"item_1","call_id":"call_1","type":"function_call","name":"exec","arguments":""}}\n\n',
+          'event: response.function_call_arguments.delta\n',
+          'data: {"call_id":"call_1","delta":"{\\"input\\":\\"Get-Date\\"}"}\n\n',
+        ].join(""));
+        setImmediate(() => {
+          now = 1_050;
+          response.end([
+            'event: response.function_call_arguments.done\n',
+            'data: {"call_id":"call_1","arguments":"{\\"input\\":\\"Get-Date\\"}"}\n\n',
+            'event: response.output_item.done\n',
+            'data: {"item":{"id":"item_1","call_id":"call_1","type":"function_call","name":"exec","arguments":"{\\"input\\":\\"Get-Date\\"}"}}\n\n',
+            'event: response.output_text.delta\n',
+            'data: {"type":"response.output_text.delta","delta":"完成"}\n\n',
+          ].join(""));
+        });
+      });
+    });
+    const profile = {
+      id: PROFILE_A,
+      name: "TTFT",
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: `${upstream.baseUrl}/v1`,
+      targets: ["codex"],
+    };
+    const { service } = await createGateway({
+      [PROFILE_A]: { profile, apiKey: "upstream-secret" },
+    }, { requestMonitor: monitor });
+    await service.activateRoutes(profile);
+    service.setExperimentalToolBridgeEnabled(true);
+    const payload = Buffer.from(JSON.stringify({
+      stream: true,
+      tools: [{ type: "custom", name: "exec" }],
+      input: [],
+    }));
+
+    const response = await rawRequest(`${service.getPublicState().localBaseUrls.codex}/responses`, {
+      method: "POST",
+      body: payload,
+    });
+
+    expect(response.body.toString("utf8")).toContain("response.custom_tool_call_input.delta");
+    expect(monitor.list()[0]).toMatchObject({
+      firstTokenLatencyMs: 50,
+      outcome: "completed",
+    });
   });
 
   it("热切换和回滚只替换持久化 profileId 路由", async () => {
@@ -737,6 +1771,50 @@ describe("GatewayService", () => {
 
     await service.activateRoutes(profileB);
     expect([...service.connectionCache.keys()]).toEqual([PROFILE_B]);
+  });
+
+  it("未 engaged 的方案不会回填明文缓存，加载竞态结束时再次校验", async () => {
+    const profile = {
+      id: PROFILE_A,
+      protocol: "openai-responses",
+      authMode: "bearer",
+      baseUrl: "http://127.0.0.1:1",
+      targets: ["codex"],
+    };
+    let blockConnection = false;
+    let releaseConnection;
+    let connectionStarted;
+    const gate = new Promise((resolve) => { releaseConnection = resolve; });
+    const started = new Promise((resolve) => { connectionStarted = resolve; });
+    const getConnection = vi.fn(async () => {
+      if (blockConnection) {
+        connectionStarted();
+        await gate;
+      }
+      return { profile, apiKey: "key-a" };
+    });
+    const service = new GatewayService({
+      profileService: { getConnection },
+      store: memoryStore(),
+      vault,
+    });
+    activeServices.add(service);
+    await service.start({ port: 0, targets: [] });
+    await service.assignRoutes(profile, ["codex"]);
+    expect(service.connectionCache.size).toBe(0);
+
+    getConnection.mockClear();
+    await service.refreshProfile(PROFILE_A);
+    expect(getConnection).not.toHaveBeenCalled();
+    await service.setEngagedTargets(["codex"]);
+    blockConnection = true;
+    const loading = service._connection(PROFILE_A);
+    await started;
+    await service.setEngagedTargets([]);
+    releaseConnection();
+
+    await expect(loading).rejects.toThrow(/route changed/);
+    expect(service.connectionCache.size).toBe(0);
   });
 
   it("运行中放掉一个客户端：保留它的方案分配，但立即驱逐明文连接缓存", async () => {

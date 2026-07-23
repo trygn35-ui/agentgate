@@ -87,15 +87,37 @@ with sync_playwright() as playwright:
     page.locator(".hero h1").wait_for()
     assert page.locator(".socket-card").count() == 4
     assert page.locator(".meter").count() == 1  # DIVERGENCE METER
+    assert "0.529341" in page.locator(".meter-cell").nth(1).inner_text()
+    assert "RESET 00:00" in page.locator(".meter-cell").nth(1).inner_text()
 
     # 密钥页：三个方案行，展开首行
     page.get_by_role("button", name="KEYS", exact=True).click()
     page.get_by_role("heading", name="Attractor Fields", exact=True).wait_for()
     assert page.locator(".keyring-row").count() == 3
+    assert "1.25B" in page.locator(".keyring-row").first.inner_text()
+    key_columns = page.evaluate(
+        """
+        () => [...document.querySelectorAll('.keyring-head')].map(head => [
+          ...head.querySelectorAll('.keyring-usage, .health-bars, .keyring-stat, .keyring-tools'),
+        ].map(node => Math.round(node.getBoundingClientRect().left)))
+        """
+    )
+    assert len({tuple(column) for column in key_columns}) == 1, key_columns
+    page.screenshot(path=str(OUTPUT_DIR / "keyring-1280x800.png"), full_page=False)
+    page.set_viewport_size({"width": 1000, "height": 620})
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => document.body.scrollWidth === innerWidth")
+    page.screenshot(path=str(OUTPUT_DIR / "keyring-1000x620.png"), full_page=False)
     page.locator(".keyring-head").first.click()
     page.locator(".keyring-expand.open").wait_for()
+    page.wait_for_timeout(350)
+    assert page.evaluate(
+        "() => [...document.querySelectorAll('.keyring-actions')].every(node => node.scrollWidth <= node.clientWidth)"
+    )
+    page.screenshot(path=str(OUTPUT_DIR / "keyring-expanded-1000x620.png"), full_page=False)
     page.keyboard.press("Escape")
     assert page.locator(".keyring-expand.open").count() == 0
+    page.set_viewport_size({"width": 1280, "height": 800})
 
     # 新建方案弹窗开合
     page.get_by_role("button", name="NEW", exact=True).first.click()
@@ -107,9 +129,54 @@ with sync_playwright() as playwright:
     page.get_by_role("button", name="STREAM").click()
     page.get_by_role("heading", name="Stream", exact=True).wait_for()
     assert page.locator(".request-row").count() == 3
+    assert "LAST 3 DAYS" in page.locator(".head-note").inner_text()
+    page.get_by_role("radio", name="DONE", exact=True).click()
+    assert page.locator(".request-row .tint-complete").count() == 2
+    page.screenshot(path=str(OUTPUT_DIR / "activity-complete-1280x800.png"), full_page=False)
     page.get_by_role("radio", name="FAIL", exact=True).click()
     assert page.locator(".request-row").count() == 1
     page.get_by_role("radio", name="ALL", exact=True).click()
+
+    # 会话：默认保留更新时间和 ID 尾号，选中后才计算消息数且时间不消失
+    page.get_by_role("button", name="Sessions", exact=True).click()
+    page.locator(".sessions-page").wait_for()
+    first_session = page.locator(".index-item").first
+    assert "f784efa6" in first_session.locator(".index-main code").inner_text()
+    assert first_session.locator(".index-count .rolling").count() == 0
+    first_session.click()
+    first_session.locator(".index-count .rolling").wait_for()
+    assert first_session.locator(".index-when").is_visible()
+    session_columns = page.evaluate(
+        """
+        () => [...document.querySelectorAll('.index-item')].map(item => ({
+          side: Math.round(item.querySelector('.index-side').getBoundingClientRect().left),
+          when: Math.round(item.querySelector('.index-when').getBoundingClientRect().right),
+          total: Math.round(item.querySelector('.index-message-total').getBoundingClientRect().left),
+        }))
+        """
+    )
+    assert len({row["side"] for row in session_columns}) == 1, session_columns
+    assert len({row["when"] for row in session_columns}) == 1, session_columns
+    assert len({row["total"] for row in session_columns}) == 1, session_columns
+    page.screenshot(path=str(OUTPUT_DIR / "sessions-selected-1280x800.png"), full_page=False)
+    page.set_viewport_size({"width": 1000, "height": 620})
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => document.body.scrollWidth === innerWidth")
+    session_shell = page.evaluate(
+        """
+        () => ({
+          topbarRight: Math.round(document.querySelector('.topbar').getBoundingClientRect().right),
+          portRight: Math.round(document.querySelector('.port-chip').getBoundingClientRect().right),
+          footerRight: Math.round(document.querySelector('.status-footer').getBoundingClientRect().right),
+          viewportRight: innerWidth,
+        })
+        """
+    )
+    assert session_shell["topbarRight"] == session_shell["viewportRight"], session_shell
+    assert session_shell["portRight"] <= session_shell["viewportRight"], session_shell
+    assert session_shell["footerRight"] == session_shell["viewportRight"], session_shell
+    page.screenshot(path=str(OUTPUT_DIR / "sessions-selected-1000x620.png"), full_page=False)
+    page.set_viewport_size({"width": 1280, "height": 800})
 
     # 设置
     page.get_by_role("button", name="CONFIG", exact=True).click()

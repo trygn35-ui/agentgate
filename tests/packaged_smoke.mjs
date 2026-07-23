@@ -123,7 +123,7 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 100))
     if (attempt === 39) throw new Error('Packaged Keydeck UI did not become ready')
   }
-  await client.evaluate("window.keydeck.updateSettings({ theme: 'dark', experimentalToolBridge: false })")
+  await client.evaluate("window.agentgate.updateSettings({ theme: 'dark', experimentalToolBridge: false })")
 
   const common = {
     protocol: 'openai-responses',
@@ -138,9 +138,9 @@ try {
   const inputA = { ...common, name: '打包方案 A', baseUrl: urlA, endpoints: [{ url: urlA }], apiKey: secretA }
   const inputB = { ...common, name: '打包方案 B', baseUrl: urlB, endpoints: [{ url: urlB }], apiKey: secretB }
   const created = await client.evaluate(`(async () => {
-    const profileA = await window.keydeck.saveProfile(${JSON.stringify(inputA)});
-    const profileB = await window.keydeck.saveProfile(${JSON.stringify(inputB)});
-    const assigned = await window.keydeck.applyProfile(profileA.id, ['codex']);
+    const profileA = await window.agentgate.saveProfile(${JSON.stringify(inputA)});
+    const profileB = await window.agentgate.saveProfile(${JSON.stringify(inputB)});
+    const assigned = await window.agentgate.applyProfile(profileA.id, ['codex']);
     return { profileA, profileB, assigned };
   })()`)
   const publicResult = JSON.stringify(created)
@@ -150,7 +150,7 @@ try {
   if (created.assigned.gateway.status !== 'stopped') throw new Error('Route staging started the gateway')
   if (await fs.readFile(codexConfig, 'utf8') !== original) throw new Error('Staging changed Codex config')
 
-  await client.evaluate(`window.keydeck.startGateway({ port: ${gatewayPort} })`)
+  await client.evaluate(`window.agentgate.startGateway({ port: ${gatewayPort} })`)
   const takenOver = await fs.readFile(codexConfig, 'utf8')
   const parsed = TOML.parse(takenOver)
   const provider = parsed.model_providers.custom
@@ -174,7 +174,7 @@ try {
   const runtimeEdit = takenOver.replace('[features]', 'runtime_added = true\n\n[features]')
   await fs.writeFile(codexConfig, runtimeEdit, 'utf8')
   const beforeHotSwitch = await fs.readFile(codexConfig)
-  await client.evaluate(`window.keydeck.applyProfile(${JSON.stringify(created.profileB.id)}, ['codex'])`)
+  await client.evaluate(`window.agentgate.applyProfile(${JSON.stringify(created.profileB.id)}, ['codex'])`)
   const afterHotSwitch = await fs.readFile(codexConfig)
   if (!beforeHotSwitch.equals(afterHotSwitch)) throw new Error('Hot switch rewrote Codex config')
   if ((await gatewayRequest(localBaseUrl)).route !== 'b') throw new Error('Hot gateway route failed')
@@ -186,7 +186,7 @@ try {
     throw new Error('Recovery store contains plaintext Codex config')
   }
 
-  const stopped = await client.evaluate('window.keydeck.stopGateway()')
+  const stopped = await client.evaluate('window.agentgate.stopGateway()')
   if (stopped.gateway.status !== 'stopped') throw new Error('Gateway did not stop')
   const restored = TOML.parse(await fs.readFile(codexConfig, 'utf8'))
   if (restored.model_provider !== 'custom'

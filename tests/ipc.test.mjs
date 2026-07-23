@@ -26,6 +26,7 @@ function createHarness({ gatewayRoutes = [], gatewayStatus, ...overrides } = {})
       },
     },
     clipboard: { writeText: vi.fn() },
+    isTrustedSender: vi.fn(() => true),
     profileService: {
       list: vi.fn().mockResolvedValue([profile]),
       save: vi.fn().mockImplementation(async (input) => {
@@ -43,6 +44,7 @@ function createHarness({ gatewayRoutes = [], gatewayStatus, ...overrides } = {})
         trace.push("test");
         return { ...profile, availableModels: ["gpt-test"] };
       }),
+      discoverDraftModels: vi.fn().mockResolvedValue(["gpt-draft"]),
       testHealth: vi.fn().mockImplementation(async () => ({
         ...profile,
         endpoints: profile.endpoints.map((endpoint) => ({
@@ -115,6 +117,17 @@ function saveInput(profile, overrides = {}) {
 }
 
 describe("IPC bootstrap", () => {
+  it("在调用任何 service 前拒绝不可信的渲染进程", async () => {
+    const isTrustedSender = vi.fn(() => false);
+    const { handlers, dependencies } = createHarness({ isTrustedSender });
+    const event = { senderFrame: { url: "https://attacker.example" } };
+
+    await expect(handlers.get(CHANNELS.bootstrap)(event)).rejects.toThrow("Unauthorized IPC sender");
+    expect(isTrustedSender).toHaveBeenCalledWith(event);
+    expect(dependencies.profileService.list).not.toHaveBeenCalled();
+    expect(dependencies.clientService.scan).not.toHaveBeenCalled();
+  });
+
   it("网关状态的每个字段都要透传给渲染进程，一个都不能漏", async () => {
     /*
      * 真实事故：getBootstrap 原本逐字段手抄 getPublicState()，给网关状态新增
@@ -139,6 +152,87 @@ describe("IPC bootstrap", () => {
 
     const missing = expectedKeys.filter((key) => !actualKeys.includes(key));
     expect(missing, `getBootstrap 漏传了网关字段：${missing.join(", ")}`).toEqual([]);
+  });
+
+  it("请求监控 bootstrap 透传完整快照和 revision", async () => {
+    const activeRequests = [{
+      id: "request-1",
+      client: "codex",
+      profileName: "方案",
+      upstreamUrl: "https://api.example.com/v1",
+      state: "completed",
+      startedAt: "2026-07-14T10:00:00.000Z",
+    }];
+    const requestMonitor = {
+      getActiveRequestsSnapshot: vi.fn(() => ({
+        activeRequests,
+        activeRequestsRevision: 17,
+      })),
+    };
+    const { handlers } = createHarness({ requestMonitor });
+
+    await expect(handlers.get(CHANNELS.bootstrap)()).resolves.toMatchObject({
+      activeRequests,
+      activeRequestsRevision: 17,
+    });
+    expect(requestMonitor.getActiveRequestsSnapshot).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("IPC sessions", () => {
+  it("会话扫描把部分结果和逐客户端错误一起返回", async () => {
+    const result = {
+      sessions: [{ id: "codex:ok", client: "codex", nativeId: "ok" }],
+      errors: [{ client: "claude", reason: "permission denied" }],
+    };
+    const sessionService = { listDetailed: vi.fn().mockResolvedValue(result) };
+    const { handlers } = createHarness({ sessionService });
+
+    await expect(handlers.get(CHANNELS.listSessions)(null)).resolves.toEqual(result);
+    expect(sessionService.listDetailed).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("IPC shutdown gate", () => {
+  it("退出屏障期间拒绝写入，但允许只读快照和删除预演", async () => {
+    const isShuttingDown = vi.fn(() => true);
+    const { handlers, profile, dependencies } = createHarness({ isShuttingDown });
+
+    await expect(handlers.get(CHANNELS.saveProfile)(null, saveInput(profile)))
+      .rejects.toThrow("Application is shutting down");
+    await expect(handlers.get(CHANNELS.bootstrap)(null)).resolves.toBeDefined();
+    await expect(handlers.get(CHANNELS.planSessionRemoval)(null, ["codex:session"]))
+      .resolves.toEqual([]);
+    expect(dependencies.profileService.save).not.toHaveBeenCalled();
+  });
+
+  it("清理失败后闸门可恢复接受写入", async () => {
+    let shuttingDown = true;
+    const { handlers, profile, dependencies } = createHarness({
+      isShuttingDown: () => shuttingDown,
+    });
+    await expect(handlers.get(CHANNELS.saveProfile)(null, saveInput(profile)))
+      .rejects.toThrow("Application is shutting down");
+    shuttingDown = false;
+    await expect(handlers.get(CHANNELS.saveProfile)(null, saveInput(profile))).resolves.toBeDefined();
+    expect(dependencies.profileService.save).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("IPC update install", () => {
+  it("只在安装包已下载完成时请求退出安装", async () => {
+    const requestUpdateInstall = vi.fn();
+    const updateService = {
+      getPublicState: vi.fn(() => ({ state: "available", portable: false })),
+    };
+    const { handlers } = createHarness({ updateService, requestUpdateInstall });
+
+    await expect(handlers.get(CHANNELS.installUpdate)(null)).rejects.toThrow("not ready");
+    expect(requestUpdateInstall).not.toHaveBeenCalled();
+
+    updateService.getPublicState.mockReturnValue({ state: "ready", portable: false });
+    await expect(handlers.get(CHANNELS.installUpdate)(null)).resolves.toEqual({ ok: true });
+    expect(requestUpdateInstall).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -267,6 +361,19 @@ describe("IPC gateway coordination", () => {
     await expect(handlers.get(CHANNELS.testProfile)(null, profile.id))
       .resolves.toBeDefined();
     expect(dependencies.healthService.test).toHaveBeenCalledWith(profile.id);
+  });
+
+  it("草稿模型识别使用当前表单参数且不保存方案", async () => {
+    const { handlers, profile, dependencies } = createHarness();
+    const input = saveInput(profile, {
+      baseUrl: "https://draft.example/v1",
+      endpoints: [{ url: "https://draft.example/v1" }],
+    });
+
+    await expect(handlers.get(CHANNELS.testProfileDraft)(null, input))
+      .resolves.toEqual(["gpt-draft"]);
+    expect(dependencies.healthService.discoverDraftModels).toHaveBeenCalledWith(input);
+    expect(dependencies.profileService.save).not.toHaveBeenCalled();
   });
 
   it("端点检测使用无凭据健康探测且不触发模型识别", async () => {

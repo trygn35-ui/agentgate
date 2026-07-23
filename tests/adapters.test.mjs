@@ -91,6 +91,609 @@ describe("client adapters", () => {
     expect(parsed.env.ENABLE_TOOL_SEARCH).toBe("true");
   });
 
+  it("patches Claude VS Code launch variables and disables the redundant login prompt", async () => {
+    const vscodeConfig = path.join(root, "Code", "User", "settings.json");
+    await seed(vscodeConfig, `{
+  "claudeCode.environmentVariables": [
+    // Preserve this unrelated entry comment.
+    { "name": "KEEP_ME", "value": "yes" },
+    { "name": "ANTHROPIC_BASE_URL", "value": "http://127.0.0.1:8090/anthropic" },
+    { "name": "ANTHROPIC_API_KEY", "value": "stale-api-key" },
+    { "name": "ANTHROPIC_AUTH_TOKEN", "value": "stale-auth-token" },
+    { "name": "ANTHROPIC_MODEL", "value": "stale-model" }
+  ],
+  "claudeCode.disableLoginPrompt": false,
+  "workbench.colorTheme": "Keep Theme"
+}\n`);
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, vscodeConfig },
+    }).claude;
+    const profile = {
+      ...baseProfile,
+      baseUrl: "http://127.0.0.1:17863/claude",
+      model: "claude-sonnet-4-5",
+    };
+
+    const drafts = await adapter.build(profile, "gateway-secret", { gateway: true });
+    const vscodeDraft = drafts.find((draft) => draft.path === vscodeConfig);
+    const vscode = parse(vscodeDraft.content);
+    const env = Object.fromEntries(vscode["claudeCode.environmentVariables"]
+      .map((entry) => [entry.name, entry.value]));
+
+    expect(env.KEEP_ME).toBe("yes");
+    expect(env.ANTHROPIC_BASE_URL).toBe(profile.baseUrl);
+    expect(env.ANTHROPIC_API_KEY).toBe("");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("gateway-secret");
+    expect(env.ANTHROPIC_MODEL).toBe(profile.model);
+    expect(env.ENABLE_TOOL_SEARCH).toBe("");
+    expect(vscode["claudeCode.disableLoginPrompt"]).toBe(true);
+    expect(vscode["workbench.colorTheme"]).toBe("Keep Theme");
+    expect(vscodeDraft.content).toContain("// Preserve this unrelated entry comment.");
+
+    const apiKeyDrafts = await adapter.build(
+      { ...profile, authMode: "api-key" },
+      "api-key-secret",
+      { gateway: true },
+    );
+    const apiKeyVsCode = parse(apiKeyDrafts
+      .find((draft) => draft.path === vscodeConfig).content);
+    const apiKeyEnv = Object.fromEntries(apiKeyVsCode["claudeCode.environmentVariables"]
+      .map((entry) => [entry.name, entry.value]));
+    expect(apiKeyEnv.ANTHROPIC_API_KEY).toBe("api-key-secret");
+    expect(apiKeyEnv.ANTHROPIC_AUTH_TOKEN).toBe("");
+  });
+
+  it("preserves the VS Code model when the Claude profile does not specify one", async () => {
+    const vscodeConfig = path.join(root, "Code", "User", "settings.json");
+    await seed(vscodeConfig, JSON.stringify({
+      "claudeCode.environmentVariables": [
+        { name: "ANTHROPIC_MODEL", value: "existing-model" },
+      ],
+    }));
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, vscodeConfig },
+    }).claude;
+
+    const drafts = await adapter.build(baseProfile, "gateway-secret", { gateway: true });
+    const vscode = parse(drafts.find((draft) => draft.path === vscodeConfig).content);
+    const env = Object.fromEntries(vscode["claudeCode.environmentVariables"]
+      .map((entry) => [entry.name, entry.value]));
+
+    expect(env.ANTHROPIC_MODEL).toBe("existing-model");
+  });
+
+  it("restores Claude VS Code launch variables without erasing runtime additions", async () => {
+    const vscodeConfig = path.join(root, "Code", "User", "settings.json");
+    await seed(vscodeConfig, `{
+  "claudeCode.environmentVariables": [
+    { "name": "KEEP_ME", "value": "yes" },
+    { "name": "ANTHROPIC_BASE_URL", "value": "https://before.example" },
+    { "name": "ANTHROPIC_API_KEY", "value": "before-api-key" },
+    { "name": "ANTHROPIC_MODEL", "value": "before-model" }
+  ],
+  "claudeCode.disableLoginPrompt": false
+}\n`);
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, vscodeConfig },
+    }).claude;
+    const baseline = await adapter.captureManagedState();
+    await writeDrafts(await adapter.build({
+      ...baseProfile,
+      baseUrl: "http://127.0.0.1:17863/claude",
+      model: "gateway-model",
+    }, "gateway-secret", { gateway: true }));
+
+    const during = parse(await fs.readFile(vscodeConfig, "utf8"));
+    during["claudeCode.environmentVariables"].push({ name: "RUNTIME_KEEP", value: "added" });
+    during["editor.fontSize"] = 15;
+    await fs.writeFile(vscodeConfig, `${JSON.stringify(during, null, 2)}\n`, "utf8");
+    await writeDrafts(await adapter.buildRestore(baseline));
+
+    const restored = parse(await fs.readFile(vscodeConfig, "utf8"));
+    const env = Object.fromEntries(restored["claudeCode.environmentVariables"]
+      .map((entry) => [entry.name, entry.value]));
+    expect(env.KEEP_ME).toBe("yes");
+    expect(env.RUNTIME_KEEP).toBe("added");
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://before.example");
+    expect(env.ANTHROPIC_API_KEY).toBe("before-api-key");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.ANTHROPIC_MODEL).toBe("before-model");
+    expect(restored["claudeCode.disableLoginPrompt"]).toBe(false);
+    expect(restored["editor.fontSize"]).toBe(15);
+  });
+
+  it("ignores newly managed VS Code fields when recovering an older gateway baseline", async () => {
+    const vscodeConfig = path.join(root, "Code", "User", "settings.json");
+    const profile = {
+      ...baseProfile,
+      baseUrl: "http://127.0.0.1:17863/claude",
+      model: "gateway-model",
+    };
+    await seed(paths.claude.config, JSON.stringify({
+      env: {
+        ANTHROPIC_BASE_URL: profile.baseUrl,
+        ANTHROPIC_AUTH_TOKEN: "gateway-secret",
+        ANTHROPIC_MODEL: profile.model,
+      },
+    }));
+    await seed(vscodeConfig, JSON.stringify({
+      "claudeCode.environmentVariables": [
+        { name: "ANTHROPIC_BASE_URL", value: "http://127.0.0.1:8090/anthropic" },
+      ],
+    }));
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, vscodeConfig },
+    }).claude;
+    const oldBaseline = {
+      baseUrl: { present: false, value: null },
+      apiKey: { present: false, value: null },
+      authToken: { present: false, value: null },
+      model: { present: false, value: null },
+      toolSearch: { present: false, value: null },
+    };
+
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline: oldBaseline },
+    )).toBe(GATEWAY_OWNERSHIP.OWNED);
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      {
+        gateway: true,
+        baseline: {
+          ...oldBaseline,
+          vscodeEnvironmentVariables: { present: true, value: null },
+          vscodeBaseUrl: { present: false, value: null },
+        },
+      },
+    )).toBe(GATEWAY_OWNERSHIP.CONFLICT);
+
+    const oldBaselineDrafts = await adapter.build(
+      profile,
+      "gateway-secret",
+      { gateway: true, baseline: oldBaseline },
+    );
+    expect(oldBaselineDrafts.map((draft) => draft.path)).toEqual([paths.claude.config]);
+  });
+
+  it("reports a conflict while only VS Code still selects the Claude gateway", async () => {
+    const vscodeConfig = path.join(root, "Code", "User", "settings.json");
+    const profile = {
+      ...baseProfile,
+      baseUrl: "http://127.0.0.1:17863/claude",
+      model: "gateway-model",
+    };
+    await seed(paths.claude.config, JSON.stringify({
+      env: {
+        ANTHROPIC_BASE_URL: "https://changed.example",
+        ANTHROPIC_AUTH_TOKEN: "gateway-secret",
+        ANTHROPIC_MODEL: profile.model,
+      },
+    }));
+    await seed(vscodeConfig, JSON.stringify({
+      "claudeCode.environmentVariables": [
+        { name: "ANTHROPIC_BASE_URL", value: profile.baseUrl },
+        { name: "ANTHROPIC_AUTH_TOKEN", value: "gateway-secret" },
+        { name: "ANTHROPIC_MODEL", value: profile.model },
+      ],
+      "claudeCode.disableLoginPrompt": true,
+    }));
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, vscodeConfig },
+    }).claude;
+
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      {
+        gateway: true,
+        baseline: {
+          vscodeEnvironmentVariables: { present: true, value: null },
+        },
+      },
+    )).toBe(GATEWAY_OWNERSHIP.CONFLICT);
+  });
+
+  it("patches and restores the active Claude Desktop 3P profile", async () => {
+    const desktopConfig = path.join(root, "Claude-3p", "configLibrary", "active.json");
+    await seed(desktopConfig, `{
+  "inferenceProvider": "gateway",
+  "inferenceGatewayBaseUrl": "https://login.example/cli/auth",
+  "inferenceCredentialKind": "interactive",
+  "inferenceGatewayOidc": { "issuer": "https://issuer.example" },
+  "inferenceModels": ["before-model"],
+  "keepMe": true
+}\n`);
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, desktopConfig },
+    }).claude;
+    const baseline = await adapter.captureManagedState();
+    const profile = {
+      ...baseProfile,
+      baseUrl: "http://127.0.0.1:17863/claude",
+      model: "claude-sonnet-4-6",
+    };
+
+    await writeDrafts(await adapter.build(profile, "gateway-secret", {
+      gateway: true,
+      baseline,
+    }));
+    const configured = parse(await fs.readFile(desktopConfig, "utf8"));
+    expect(configured.inferenceProvider).toBe("gateway");
+    expect(configured.inferenceGatewayBaseUrl).toBe(profile.baseUrl);
+    expect(configured.inferenceCredentialKind).toBe("static");
+    expect(configured.inferenceGatewayApiKey).toBe("gateway-secret");
+    expect(configured.inferenceGatewayAuthScheme).toBe("bearer");
+    expect(configured.inferenceGatewayOidc).toBeUndefined();
+    expect(configured.modelDiscoveryEnabled).toBe(true);
+    expect(configured.inferenceModels).toEqual([profile.model]);
+    expect(configured.disableDeploymentModeChooser).toBe(true);
+    expect(configured.keepMe).toBe(true);
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.OWNED);
+
+    configured.modelDiscoveryEnabled = false;
+    await fs.writeFile(desktopConfig, `${JSON.stringify(configured, null, 2)}\n`, "utf8");
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.CONFLICT);
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline, allowLegacyModelDiscovery: true },
+    )).toBe(GATEWAY_OWNERSHIP.OWNED);
+
+    configured.modelDiscoveryEnabled = true;
+    configured.runtimeKeep = "added";
+    await fs.writeFile(desktopConfig, `${JSON.stringify(configured, null, 2)}\n`, "utf8");
+    await writeDrafts(await adapter.buildRestore(baseline));
+    const restored = parse(await fs.readFile(desktopConfig, "utf8"));
+    expect(restored.inferenceGatewayBaseUrl).toBe("https://login.example/cli/auth");
+    expect(restored.inferenceCredentialKind).toBe("interactive");
+    expect(restored.inferenceGatewayApiKey).toBeUndefined();
+    expect(restored.inferenceGatewayOidc).toEqual({ issuer: "https://issuer.example" });
+    expect(restored.inferenceModels).toEqual(["before-model"]);
+    expect(restored.modelDiscoveryEnabled).toBeUndefined();
+    expect(restored.disableDeploymentModeChooser).toBeUndefined();
+    expect(restored.keepMe).toBe(true);
+    expect(restored.runtimeKeep).toBe("added");
+
+    const apiKeyDrafts = await adapter.build(
+      { ...profile, authMode: "api-key", model: "" },
+      "api-key-secret",
+      { gateway: true, baseline },
+    );
+    const apiKeyDesktop = parse(apiKeyDrafts
+      .find((draft) => draft.path === desktopConfig).content);
+    expect(apiKeyDesktop.inferenceGatewayAuthScheme).toBe("x-api-key");
+    expect(apiKeyDesktop.inferenceGatewayApiKey).toBe("api-key-secret");
+    expect(apiKeyDesktop.inferenceModels).toEqual(["before-model"]);
+    expect(apiKeyDesktop.modelDiscoveryEnabled).toBeUndefined();
+  });
+
+  it("inspects the active Claude Desktop profile when Claude Code has no endpoint", async () => {
+    const desktopLibrary = path.join(root, "Claude-3p", "configLibrary");
+    const desktopProfileId = "11111111-1111-4111-8111-111111111111";
+    const desktopProfile = path.join(desktopLibrary, `${desktopProfileId}.json`);
+    await seed(paths.claude.config, "{}\n");
+    await seed(
+      path.join(desktopLibrary, "_meta.json"),
+      JSON.stringify({ appliedId: desktopProfileId }),
+    );
+    await seed(desktopProfile, JSON.stringify({
+      inferenceGatewayBaseUrl: "https://desktop.example/anthropic",
+      inferenceModels: [{ name: "claude-sonnet-4-6", supports1m: true }],
+    }));
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, desktopLibrary },
+    }).claude;
+    const sources = new Map(await Promise.all(adapter.paths.map(async (filePath) => (
+      [filePath, await fs.readFile(filePath, "utf8")]
+    ))));
+
+    expect(adapter.inspect(sources)).toEqual({
+      baseUrl: "https://desktop.example/anthropic",
+      model: "claude-sonnet-4-6",
+    });
+  });
+
+  it.each([
+    ["missing", null],
+    ["malformed", "{ invalid metadata"],
+  ])("ignores %s Claude Desktop metadata during capture and apply", async (_name, meta) => {
+    const desktopLibrary = path.join(root, "Claude-3p", "configLibrary");
+    const metaPath = path.join(desktopLibrary, "_meta.json");
+    await seed(paths.claude.config, JSON.stringify({
+      env: { KEEP_ME: "yes" },
+    }));
+    await fs.mkdir(desktopLibrary, { recursive: true });
+    if (meta !== null) await seed(metaPath, meta);
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, desktopLibrary },
+    }).claude;
+
+    if (meta !== null) expect(() => adapter.validate(meta, metaPath)).not.toThrow();
+    await expect(adapter.gatewayOwnership(baseProfile, "gateway-secret"))
+      .resolves.toBe(GATEWAY_OWNERSHIP.RELEASED);
+    const baseline = await adapter.captureManagedState();
+    expect(baseline.desktopConfig).toBeUndefined();
+    await expect(adapter.build(baseProfile, "gateway-secret", {
+      gateway: true,
+      baseline,
+    })).resolves.toHaveLength(1);
+  });
+
+  it("ignores Claude Desktop when an older gateway baseline cannot restore it", async () => {
+    const desktopConfig = path.join(root, "Claude-3p", "configLibrary", "active.json");
+    await seed(desktopConfig, JSON.stringify({
+      inferenceProvider: "gateway",
+      inferenceGatewayBaseUrl: "https://before.example",
+      inferenceCredentialKind: "interactive",
+    }));
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, desktopConfig },
+    }).claude;
+    const oldBaseline = {
+      baseUrl: { present: false, value: null },
+      apiKey: { present: false, value: null },
+      authToken: { present: false, value: null },
+      model: { present: false, value: null },
+      toolSearch: { present: false, value: null },
+    };
+
+    const drafts = await adapter.build(baseProfile, "gateway-secret", {
+      gateway: true,
+      baseline: oldBaseline,
+    });
+    expect(drafts.map((draft) => draft.path)).toEqual([paths.claude.config]);
+  });
+
+  it("does not parse invalid Claude Desktop metadata for an older gateway baseline", async () => {
+    const desktopLibrary = path.join(root, "Claude-3p", "configLibrary");
+    await seed(path.join(desktopLibrary, "_meta.json"), "{}\n");
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, desktopLibrary },
+    }).claude;
+    const oldBaseline = {
+      baseUrl: { present: false, value: null },
+      apiKey: { present: false, value: null },
+      authToken: { present: false, value: null },
+      model: { present: false, value: null },
+      toolSearch: { present: false, value: null },
+    };
+
+    await expect(adapter.build(baseProfile, "gateway-secret", {
+      gateway: true,
+      baseline: oldBaseline,
+    })).resolves.toHaveLength(1);
+    await expect(adapter.buildRestore(oldBaseline)).resolves.toHaveLength(1);
+  });
+
+  it("keeps managing the captured Claude Desktop profile after appliedId changes", async () => {
+    const desktopLibrary = path.join(root, "Claude-3p", "configLibrary");
+    const desktopMeta = path.join(desktopLibrary, "_meta.json");
+    const profileAId = "11111111-1111-4111-8111-111111111111";
+    const profileBId = "22222222-2222-4222-8222-222222222222";
+    const desktopProfileA = path.join(desktopLibrary, `${profileAId}.json`);
+    const desktopProfileB = path.join(desktopLibrary, `${profileBId}.json`);
+    const profile = {
+      ...baseProfile,
+      baseUrl: "http://127.0.0.1:17863/claude",
+      model: "gateway-model",
+    };
+    const profileABefore = {
+      inferenceProvider: "gateway",
+      inferenceGatewayBaseUrl: "https://before.example",
+      inferenceCredentialKind: "interactive",
+      inferenceModels: ["profile-a-model"],
+      profileMarker: "A",
+    };
+    const profileBGateway = `${JSON.stringify({
+      inferenceProvider: "gateway",
+      inferenceGatewayBaseUrl: profile.baseUrl,
+      inferenceCredentialKind: "static",
+      inferenceGatewayApiKey: "other-secret",
+      inferenceGatewayAuthScheme: "bearer",
+      inferenceModels: ["profile-b-model"],
+      profileMarker: "B",
+    }, null, 2)}\n`;
+
+    await seed(paths.claude.config, "{}\n");
+    await seed(desktopMeta, JSON.stringify({ appliedId: profileAId }));
+    await seed(desktopProfileA, `${JSON.stringify(profileABefore, null, 2)}\n`);
+    await seed(desktopProfileB, profileBGateway);
+    const adapter = createAdapters({
+      ...paths,
+      claude: {
+        ...paths.claude,
+        desktopConfig: desktopProfileA,
+        desktopLibrary,
+      },
+    }).claude;
+    const baseline = await adapter.captureManagedState();
+
+    expect(baseline.desktopProfileId).toBe(profileAId);
+    await seed(desktopMeta, JSON.stringify({ appliedId: profileBId }));
+
+    const buildDrafts = await adapter.build(profile, "gateway-secret", {
+      gateway: true,
+      baseline,
+    });
+    expect(buildDrafts.map((draft) => draft.path)).toContain(desktopProfileA);
+    expect(buildDrafts.map((draft) => draft.path)).not.toContain(desktopProfileB);
+    await writeDrafts(buildDrafts);
+    expect(parse(await fs.readFile(desktopProfileA, "utf8")).inferenceGatewayBaseUrl)
+      .toBe(profile.baseUrl);
+    expect(await fs.readFile(desktopProfileB, "utf8")).toBe(profileBGateway);
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.CONFLICT);
+
+    const restoreDrafts = await adapter.buildRestore(baseline);
+    expect(restoreDrafts.map((draft) => draft.path)).toContain(desktopProfileA);
+    expect(restoreDrafts.map((draft) => draft.path)).not.toContain(desktopProfileB);
+    await writeDrafts(restoreDrafts);
+    expect(parse(await fs.readFile(desktopProfileA, "utf8"))).toEqual(profileABefore);
+    expect(await fs.readFile(desktopProfileB, "utf8")).toBe(profileBGateway);
+  });
+
+  it("restores baseline models on an empty Claude profile and detects later model drift", async () => {
+    const vscodeConfig = path.join(root, "Code", "User", "settings.json");
+    const desktopConfig = path.join(root, "Claude-3p", "configLibrary", "active.json");
+    await seed(paths.claude.config, JSON.stringify({
+      env: { ANTHROPIC_MODEL: "native-before-model" },
+    }));
+    await seed(vscodeConfig, JSON.stringify({
+      "claudeCode.environmentVariables": [
+        { name: "ANTHROPIC_MODEL", value: "vscode-before-model" },
+      ],
+    }));
+    await seed(desktopConfig, JSON.stringify({
+      inferenceProvider: "gateway",
+      inferenceGatewayBaseUrl: "https://before.example",
+      inferenceCredentialKind: "interactive",
+      modelDiscoveryEnabled: true,
+      inferenceModels: [{ name: "desktop-before-model", supports1m: true }],
+    }));
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, vscodeConfig, desktopConfig },
+    }).claude;
+    const baseline = await adapter.captureManagedState();
+    const gatewayProfile = {
+      ...baseProfile,
+      baseUrl: "http://127.0.0.1:17863/claude",
+      model: "gateway-model",
+    };
+    await writeDrafts(await adapter.build(gatewayProfile, "gateway-secret", {
+      gateway: true,
+      baseline,
+    }));
+
+    const emptyProfile = { ...gatewayProfile, model: "" };
+    const emptyDrafts = await adapter.build(emptyProfile, "gateway-secret", {
+      gateway: true,
+      baseline,
+    });
+    await writeDrafts(emptyDrafts);
+
+    const native = parse(await fs.readFile(paths.claude.config, "utf8"));
+    expect(native.env.ANTHROPIC_MODEL).toBe("native-before-model");
+    const vscode = parse(await fs.readFile(vscodeConfig, "utf8"));
+    const vscodeEnvironment = Object.fromEntries(vscode["claudeCode.environmentVariables"]
+      .map((entry) => [entry.name, entry.value]));
+    expect(vscodeEnvironment.ANTHROPIC_MODEL).toBe("vscode-before-model");
+    const desktop = parse(await fs.readFile(desktopConfig, "utf8"));
+    expect(desktop.modelDiscoveryEnabled).toBe(true);
+    expect(desktop.inferenceModels)
+      .toEqual([{ name: "desktop-before-model", supports1m: true }]);
+    expect(await adapter.gatewayOwnership(
+      emptyProfile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.OWNED);
+
+    native.env.ANTHROPIC_MODEL = "native-runtime-model";
+    await seed(paths.claude.config, `${JSON.stringify(native, null, 2)}\n`);
+    expect(await adapter.gatewayOwnership(
+      emptyProfile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.CONFLICT);
+
+    await writeDrafts(emptyDrafts);
+    const changedVsCode = parse(await fs.readFile(vscodeConfig, "utf8"));
+    changedVsCode["claudeCode.environmentVariables"]
+      .find((entry) => entry.name === "ANTHROPIC_MODEL").value = "vscode-runtime-model";
+    await seed(vscodeConfig, `${JSON.stringify(changedVsCode, null, 2)}\n`);
+    expect(await adapter.gatewayOwnership(
+      emptyProfile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.CONFLICT);
+
+    await writeDrafts(emptyDrafts);
+    const changedDesktop = parse(await fs.readFile(desktopConfig, "utf8"));
+    changedDesktop.inferenceModels = ["desktop-runtime-model"];
+    await seed(desktopConfig, `${JSON.stringify(changedDesktop, null, 2)}\n`);
+    expect(await adapter.gatewayOwnership(
+      emptyProfile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.CONFLICT);
+  });
+
+  it("treats Claude Desktop string and named-object models as equivalent ownership", async () => {
+    const desktopConfig = path.join(root, "Claude-3p", "configLibrary", "active.json");
+    await seed(paths.claude.config, "{}\n");
+    await seed(desktopConfig, JSON.stringify({
+      inferenceProvider: "gateway",
+      inferenceGatewayBaseUrl: "https://before.example",
+      inferenceCredentialKind: "interactive",
+    }));
+    const adapter = createAdapters({
+      ...paths,
+      claude: { ...paths.claude, desktopConfig },
+    }).claude;
+    const baseline = await adapter.captureManagedState();
+    const profile = {
+      ...baseProfile,
+      baseUrl: "http://127.0.0.1:17863/claude",
+      model: "claude-sonnet-4-6",
+    };
+    await writeDrafts(await adapter.build(profile, "gateway-secret", {
+      gateway: true,
+      baseline,
+    }));
+
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.OWNED);
+
+    const desktop = parse(await fs.readFile(desktopConfig, "utf8"));
+    desktop.inferenceModels = [{ name: profile.model }];
+    await seed(desktopConfig, `${JSON.stringify(desktop, null, 2)}\n`);
+    expect(await adapter.gatewayOwnership(
+      profile,
+      "gateway-secret",
+      undefined,
+      { gateway: true, baseline },
+    )).toBe(GATEWAY_OWNERSHIP.OWNED);
+  });
+
   it("surgically replaces the managed Codex provider and preserves MCP config", async () => {
     const original = `# 保留顶层注释
 model_provider = "old"
@@ -752,7 +1355,13 @@ wire_api = "responses"
         });
         continue;
       }
-      for (const state of Object.values(baseline)) expect(state.present).toBe(false);
+      if (target === "opencode") {
+        expect(baseline.providerId).toBe("agentgate_gateway");
+      }
+      for (const [key, state] of Object.entries(baseline)) {
+        if (key === "providerId") continue;
+        expect(state.present).toBe(false);
+      }
     }
 
     const profiles = {
@@ -831,9 +1440,21 @@ wire_api = "responses"
 
   it("honors config root overrides and prefers OpenCode JSONC", async () => {
     const configRoot = path.join(root, "xdg-config");
+    const appData = path.join(root, "app-data");
+    const localAppData = path.join(root, "local-app-data");
+    const desktopProfileId = "1c10ccd0-49ef-493d-8126-53e097457adf";
     const openCodeDir = path.join(configRoot, "opencode");
     await seed(path.join(openCodeDir, "opencode.json"), "{}\n");
     await seed(path.join(openCodeDir, "opencode.jsonc"), "{}\n");
+    await seed(path.join(appData, "Code", "User", "settings.json"), "{}\n");
+    await seed(
+      path.join(localAppData, "Claude-3p", "configLibrary", "_meta.json"),
+      JSON.stringify({ appliedId: desktopProfileId }),
+    );
+    await seed(
+      path.join(localAppData, "Claude-3p", "configLibrary", `${desktopProfileId}.json`),
+      "{}\n",
+    );
 
     const resolved = resolveClientPaths(
       {
@@ -842,15 +1463,58 @@ wire_api = "responses"
         GEMINI_CLI_HOME: path.join(root, "gemini-custom"),
         XDG_CONFIG_HOME: configRoot,
         XDG_DATA_HOME: path.join(root, "xdg-data"),
+        APPDATA: appData,
+        LOCALAPPDATA: localAppData,
       },
       root,
     );
 
     expect(resolved.claude.config).toBe(path.join(root, "claude-custom", "settings.json"));
+    expect(resolved.claude.vscodeConfig)
+      .toBe(path.join(appData, "Code", "User", "settings.json"));
+    expect(resolved.claude.desktopConfig).toBe(path.join(
+      localAppData,
+      "Claude-3p",
+      "configLibrary",
+      `${desktopProfileId}.json`,
+    ));
+    expect(resolved.claude.desktopLibrary)
+      .toBe(path.join(localAppData, "Claude-3p", "configLibrary"));
     expect(resolved.codex.config).toBe(path.join(root, "codex-custom", "config.toml"));
     expect(resolved.gemini.env).toBe(path.join(root, "gemini-custom", ".env"));
     expect(resolved.opencode.config).toBe(path.join(openCodeDir, "opencode.jsonc"));
     expect(resolved.opencode.auth).toBe(path.join(root, "xdg-data", "opencode", "auth.json"));
+  });
+
+  it("ignores an unsafe Claude Desktop applied profile id", async () => {
+    const localAppData = path.join(root, "local-app-data");
+    const desktopLibrary = path.join(localAppData, "Claude-3p", "configLibrary");
+    await seed(
+      path.join(desktopLibrary, "_meta.json"),
+      JSON.stringify({ appliedId: "..\\..\\settings" }),
+    );
+
+    const resolved = resolveClientPaths({ LOCALAPPDATA: localAppData }, root);
+
+    expect(resolved.claude.desktopConfig).toBeUndefined();
+    expect(resolved.claude.desktopLibrary).toBe(desktopLibrary);
+  });
+
+  it.each([
+    ["missing", null],
+    ["malformed", "{ invalid metadata"],
+  ])("keeps the Claude Desktop library when metadata is %s", async (_name, meta) => {
+    const localAppData = path.join(root, "local-app-data");
+    const desktopLibrary = path.join(localAppData, "Claude-3p", "configLibrary");
+    await fs.mkdir(desktopLibrary, { recursive: true });
+    if (meta !== null) {
+      await seed(path.join(desktopLibrary, "_meta.json"), meta);
+    }
+
+    const resolved = resolveClientPaths({ LOCALAPPDATA: localAppData }, root);
+
+    expect(resolved.claude.desktopConfig).toBeUndefined();
+    expect(resolved.claude.desktopLibrary).toBe(desktopLibrary);
   });
 });
 
@@ -873,5 +1537,96 @@ describe("旧版兼容", () => {
 
     expect(inspected.baseUrl).toBe("http://127.0.0.1:17863/opencode/v1");
     expect(inspected.model).toBe("gpt-5.2");
+  });
+
+  it("识别并恢复旧版 OpenCode 网关 provider", async () => {
+    const localBaseUrl = "http://127.0.0.1:17863/opencode";
+    await seed(paths.opencode.config, `{
+  "provider": {
+    "keydeck_gateway": {
+      "npm": "@ai-sdk/openai",
+      "name": "Keydeck Local Gateway",
+      "options": { "baseURL": "${localBaseUrl}" },
+      "models": { "gpt-5.2": { "name": "gpt-5.2" } }
+    },
+    "other": { "keep": true }
+  },
+  "model": "keydeck_gateway/gpt-5.2"
+}\n`);
+    await seed(paths.opencode.auth, `{
+  "keydeck_gateway": { "type": "api", "key": "gateway-secret" },
+  "other": { "type": "oauth", "refresh": "keep" }
+}\n`);
+    const profile = {
+      ...baseProfile,
+      protocol: "openai-responses",
+      baseUrl: localBaseUrl,
+      model: "gpt-5.2",
+      targets: ["opencode"],
+    };
+
+    expect(await adapters.opencode.gatewayOwnership(profile, "gateway-secret"))
+      .toBe(GATEWAY_OWNERSHIP.OWNED);
+
+    const drafts = await adapters.opencode.buildRestore({
+      model: { present: true, value: "other/default" },
+      provider: { present: false, value: null },
+      auth: { present: false, value: null },
+    });
+    const config = parse(drafts.find((draft) => draft.path === paths.opencode.config).content);
+    const auth = parse(drafts.find((draft) => draft.path === paths.opencode.auth).content);
+    expect(config.model).toBe("other/default");
+    expect(config.provider.keydeck_gateway).toBeUndefined();
+    expect(config.provider.other.keep).toBe(true);
+    expect(auth.keydeck_gateway).toBeUndefined();
+    expect(auth.other.refresh).toBe("keep");
+  });
+
+  it("旧版 OpenCode provider 的 capture 与新 provider 接管后仍能恢复", async () => {
+    const localBaseUrl = "http://127.0.0.1:17863/opencode";
+    await seed(paths.opencode.config, JSON.stringify({
+      provider: {
+        keydeck_gateway: {
+          npm: "@ai-sdk/openai",
+          name: "Keydeck Local Gateway",
+          options: { baseURL: localBaseUrl },
+          models: { "gpt-5.2": { name: "gpt-5.2" } },
+        },
+        other: { keep: true },
+      },
+      model: "keydeck_gateway/gpt-5.2",
+    }));
+    await seed(paths.opencode.auth, JSON.stringify({
+      keydeck_gateway: { type: "api", key: "gateway-secret" },
+      other: { type: "oauth", refresh: "keep" },
+    }));
+
+    const captured = await adapters.opencode.captureManagedState();
+    const takeover = await adapters.opencode.build({
+      ...baseProfile,
+      protocol: "openai-responses",
+      baseUrl: localBaseUrl,
+      model: "gpt-5.2",
+      targets: ["opencode"],
+    }, "new-gateway-secret", { gateway: true });
+    await writeDrafts(takeover);
+    const duringTakeover = parse(await fs.readFile(paths.opencode.config, "utf8"));
+    expect(duringTakeover.model).toBe("agentgate_gateway/gpt-5.2");
+    expect(duringTakeover.provider.keydeck_gateway).toBeDefined();
+    expect(duringTakeover.provider.agentgate_gateway).toBeDefined();
+
+    const drafts = await adapters.opencode.buildRestore(captured);
+    await writeDrafts(drafts);
+    const config = parse(await fs.readFile(paths.opencode.config, "utf8"));
+    const auth = parse(await fs.readFile(paths.opencode.auth, "utf8"));
+
+    expect(captured.providerId).toBe("keydeck_gateway");
+    expect(config.provider.keydeck_gateway).toBeDefined();
+    expect(config.provider.keydeck_gateway.name).toBe("Keydeck Local Gateway");
+    expect(config.provider.other.keep).toBe(true);
+    expect(config.provider.agentgate_gateway).toBeUndefined();
+    expect(auth.keydeck_gateway.key).toBe("gateway-secret");
+    expect(auth.other.refresh).toBe("keep");
+    expect(auth.agentgate_gateway).toBeUndefined();
   });
 });

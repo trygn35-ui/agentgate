@@ -12,8 +12,11 @@
 export function relativeTime(value: string | undefined, locale: string, neverLabel: string): string {
   if (!value) return neverLabel;
 
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return neverLabel;
+
   const format = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
-  const delta = Date.now() - new Date(value).getTime();
+  const delta = Date.now() - timestamp;
   const minutes = Math.max(0, Math.floor(delta / 60_000));
   if (minutes < 1) return format.format(0, "minute");
   if (minutes < 60) return format.format(-minutes, "minute");
@@ -31,12 +34,14 @@ export function relativeTime(value: string | undefined, locale: string, neverLab
  * @returns 本地化后的日期时间文本。
  */
 export function formatDateTime(value: string, locale: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "--";
   return new Intl.DateTimeFormat(locale, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(new Date(value));
+  }).format(date);
 }
 
 /**
@@ -51,13 +56,16 @@ export function describeError(error: unknown): string {
 }
 
 /**
- * 将 Token 数量压缩为 K/M 短格式。
+ * 将 Token 数量压缩为 K/M/B 短格式。
  *
  * @param value Token 数；缺失或非数字时返回 "--"。
- * @returns 例如 "12.4K"、"1.05M"。
+ * @returns 例如 "12.4K"、"1.05M"、"1.25B"。
  */
 export function formatTokenCount(value?: number): string {
   if (value === undefined || !Number.isFinite(value)) return "--";
+  if (value >= 1_000_000_000) {
+    return `${(value / 1_000_000_000).toFixed(value < 10_000_000_000 ? 2 : 1)}B`;
+  }
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value < 10_000_000 ? 2 : 1)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}K`;
   return Math.round(value).toLocaleString();
@@ -74,4 +82,3 @@ export function formatDuration(milliseconds?: number): string {
   if (milliseconds < 1_000) return `${Math.max(0, Math.round(milliseconds))} ms`;
   return `${(milliseconds / 1_000).toFixed(2)} s`;
 }
-

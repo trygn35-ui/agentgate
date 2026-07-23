@@ -107,7 +107,7 @@ function UpdateRow({
         <button type="button" className="primary-pill" onClick={onInstall}>
           <ArrowDownToLine size={13} />{m.config.installRestart}
         </button>
-      ) : state === "available" ? (
+      ) : state === "available" || state === "downloading" ? (
         <button type="button" className="primary-pill" disabled={downloading} onClick={onDownload}>
           {downloading
             ? <LoaderCircle size={13} className="spin" />

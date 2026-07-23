@@ -8,6 +8,8 @@ const MAX_DETECTION_BUFFER_BYTES = 64 * 1024
  * 但不能无限——超过就放弃精确解析，退回结束时的尾部扫描。
  */
 const MAX_LINE_BYTES = 1024 * 1024
+const LINE_PART_BLOCK_SIZE = 1024
+const TAIL_PENDING_HEADROOM_BYTES = 4096
 /** 终止/错误标记跨 chunk 被劈开时的重叠窗口。标记本身最长不过几十个字符。 */
 const MARKER_OVERLAP = 64
 /**
@@ -15,10 +17,30 @@ const MARKER_OVERLAP = 64
  * 入口——Anthropic/OpenAI 用 usage，Gemini 用 usageMetadata。
  */
 const USAGE_HINT = /"usage"|"usageMetadata"/
-/** 保留窗口：按时间而非条数保留，1 小时内的记录都留着，供缓存率等窗口指标计算。 */
-const RETENTION_WINDOW_MS = 60 * 60_000
-/** 硬上限：防止极端高频场景把内存和磁盘撑爆，正常使用远达不到。 */
-const MAX_RECENT_REQUESTS = 2_000
+/** 保留窗口：按时间保留最近三天，首页再按本地 0 点截取当天缓存率。 */
+const RETENTION_WINDOW_MS = 3 * 24 * 60 * 60_000
+
+function utf8Suffix(text, maxBytes) {
+  let index = text.length
+  let bytes = 0
+  while (index > 0) {
+    const code = text.charCodeAt(index - 1)
+    if (code >= 0xDC00 && code <= 0xDFFF && index >= 2) {
+      const high = text.charCodeAt(index - 2)
+      if (high >= 0xD800 && high <= 0xDBFF) {
+        if (bytes + 4 > maxBytes) break
+        bytes += 4
+        index -= 2
+        continue
+      }
+    }
+    const width = code <= 0x7F ? 1 : code <= 0x7FF ? 2 : 3
+    if (bytes + width > maxBytes) break
+    bytes += width
+    index -= 1
+  }
+  return { text: text.slice(index), bytes }
+}
 
 const RequestLogEntrySchema = z.object({
   id: z.string(),
@@ -53,7 +75,7 @@ const RequestLogEntrySchema = z.object({
 
 const RequestLogStoreSchema = z.object({
   version: z.literal(1),
-  entries: z.array(RequestLogEntrySchema).max(MAX_RECENT_REQUESTS),
+  entries: z.array(RequestLogEntrySchema),
 })
 const PROGRESS_NOTIFY_INTERVAL_MS = 200
 const MAX_MODEL_METADATA_LENGTH = 240
@@ -69,81 +91,85 @@ function nonEmptyText(value) {
   ))
 }
 
-function nonEmptyToolCalls(value) {
-  return Array.isArray(value) && value.some((call) => (
-    nonEmptyText(call?.function?.arguments)
-    || nonEmptyText(call?.arguments)
-    || nonEmptyText(call?.input)
-  ))
+const OPENAI_VISIBLE_CONTENT_TYPES = new Set(['output_text', 'refusal', 'text'])
+
+function isOpenAiVisibleContent(value) {
+  if (typeof value === 'string') return nonEmptyText(value)
+  if (Array.isArray(value)) return value.some(isOpenAiVisibleContent)
+  if (!value || typeof value !== 'object') return false
+  if (value.type && !OPENAI_VISIBLE_CONTENT_TYPES.has(value.type)) return false
+  return nonEmptyText(value.text) || nonEmptyText(value.refusal)
 }
 
-function nonEmptyStructured(value) {
-  if (nonEmptyText(value)) return true
-  return Boolean(value && typeof value === 'object' && Object.keys(value).length > 0)
+function isOpenAiVisibleOutput(value) {
+  if (!value || typeof value !== 'object') return false
+  if (value.type && value.type !== 'message'
+    && !OPENAI_VISIBLE_CONTENT_TYPES.has(value.type)) return false
+  return nonEmptyText(value.output_text)
+    || nonEmptyText(value.text)
+    || nonEmptyText(value.refusal)
+    || isOpenAiVisibleContent(value.content)
 }
 
-function isMeaningfulPayload(protocol, payload, eventName = '') {
+function isAnthropicVisibleContent(value) {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && (!value.type || value.type === 'text')
+    && nonEmptyText(value.text),
+  )
+}
+
+function isVisibleTextPayload(protocol, payload, eventName = '') {
   if (!payload || typeof payload !== 'object') return false
   if (protocol === 'openai-responses') {
-    const recognizedTypes = [
+    const textEventTypes = [
       'response.output_text.delta',
-      'response.reasoning_summary_text.delta',
-      'response.reasoning_text.delta',
-      'response.reasoning.delta',
-      'response.function_call_arguments.delta',
-      'response.custom_tool_call_input.delta',
+      'response.output_text.done',
       'response.refusal.delta',
+      'response.refusal.done',
     ]
-    if (recognizedTypes.includes(eventName) || recognizedTypes.includes(payload.type)) {
+    if (textEventTypes.includes(eventName) || textEventTypes.includes(payload.type)) {
       return nonEmptyText(payload.delta)
         || nonEmptyText(payload.text)
-        || nonEmptyText(payload.arguments)
-        || nonEmptyText(payload.input)
+        || nonEmptyText(payload.refusal)
+    }
+    const contentPartTypes = ['response.content_part.added', 'response.content_part.done']
+    if (contentPartTypes.includes(eventName) || contentPartTypes.includes(payload.type)) {
+      return isOpenAiVisibleContent(payload.part)
+    }
+    const outputItemTypes = ['response.output_item.added', 'response.output_item.done']
+    if (outputItemTypes.includes(eventName) || outputItemTypes.includes(payload.type)) {
+      return isOpenAiVisibleOutput(payload.item)
     }
     const response = payload.response || payload
     return nonEmptyText(response.output_text)
-      || (Array.isArray(response.output) && response.output.some((item) => (
-        nonEmptyText(item?.text)
-        || nonEmptyText(item?.arguments)
-        || nonEmptyStructured(item?.input)
-        || (Array.isArray(item?.content) && item.content.some((content) => (
-          nonEmptyText(content?.text)
-          || nonEmptyText(content?.refusal)
-        )))
-      )))
+      || isOpenAiVisibleContent(response.content)
+      || (Array.isArray(response.output) && response.output.some(isOpenAiVisibleOutput))
   }
   if (protocol === 'openai-chat') {
     return Array.isArray(payload.choices) && payload.choices.some((choice) => {
       const delta = choice?.delta || choice?.message || {}
       return nonEmptyText(delta.content)
-        || nonEmptyText(delta.reasoning_content)
-        || nonEmptyText(delta.reasoning)
         || nonEmptyText(delta.refusal)
-        || nonEmptyToolCalls(delta.tool_calls)
     })
   }
   if (protocol === 'anthropic') {
-    const type = eventName === 'content_block_delta' || payload.type === 'content_block_delta'
-      ? 'content_block_delta'
-      : eventName || payload.type
+    const type = payload.type || eventName
     const delta = payload.delta || {}
     if (type === 'content_block_delta') {
-      return nonEmptyText(delta.text)
-        || nonEmptyText(delta.thinking)
-        || nonEmptyText(delta.partial_json)
+      return (!delta.type || delta.type === 'text_delta') && nonEmptyText(delta.text)
     }
-    return Array.isArray(payload.content) && payload.content.some((content) => (
-      nonEmptyText(content?.text)
-      || nonEmptyText(content?.thinking)
-      || nonEmptyStructured(content?.input)
-    ))
+    if (type === 'content_block_start') {
+      return isAnthropicVisibleContent(payload.content_block)
+    }
+    const content = payload.message?.content || payload.content
+    return Array.isArray(content) && content.some(isAnthropicVisibleContent)
   }
   if (protocol === 'gemini') {
     return Array.isArray(payload.candidates) && payload.candidates.some((candidate) => (
       candidate?.content?.parts?.some((part) => (
-        nonEmptyText(part?.text)
-        || nonEmptyText(part?.thought)
-        || nonEmptyStructured(part?.functionCall?.args)
+        part?.thought !== true && nonEmptyText(part?.text)
       ))
       || nonEmptyText(candidate?.text)
     ))
@@ -175,11 +201,20 @@ class StreamScanner {
   constructor() {
     // chunk 可能从一个多字节字符中间劈开，交给 StringDecoder 兜着，别解出替换字符
     this.decoder = new StringDecoder('utf8')
-    this.lineCarry = ''
+    this.lineBlocks = []
+    this.lineParts = []
+    this.lineBytes = 0
+    this.discardingLine = false
+    this.discardFrame = false
+    this.jsonStarted = false
+    this.jsonCandidate = true
+    this.jsonDepth = 0
+    this.jsonInString = false
+    this.jsonEscaped = false
+    this.jsonComplete = false
     this.eventName = ''
     this.dataLines = []
     this.dataBytes = 0
-    this.probedLength = -1
     this.sawSse = false
     /** 首字已经认出来了——之后除了 usage，什么都不必再解析。 */
     this.settled = false
@@ -191,14 +226,17 @@ class StreamScanner {
      * 每个 chunk 拼一个 64KB 字符串正是要除掉的那笔开销。
      */
     this.tailParts = []
+    this.tailStart = 0
+    this.tailPendingParts = []
+    this.tailPendingBytes = 0
     this.tailBytes = 0
   }
 
   /** @returns {Array<{eventName: string, payload: unknown}>} 这一片里新解析出来的。 */
-  push(bytes) {
+  push(bytes, probeBody = false) {
     const text = this.decoder.write(bytes)
     if (!text) return []
-    return this._consume(text)
+    return this._consume(text, false, probeBody)
   }
 
   /** 流结束：把残留的半行和未闭合的块也吐出来。 */
@@ -211,43 +249,195 @@ class StreamScanner {
 
   /** 结束时的兜底源：非 SSE 正文（尤其是被换行拆开的）只能靠它捞 usage。 */
   tailSource() {
-    return this.tailParts.join('')
+    return [
+      ...this.tailParts.slice(this.tailStart).map((part) => part.text),
+      this.tailPendingParts.join(''),
+    ].join('')
   }
 
-  _consume(text, final = false) {
+  _consume(text, final = false, probeBody = false) {
     const out = []
     if (text) {
       this._scanMarkers(text)
-      this.tailParts.push(text)
-      this.tailBytes += text.length
-      while (this.tailParts.length > 1
-        && this.tailBytes - this.tailParts[0].length >= MAX_DETECTION_BUFFER_BYTES) {
-        this.tailBytes -= this.tailParts.shift().length
+      this._appendTail(text)
+    }
+    let start = 0
+    for (let newline = text.indexOf('\n', start); newline >= 0; newline = text.indexOf('\n', start)) {
+      this._appendLine(text.slice(start, newline))
+      this._finishLine(out)
+      start = newline + 1
+    }
+    this._appendLine(text.slice(start))
+    if (!final && probeBody && this.jsonComplete) {
+      const payloads = parsedJson(this._appendLineSource().trim())
+      if (payloads.length > 0) {
+        this._resetLine()
+        for (const payload of payloads) out.push({ eventName: '', payload })
       }
     }
-    const merged = this.lineCarry + text
-    const lines = merged.split('\n')
-    // 最后一段没跟换行，可能只是半行，留到下一片再说——除非流已经结束了
-    this.lineCarry = final ? '' : (lines.pop() ?? '')
-    for (const line of lines) this._line(line, out)
-    if (this.lineCarry.length > MAX_LINE_BYTES) {
-      // 单行大到离谱：只保住内存上限，usage 靠结束时的尾部扫描兜底
-      this.lineCarry = this.lineCarry.slice(-MAX_LINE_BYTES)
-      this.probedLength = this.lineCarry.length
-    } else if (!final) {
-      this._probeBody(out)
+    if (final) {
+      if (this.discardingLine) this._resetLine()
+      else if (this.lineBytes > 0) this._finishLine(out)
+      if (this.discardFrame) this._resetFrameDiscard()
     }
     return out
   }
 
+  _appendTail(text) {
+    const incoming = utf8Suffix(text, MAX_DETECTION_BUFFER_BYTES)
+    if (!incoming.text) return
+    if (incoming.bytes >= MAX_DETECTION_BUFFER_BYTES) {
+      const suffix = utf8Suffix(
+        incoming.text,
+        MAX_DETECTION_BUFFER_BYTES - TAIL_PENDING_HEADROOM_BYTES,
+      )
+      this.tailParts = [{ text: suffix.text, bytes: suffix.bytes }]
+      this.tailStart = 0
+      this.tailPendingParts = []
+      this.tailPendingBytes = 0
+      this.tailBytes = suffix.bytes
+      return
+    }
+    this.tailPendingParts.push(incoming.text)
+    this.tailPendingBytes += incoming.bytes
+    this.tailBytes += incoming.bytes
+    if (this.tailPendingParts.length >= LINE_PART_BLOCK_SIZE
+      || this.tailPendingBytes >= TAIL_PENDING_HEADROOM_BYTES) {
+      const block = utf8Suffix(
+        this.tailPendingParts.join(''),
+        MAX_DETECTION_BUFFER_BYTES - TAIL_PENDING_HEADROOM_BYTES,
+      )
+      this.tailParts.push({
+        text: block.text,
+        bytes: block.bytes,
+      })
+      this.tailPendingParts = []
+      this.tailBytes -= this.tailPendingBytes - block.bytes
+      this.tailPendingBytes = 0
+    }
+    while (this.tailStart < this.tailParts.length - 1
+      && this.tailBytes > MAX_DETECTION_BUFFER_BYTES) {
+      this.tailBytes -= this.tailParts[this.tailStart].bytes
+      this.tailStart += 1
+    }
+    if (this.tailStart >= 1024) {
+      this.tailParts = this.tailParts.slice(this.tailStart)
+      this.tailStart = 0
+    }
+  }
+
+  _appendLine(text) {
+    if (!text || this.discardingLine) return
+    this.lineBytes += Buffer.byteLength(text, 'utf8')
+    if (this.lineBytes > MAX_LINE_BYTES) {
+      this.lineBlocks = []
+      this.lineParts = []
+      this.lineBytes = 0
+      this.discardingLine = true
+      this._discardFrame()
+      return
+    }
+    this.lineParts.push(text)
+    if (this.lineParts.length >= LINE_PART_BLOCK_SIZE) {
+      this.lineBlocks.push(this.lineParts.join(''))
+      this.lineParts = []
+    }
+    this._scanJson(text)
+  }
+
+  _scanJson(text) {
+    if (!this.jsonCandidate) return
+    for (const character of text) {
+      if (!this.jsonStarted) {
+        if (/\s/.test(character)) continue
+        if (character !== '{' && character !== '[') {
+          this.jsonCandidate = false
+          return
+        }
+        this.jsonStarted = true
+        this.jsonDepth = 1
+        continue
+      }
+      if (this.jsonComplete) {
+        if (!/\s/.test(character)) this.jsonCandidate = false
+        continue
+      }
+      if (this.jsonInString) {
+        if (this.jsonEscaped) this.jsonEscaped = false
+        else if (character === '\\') this.jsonEscaped = true
+        else if (character === '"') this.jsonInString = false
+        continue
+      }
+      if (character === '"') this.jsonInString = true
+      else if (character === '{' || character === '[') this.jsonDepth += 1
+      else if (character === '}' || character === ']') {
+        this.jsonDepth -= 1
+        if (this.jsonDepth === 0) this.jsonComplete = true
+        else if (this.jsonDepth < 0) this.jsonCandidate = false
+      }
+    }
+  }
+
+  _appendLineSource() {
+    return [...this.lineBlocks, this.lineParts.join('')].join('')
+  }
+
+  _resetLine() {
+    this.lineBlocks = []
+    this.lineParts = []
+    this.lineBytes = 0
+    this.discardingLine = false
+    this.jsonStarted = false
+    this.jsonCandidate = true
+    this.jsonDepth = 0
+    this.jsonInString = false
+    this.jsonEscaped = false
+    this.jsonComplete = false
+  }
+
+  _takeLine() {
+    const source = this._appendLineSource()
+    this._resetLine()
+    return source
+  }
+
+  _finishLine(out) {
+    if (this.discardingLine) {
+      this._resetLine()
+      return
+    }
+    this._line(this._takeLine(), out)
+  }
+
+  _resetFrameDiscard() {
+    this.discardFrame = false
+    this.dataLines = []
+    this.dataBytes = 0
+    this.eventName = ''
+  }
+
+  _discardFrame() {
+    this.discardFrame = true
+    this.dataLines = []
+    this.dataBytes = 0
+    this.eventName = ''
+  }
+
   _line(raw, out) {
     const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    if (this.discardFrame) {
+      if (line.trim() === '') this._resetFrameDiscard()
+      return
+    }
     if (line.startsWith('data:')) {
       this.sawSse = true
-      if (this.dataBytes < MAX_LINE_BYTES) {
-        const value = line.slice(5).replace(/^ /, '')
+      const value = line.slice(5).replace(/^ /, '')
+      const bytes = Buffer.byteLength(value, 'utf8')
+      if (this.dataBytes + bytes <= MAX_LINE_BYTES) {
         this.dataLines.push(value)
-        this.dataBytes += value.length
+        this.dataBytes += bytes
+      } else {
+        this._discardFrame()
       }
       return
     }
@@ -289,26 +479,6 @@ class StreamScanner {
     if (!value) return
     if (this.settled && !USAGE_HINT.test(value)) return
     for (const payload of parsedJson(value)) out.push({ eventName, payload })
-  }
-
-  /**
-   * 非流式正文没有换行，一辈子等不到行结束——得在这儿主动试一次。
-   *
-   * 但不能每片都试：一个 10MB 的正文分 160 片到达，就是 160 次全量 JSON.parse。
-   * 所以先做 O(1) 预检——正文没闭合（末字符不是 } 或 ]）就绝不可能解析成功。
-   * 多片正文里只有最后一片能过这道闸。
-   */
-  _probeBody(out) {
-    if (this.sawSse) return
-    const source = this.lineCarry
-    if (source.length === 0 || source.length === this.probedLength) return
-    let end = source.length - 1
-    while (end >= 0 && (source[end] === ' ' || source[end] === '\t' || source[end] === '\r')) end -= 1
-    if (end < 0) return
-    const last = source[end]
-    if (last !== '}' && last !== ']') return
-    this.probedLength = source.length
-    for (const payload of parsedJson(source.trim())) out.push({ eventName: '', payload })
   }
 
   _scanMarkers(text) {
@@ -493,11 +663,10 @@ function hasTerminalMarker(source) {
 /**
  * 上游错误事件标记：流只回了个错误就结束时（HTTP 仍是 200），不该记成「已完成」。
  *
- * 模式收紧到 SSE 事件行与事件体的 type 字段，避免误伤正文里恰好出现的字样；
- * 最终判定还要求全程没出现过首个有效 token（见 end()），双保险。
+ * 模式收紧到行首 SSE 事件与事件体的 type 字段，避免误伤正文里恰好出现的字样。
  */
 const ERROR_EVENT_PATTERN = new RegExp([
-  'event:\\s*(?:response\\.failed|error)\\b',
+  '(?:^|\\r?\\n)event:\\s*(?:response\\.failed|error)\\b',
   '"type"\\s*:\\s*"(?:response\\.failed|error)"',
 ].join('|'))
 
@@ -529,7 +698,7 @@ function toPublicRequest(entry) {
   /*
    * 已结束的记录不会再变，公开形态缓存下来。
    *
-   * _notify 每次都要把全部记录（活跃 + 最多 2000 条历史）重建一遍，而它是同步压在
+   * _notify 每次都要把全部记录（活跃 + 三天历史）重建一遍，而它是同步压在
    * 网关转发路径上的——实测这一项吃掉了 observeChunk 四成的时间，且随历史条数线性
    * 增长。历史是死的，没有理由每 200 毫秒重造一次。
    */
@@ -576,6 +745,8 @@ class RequestMonitorService {
     this._persistTimer = undefined
     /** 进度通知的服务级节流时间戳。见 _notifyProgress。 */
     this._lastProgressAt = 0
+    /** bootstrap 与增量事件共用的单调版本号。 */
+    this.revision = 0
   }
 
   /**
@@ -587,8 +758,8 @@ class RequestMonitorService {
     if (!this.store) return
     try {
       const data = await this.store.read()
-      this.recent = data.entries.slice(0, MAX_RECENT_REQUESTS)
-      this._prune()
+      this.recent = data.entries
+      if (this._prune().length > 0) this._schedulePersist()
     } catch {
       this.recent = []
     }
@@ -623,16 +794,19 @@ class RequestMonitorService {
   /**
    * 丢弃保留窗口之外的记录。
    *
-   * 按时间保留而非条数：缓存率等窗口指标需要完整的一小时样本，固定条数会在高频
-   * 场景下把窗口截短。硬上限只在极端流量下兜底。
+   * 按时间保留而非条数：动态页需要完整的三天记录，固定条数会在高频场景下把窗口
+   * 截短。
    */
   _prune() {
     const cutoff = this.now() - RETENTION_WINDOW_MS
+    const removedIds = []
     this.recent = this.recent.filter((entry) => {
       const completedAt = Date.parse(entry.completedAt || entry.startedAt)
-      return !Number.isFinite(completedAt) || completedAt >= cutoff
+      const keep = !Number.isFinite(completedAt) || completedAt >= cutoff
+      if (!keep) removedIds.push(entry.id)
+      return keep
     })
-    if (this.recent.length > MAX_RECENT_REQUESTS) this.recent.length = MAX_RECENT_REQUESTS
+    return removedIds
   }
 
   setOnChange(onChange) {
@@ -646,12 +820,49 @@ class RequestMonitorService {
    * 请求只能落在活跃组的末尾——看上去像是「新请求出现在下面」。而 recent 是按完成
    * 时间 unshift 的，并发请求交错完成时，时间戳列也是乱的。
    *
-   * recent 本身仍保持完成时间倒序不动：_prune 靠这个顺序截断最旧的。
+   * recent 本身仍保持完成时间倒序不动，便于和活跃请求按开始时间合并。
    */
   list() {
+    // 时间窗口也必须在“没有新请求”的日子里生效；否则打开动态页或重新 bootstrap
+    // 仍会把已经过期的历史带回渲染进程。只安排一次低频写盘，不在这里广播事件。
+    if (this._prune().length > 0) this._schedulePersist()
     return [...this.active.values(), ...this.recent]
       .sort((left, right) => startedAtMillis(right) - startedAtMillis(left))
       .map(toPublicRequest)
+  }
+
+  /**
+   * 在网关热路径上查询最近的一条失败记录，不排序也不复制整部历史。
+   * 调用方只需要能力探测结果，不应为此把三天动态记录全部映射到渲染格式。
+   */
+  hasRecentFailure({ profileId, upstreamUrls = [], maxAgeMs, statusCode = 502 } = {}) {
+    const removedIds = this._prune()
+    if (removedIds.length > 0) this._schedulePersist()
+    const urlSet = new Set(upstreamUrls)
+    const cutoff = this.now() - (Number.isFinite(maxAgeMs) ? maxAgeMs : 0)
+    return this.recent.some((entry) => {
+      const completedAt = Date.parse(entry.completedAt || entry.startedAt)
+      return entry.profileId === profileId
+        && (urlSet.size === 0 || urlSet.has(entry.upstreamUrl))
+        && entry.streaming !== true
+        && entry.statusCode === statusCode
+        && entry.outcome === 'failed'
+        && Number.isFinite(completedAt)
+        && completedAt >= cutoff
+    })
+  }
+
+  /** bootstrap 使用的完整快照；后续状态变化通过记录级增量传输。 */
+  getActiveRequestsSnapshot() {
+    return {
+      activeRequests: this.list(),
+      activeRequestsRevision: this.revision,
+    }
+  }
+
+  /** 兼容旧调用方的列表接口。 */
+  getActiveRequests() {
+    return this.list()
   }
 
   start(input) {
@@ -674,7 +885,7 @@ class RequestMonitorService {
       streaming: input.streaming,
       scanner: new StreamScanner(),
     })
-    this._notify()
+    this._notifyChanged([this.active.get(id)])
     return id
   }
 
@@ -698,9 +909,11 @@ class RequestMonitorService {
         entry.reasoningEffort = reasoningEffort
       }
     }
-    if (typeof patch.streaming === 'boolean') entry.streaming = patch.streaming
+    if (typeof patch.streaming === 'boolean' && !entry.streamingLocked) {
+      entry.streaming = patch.streaming
+    }
     if (patch.tokenUsage) entry.tokenUsage = mergeUsage(entry.tokenUsage, patch.tokenUsage)
-    this._notify()
+    this._notifyChanged([entry])
     return true
   }
 
@@ -709,9 +922,19 @@ class RequestMonitorService {
     if (!entry) return false
     entry.statusCode = statusCode
     entry.state = 'waiting-first-token'
-    entry.streaming = streaming ?? entry.streaming
-      ?? String(contentType || '').toLowerCase().includes('text/event-stream')
-    this._notify()
+    const mediaType = String(contentType || '').split(';', 1)[0].trim().toLowerCase()
+    const responseStreaming = mediaType === 'text/event-stream'
+      || mediaType === 'application/x-ndjson'
+      || mediaType === 'application/json-seq'
+      ? true
+      : mediaType === 'application/json' || mediaType.endsWith('+json')
+        ? false
+        : undefined
+    if (streaming !== undefined || responseStreaming !== undefined) {
+      entry.streaming = streaming ?? responseStreaming
+      entry.streamingLocked = true
+    }
+    this._notifyChanged([entry])
     return true
   }
 
@@ -720,19 +943,26 @@ class RequestMonitorService {
     if (!entry) return false
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     if (bytes.byteLength === 0) return false
+    const receivedAtMs = this.now()
+    entry.lastChunkAtMs = receivedAtMs
     entry.receivedBytes += bytes.byteLength
     if (entry.firstByteLatencyMs === undefined) {
-      entry.firstByteLatencyMs = Math.max(0, this.now() - entry.startedAtMs)
-      this._notify()
+      entry.firstByteLatencyMs = Math.max(0, receivedAtMs - entry.startedAtMs)
+      if (entry.streaming === false) entry.state = 'streaming'
+      this._notifyChanged([entry])
     }
-    const marked = this._absorb(entry, entry.scanner.push(bytes))
+    const marked = this._absorb(
+      entry,
+      entry.scanner.push(bytes, entry.streaming === true),
+      receivedAtMs,
+    )
     if (marked) return true
-    this._notifyProgress()
+    this._notifyProgress(receivedAtMs)
     return false
   }
 
   /** 消化新解析出的 payload：累计 usage、认领模型、判首字。 */
-  _absorb(entry, payloads) {
+  _absorb(entry, payloads, receivedAtMs) {
     let marked = false
     for (const { eventName, payload } of payloads) {
       const usage = extractTokenUsage(payload)
@@ -740,8 +970,8 @@ class RequestMonitorService {
       if (entry.firstTokenLatencyMs !== undefined) continue
       const metadata = extractRequestMetadata(payload?.response || payload)
       if (metadata.model) entry.model = metadata.model
-      if (isMeaningfulPayload(entry.protocol, payload, eventName)) {
-        this._markFirstToken(entry)
+      if (entry.streaming === true && isVisibleTextPayload(entry.protocol, payload, eventName)) {
+        this._markFirstToken(entry, receivedAtMs)
         marked = true
       }
     }
@@ -756,7 +986,7 @@ class RequestMonitorService {
     this.active.delete(id)
     // 收尾：残留的半行、没闭合的块，还有非 SSE 正文——被换行拆开的正文行行都解析
     // 不出来，只能从尾巴里把 usage 捞出来（它通常就在 JSON 末尾）。
-    this._absorb(entry, entry.scanner.end())
+    this._absorb(entry, entry.scanner.end(), entry.lastChunkAtMs ?? entry.startedAtMs)
     if (entry.tokenUsage === undefined) {
       const usage = extractTokenUsageFromSource(entry.scanner.tailSource())
       if (usage) entry.tokenUsage = mergeUsage(entry.tokenUsage, usage)
@@ -768,15 +998,14 @@ class RequestMonitorService {
     const effectiveOutcome = outcome === 'aborted' && entry.sawCompletion ? undefined : outcome
     entry.outcome = effectiveOutcome || (
       entry.statusCode !== undefined && entry.statusCode >= 400 ? 'failed'
-        // 只见错误事件、始终没等来首个有效 token 的流，是伪装成 200 的失败
-        : entry.sawErrorEvent && entry.firstTokenLatencyMs === undefined ? 'failed'
+        : entry.sawErrorEvent ? 'failed'
           : 'completed'
     )
     entry.state = entry.outcome === 'completed' ? 'completed' : entry.outcome
-    // 记录会在 recent 里留一小时。扫描器攥着 64KB 尾巴，留着就是 2000 × 64KB。
+    // 记录会在 recent 里保留三天，但扫描器的尾部缓存不需要随历史一起保留。
     delete entry.scanner
     this.recent.unshift(entry)
-    this._prune()
+    const removedIds = this._prune()
     if (typeof this.onRequestEnded === 'function') {
       try {
         this.onRequestEnded(toPublicRequest(entry))
@@ -785,7 +1014,7 @@ class RequestMonitorService {
       }
     }
     this._schedulePersist()
-    this._notify()
+    this._notifyChanged([entry], removedIds)
     return true
   }
 
@@ -794,42 +1023,48 @@ class RequestMonitorService {
     for (const id of [...this.active.keys()]) this.end(id, { outcome: 'cancelled' })
   }
 
-  _markFirstToken(entry) {
-    entry.firstTokenLatencyMs = Math.max(0, this.now() - entry.startedAtMs)
+  _markFirstToken(entry, receivedAtMs) {
+    entry.firstTokenLatencyMs = Math.max(0, receivedAtMs - entry.startedAtMs)
     entry.state = 'streaming'
     // 告诉扫描器：可以只盯 usage 了，别再解析每一个增量
     entry.scanner.settled = true
-    this._notify()
+    this._notifyChanged([entry])
   }
 
   /**
    * 流传输途中的进度通知：只推还在跑的那几条，不推整部历史。
    *
    * 历史记录只在请求「结束」时才会变；传输途中变的只有活跃的那几条。而这段代码是
-   * 同步压在网关转发路径上的——原本每 200ms 就把全部记录（活跃 + 最多 2000 条历史）
+   * 同步压在网关转发路径上的——原本每 200ms 就把全部记录（活跃 + 三天历史）
    * 重新序列化一遍推过去。实测：4 条并发流跑 30 秒，光这一项就推了一百万条记录，
    * 吃掉 observeChunk 八成六的 CPU。
    *
    * 节流器也是整个服务共用的，不是每条请求各管各的——否则四条流并发时，节流加起来
    * 一秒能发二十次。
    */
-  _notifyProgress() {
-    const now = this.now()
+  _notifyProgress(now) {
     if (now - this._lastProgressAt < PROGRESS_NOTIFY_INTERVAL_MS) return
     this._lastProgressAt = now
     this._emit([...this.active.values()].map(toPublicRequest), true)
   }
 
-  /** 全量快照。开始/结束/首字这类会改变列表构成的事件走这里，不节流。 */
-  _notify() {
-    this._emit(this.list(), false)
+  /** 发送变动记录；完整三天快照只由 bootstrap 返回。 */
+  _notifyChanged(entries = [], removedRequestIds = []) {
+    this._emit(entries.filter(Boolean).map(toPublicRequest), true, removedRequestIds)
   }
 
-  _emit(activeRequests, patch) {
+  _emit(activeRequests, patch, removedRequestIds = []) {
+    this.revision += 1
     if (typeof this.onChange !== 'function') return
     try {
-      // patch = 只是这几条的最新状态，渲染进程按 id 就地更新，别整表替换
-      this.onChange({ type: 'active-requests-changed', activeRequests, ...(patch ? { patch: true } : {}) })
+      // patch = 只是变动记录，渲染进程按 id upsert，并删除明确淘汰的历史 ID。
+      this.onChange({
+        type: 'active-requests-changed',
+        activeRequests,
+        ...(patch ? { patch: true } : {}),
+        ...(removedRequestIds.length > 0 ? { removedRequestIds } : {}),
+        revision: this.revision,
+      })
     } catch {
       // UI 订阅者不得影响网关请求。
     }
@@ -838,12 +1073,13 @@ class RequestMonitorService {
 
 module.exports = {
   MAX_DETECTION_BUFFER_BYTES,
-  MAX_RECENT_REQUESTS,
+  MAX_LINE_BYTES,
+  RETENTION_WINDOW_MS,
   RequestLogStoreSchema,
   RequestMonitorService,
   StreamScanner,
   extractRequestMetadata,
   extractTokenUsage,
   extractTokenUsageFromSource,
-  isMeaningfulPayload,
+  isVisibleTextPayload,
 }

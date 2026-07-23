@@ -8,6 +8,7 @@ const CHANNELS = Object.freeze({
   deleteProfile: 'agentgate:delete-profile',
   copyProfileKey: 'agentgate:copy-profile-key',
   testProfile: 'agentgate:test-profile',
+  testProfileDraft: 'agentgate:test-profile-draft',
   checkProfileHealth: 'agentgate:check-profile-health',
   probeProfile: 'agentgate:probe-profile',
   applyProfile: 'agentgate:apply-profile',
@@ -48,6 +49,7 @@ const CHANNELS = Object.freeze({
  * - deleteProfile(id)                 -> agentgate:delete-profile
  * - copyProfileKey(id)                -> agentgate:copy-profile-key
  * - testProfile(id)                   -> agentgate:test-profile
+ * - testProfileDraft(input)           -> agentgate:test-profile-draft
  * - checkProfileHealth(id)            -> agentgate:check-profile-health
  * - applyProfile(id, targets?)        -> agentgate:apply-profile（只分配本地网关路由）
  * - undoHistory(id)                   -> agentgate:undo-history
@@ -65,6 +67,7 @@ const api = Object.freeze({
   deleteProfile: (id) => ipcRenderer.invoke(CHANNELS.deleteProfile, id),
   copyProfileKey: (id) => ipcRenderer.invoke(CHANNELS.copyProfileKey, id),
   testProfile: (id) => ipcRenderer.invoke(CHANNELS.testProfile, id),
+  testProfileDraft: (input) => ipcRenderer.invoke(CHANNELS.testProfileDraft, input),
   checkProfileHealth: (id) => ipcRenderer.invoke(CHANNELS.checkProfileHealth, id),
   probeProfile: (id) => ipcRenderer.invoke(CHANNELS.probeProfile, id),
   applyProfile: (id, targets) => ipcRenderer.invoke(CHANNELS.applyProfile, id, targets),

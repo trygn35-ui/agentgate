@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestStores, testVault } from "./helpers.mjs";
 
 const require = createRequire(import.meta.url);
@@ -30,6 +30,192 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
+});
+
+describe("engaged route boundaries", () => {
+  it("网关运行时切换未接管目标只更新路由，不写客户端配置", async () => {
+    const profileId = "00000000-0000-4000-8000-000000000701";
+    const previousProfileId = "00000000-0000-4000-8000-000000000702";
+    const profile = {
+      id: profileId,
+      name: "新 Claude",
+      protocol: "anthropic",
+      baseUrl: "https://new.example",
+      model: "claude-sonnet-4-5",
+      authMode: "bearer",
+      targets: ["claude"],
+    };
+    const previousProfile = { ...profile, id: previousProfileId, name: "旧 Claude" };
+    const prepareConnection = vi.fn();
+    const gatewayService = {
+      getPublicState: vi.fn(() => ({
+        status: "running",
+        engaged: ["codex"],
+        routes: [{ target: "claude", profileId: previousProfileId }],
+      })),
+      assignRoutes: vi.fn().mockResolvedValue({ targets: ["claude"], routes: {} }),
+      prepareConnection,
+    };
+    const profileService = {
+      withConnectionLock: vi.fn(async (_id, _revision, operation) => operation({
+        profile,
+        apiKey: "secret",
+        markApplied: vi.fn(async () => {}),
+      })),
+      getStored: vi.fn().mockResolvedValue(previousProfile),
+    };
+    const applyService = new ApplyService({
+      profileService,
+      adapters: { claude: { name: "Claude" } },
+      historyStore: { read: vi.fn(async () => ({ version: 1, entries: [] })) },
+      backupDirectory: path.join(root, "backups"),
+      vault: testVault,
+      gatewayService,
+    });
+
+    await expect(applyService.assignProfile(profileId, ["claude"])).resolves.toMatchObject({
+      assignedTargets: ["claude"],
+    });
+    expect(prepareConnection).not.toHaveBeenCalled();
+  });
+});
+
+describe("dynamic adapter snapshots", () => {
+  it("retries when an adapter changes its managed path set while sources are read", async () => {
+    const metaPath = path.join(root, "configLibrary", "_meta.json");
+    const profileAPath = path.join(root, "configLibrary", "a.json");
+    const profileBPath = path.join(root, "configLibrary", "b.json");
+    await fs.mkdir(path.dirname(metaPath), { recursive: true });
+    await fs.writeFile(metaPath, '{"appliedId":"b"}\n', "utf8");
+    await fs.writeFile(profileAPath, '{"profile":"a"}\n', "utf8");
+    await fs.writeFile(profileBPath, '{"profile":"b"}\n', "utf8");
+
+    let pathReads = 0;
+    const adapter = {
+      get paths() {
+        pathReads += 1;
+        return pathReads === 1
+          ? [metaPath, profileAPath]
+          : [metaPath, profileBPath];
+      },
+      gatewayOwnership: vi.fn(async () => "released"),
+      captureManagedState: vi.fn(async (sources) => {
+        expect(sources.has(metaPath)).toBe(true);
+        expect(sources.has(profileAPath)).toBe(false);
+        expect(sources.has(profileBPath)).toBe(true);
+        return { active: "b" };
+      }),
+      build: vi.fn(async () => []),
+    };
+    let baselineData = { version: 2, baselines: {} };
+    const gatewayBaselineStore = {
+      read: vi.fn(async () => baselineData),
+      write: vi.fn(async (value) => { baselineData = value; }),
+    };
+    const applyService = new ApplyService({
+      profileService: {},
+      adapters: { claude: adapter },
+      historyStore: {},
+      backupDirectory: path.join(root, "backups"),
+      vault: testVault,
+      gatewayService: {
+        prepareConnection: vi.fn(async (profile, apiKey) => ({ profile, apiKey })),
+      },
+      gatewayBaselineStore,
+    });
+
+    await applyService._writeGatewayEntries([{
+      profile: {
+        protocol: "anthropic",
+        baseUrl: "https://relay.example",
+        model: "",
+        authMode: "bearer",
+      },
+      apiKey: "secret",
+      target: "claude",
+    }]);
+
+    const backup = JSON.parse(testVault.decrypt(
+      baselineData.baselines.claude.encryptedBackup,
+    ));
+    expect(backup.files.map((file) => file.path)).toEqual([metaPath, profileBPath]);
+    expect(pathReads).toBeGreaterThan(1);
+  });
+
+  it("includes a baseline-bound path and refuses edits made after ownership", async () => {
+    const metaPath = path.join(root, "configLibrary", "_meta.json");
+    const profileAPath = path.join(root, "configLibrary", "a.json");
+    const profileBPath = path.join(root, "configLibrary", "b.json");
+    await fs.mkdir(path.dirname(metaPath), { recursive: true });
+    await fs.writeFile(metaPath, '{"appliedId":"b"}\n', "utf8");
+    await fs.writeFile(profileAPath, '{"profile":"a-before"}\n', "utf8");
+    await fs.writeFile(profileBPath, '{"profile":"b"}\n', "utf8");
+
+    const storedState = { active: "a" };
+    const externalEdit = '{"profile":"a-runtime-edit"}\n';
+    const adapter = {
+      id: "claude",
+      paths: [metaPath, profileBPath],
+      pathsForBaseline: vi.fn((baseline) => {
+        expect(baseline).toEqual(storedState);
+        return [metaPath, profileBPath, profileAPath];
+      }),
+      gatewayOwnership: vi.fn(async (_profile, _apiKey, sources) => {
+        expect(sources.has(profileAPath)).toBe(true);
+        await fs.writeFile(profileAPath, externalEdit, "utf8");
+        return "owned";
+      }),
+      build: vi.fn(async (_profile, _apiKey, options) => {
+        const before = options.sources.get(profileAPath);
+        expect(before.content).toBe('{"profile":"a-before"}\n');
+        const content = '{"profile":"agentgate"}\n';
+        return [{
+          target: "claude",
+          path: profileAPath,
+          before,
+          content,
+          afterHash: crypto.createHash("sha256").update(content, "utf8").digest("hex"),
+        }];
+      }),
+    };
+    let baselineData = {
+      version: 2,
+      baselines: {
+        claude: {
+          capturedAt: new Date().toISOString(),
+          encryptedState: testVault.encrypt(JSON.stringify(storedState)),
+          encryptedBackup: testVault.encrypt(JSON.stringify({ files: [] })),
+        },
+      },
+    };
+    const gatewayBaselineStore = {
+      read: vi.fn(async () => baselineData),
+      write: vi.fn(async (value) => { baselineData = value; }),
+    };
+    const applyService = new ApplyService({
+      profileService: {},
+      adapters: { claude: adapter },
+      historyStore: {},
+      backupDirectory: path.join(root, "backups"),
+      vault: testVault,
+      gatewayService: {
+        prepareConnection: vi.fn(async (profile, apiKey) => ({ profile, apiKey })),
+      },
+      gatewayBaselineStore,
+    });
+
+    await expect(applyService._writeGatewayEntries([{
+      profile: {
+        protocol: "anthropic",
+        baseUrl: "https://relay.example",
+        model: "",
+        authMode: "bearer",
+      },
+      apiKey: "secret",
+      target: "claude",
+    }])).rejects.toThrow("Configuration changed while preparing the switch");
+    expect(await fs.readFile(profileAPath, "utf8")).toBe(externalEdit);
+  });
 });
 
 describe("transactional apply", () => {
@@ -158,6 +344,87 @@ command = "node"
         wire_api: "chat",
         experimental_bearer_token: "runtime-auth",
       });
+      expect((await gatewayBaselineStore.read()).baselines).toEqual({});
+    } finally {
+      await gatewayService.stopAndWait().catch(() => {});
+    }
+  });
+
+  it("停止时基线清理短暂失败，配置未变时下一次接管仍可复用基线", async () => {
+    const codexPath = path.join(root, ".codex", "config.toml");
+    const original = `model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://custom.example/v1"
+wire_api = "responses"
+`;
+    await fs.mkdir(path.dirname(codexPath), { recursive: true });
+    await fs.writeFile(codexPath, original, "utf8");
+
+    const { profileStore, historyStore } = createTestStores(root);
+    const profileService = new ProfileService(profileStore, testVault);
+    const gatewayStore = new JsonFileStore(
+      path.join(root, "data", "gateway.json"),
+      GatewayStoreSchema,
+      defaultGatewayStore,
+    );
+    const gatewayBaselineStore = new JsonFileStore(
+      path.join(root, "data", "gateway-recovery.json"),
+      GatewayBaselineStoreSchema,
+      defaultGatewayBaselineStore,
+    );
+    const gatewayService = new GatewayService({ profileService, store: gatewayStore, vault: testVault });
+    const adapters = createAdapters({
+      claude: { config: path.join(root, ".claude", "settings.json") },
+      codex: { config: codexPath },
+      opencode: {
+        config: path.join(root, ".config", "opencode", "opencode.json"),
+        auth: path.join(root, ".local", "share", "opencode", "auth.json"),
+      },
+      gemini: {
+        config: path.join(root, ".gemini", "settings.json"),
+        env: path.join(root, ".gemini", ".env"),
+      },
+    });
+    const applyService = new ApplyService({
+      profileService,
+      adapters,
+      historyStore,
+      backupDirectory: path.join(root, "data", "backups"),
+      vault: testVault,
+      gatewayService,
+      gatewayBaselineStore,
+    });
+    const profile = await profileService.save({
+      name: "基线重试",
+      protocol: "openai-responses",
+      baseUrl: "https://relay.example/v1",
+      apiKey: "sk-retry",
+      model: "gpt-5-codex",
+      authMode: "bearer",
+      targets: ["codex"],
+    });
+    await applyService.assignProfile(profile.id, ["codex"]);
+
+    const writeBaseline = gatewayBaselineStore.write.bind(gatewayBaselineStore);
+    let failCleanup = true;
+    gatewayBaselineStore.write = async (value) => {
+      if (failCleanup && Object.keys(value.baselines).length === 0) {
+        failCleanup = false;
+        throw new Error("simulated baseline cleanup failure");
+      }
+      return writeBaseline(value);
+    };
+
+    try {
+      await applyService.startGateway({ port: 0 });
+      await expect(applyService.stopGateway()).rejects.toThrow("simulated baseline cleanup failure");
+      expect(gatewayService.getPublicState().status).toBe("stopped");
+      expect(TOML.parse(await fs.readFile(codexPath, "utf8")).model_provider).toBe("custom");
+
+      await applyService.startGateway({ port: 0 });
+      expect(gatewayService.getPublicState().status).toBe("running");
+      await applyService.stopGateway();
       expect((await gatewayBaselineStore.read()).baselines).toEqual({});
     } finally {
       await gatewayService.stopAndWait().catch(() => {});
@@ -704,6 +971,73 @@ command = "node"
     expect(await applyService.listHistory()).toEqual([
       expect.objectContaining({ success: false, canUndo: false }),
     ]);
+  });
+
+  it("回滚不会覆盖写入后发生的用户编辑", async () => {
+    const firstPath = path.join(root, "configs", "first-user-edit.txt");
+    const secondPath = path.join(root, "configs", "second-user-edit.txt");
+    const firstOriginal = "第一份原配置\n";
+    const secondOriginal = "第二份原配置\n";
+    const userEdit = "用户在事务期间保存的新配置\n";
+    await fs.mkdir(path.dirname(firstPath), { recursive: true });
+    await Promise.all([
+      fs.writeFile(firstPath, firstOriginal, "utf8"),
+      fs.writeFile(secondPath, secondOriginal, "utf8"),
+    ]);
+
+    const { profileStore, historyStore } = createTestStores(root);
+    const profileService = new ProfileService(profileStore, testVault);
+    const snapshot = (filePath, content) => ({
+      path: filePath,
+      existed: true,
+      content,
+      hash: crypto.createHash("sha256").update(content, "utf8").digest("hex"),
+    });
+    const replacement = (before, content) => ({
+      target: "codex",
+      path: before.path,
+      before,
+      content,
+      afterHash: crypto.createHash("sha256").update(content, "utf8").digest("hex"),
+    });
+    const adapters = {
+      codex: {
+        build: async () => [
+          replacement(snapshot(firstPath, firstOriginal), "第一份新配置\n"),
+          replacement(snapshot(secondPath, secondOriginal), "第二份新配置\n"),
+        ],
+      },
+    };
+    const applyService = new ApplyService({
+      profileService,
+      adapters,
+      historyStore,
+      backupDirectory: path.join(root, "data", "backups"),
+      vault: testVault,
+    });
+    const created = await profileService.save({
+      name: "并发编辑回滚夹具",
+      protocol: "openai-responses",
+      baseUrl: "https://rollback-race.example/v1",
+      apiKey: "sk-rollback-race",
+      model: "gpt-rollback-race",
+      authMode: "bearer",
+      targets: ["codex"],
+    });
+    let continuationChecks = 0;
+
+    await expect(applyService.apply(created.id, ["codex"], {
+      source: "auto",
+      shouldContinue: () => {
+        continuationChecks += 1;
+        if (continuationChecks !== 6) return true;
+        require("node:fs").writeFileSync(firstPath, userEdit, "utf8");
+        return false;
+      },
+    })).rejects.toThrow("automatic rollback was incomplete");
+
+    expect(await fs.readFile(firstPath, "utf8")).toBe(userEdit);
+    expect(await fs.readFile(secondPath, "utf8")).toBe(secondOriginal);
   });
 });
 

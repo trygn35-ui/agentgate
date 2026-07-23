@@ -91,6 +91,48 @@ const AutoSwitchSettingsSchema = z.object({
     .default(DEFAULT_AUTO_SWITCH_INTERVAL_MINUTES),
 })
 
+function refineConnectionUrls(value, context) {
+  const connectionUrls = [value.baseUrl, ...(value.endpoints || []).map((endpoint) => endpoint.url)]
+  for (const [index, rawUrl] of connectionUrls.entries()) {
+    const url = new URL(rawUrl)
+    if (url.username || url.password || url.hash) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: index === 0 ? ['baseUrl'] : ['endpoints', index - 1, 'url'],
+        message: 'Endpoint URLs cannot contain credentials or fragments',
+      })
+    }
+  }
+
+  const normalizedEndpoints = (value.endpoints || [{ url: value.baseUrl }])
+    .map((endpoint) => normalizeHttpUrl(endpoint.url))
+  if (new Set(normalizedEndpoints).size !== normalizedEndpoints.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['endpoints'],
+      message: 'Endpoint URLs must be unique',
+    })
+  }
+}
+
+const ProfileConnectionSchema = z.object({
+  id: z.string().uuid().optional(),
+  protocol: ProtocolSchema,
+  baseUrl: HttpUrlSchema,
+  endpoints: z.array(EndpointInputSchema).min(1).max(MAX_PROFILE_ENDPOINTS).optional(),
+  apiKey: z.string().max(32768).optional(),
+  authMode: AuthModeSchema,
+}).superRefine((value, context) => {
+  if (!value.id && !value.apiKey?.trim()) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['apiKey'],
+      message: 'API key is required for a new profile',
+    })
+  }
+  refineConnectionUrls(value, context)
+})
+
 const SaveProfileSchema = z.object({
   id: z.string().uuid().optional(),
   name: z.string().trim().min(1, 'Name is required').max(80),
@@ -138,27 +180,7 @@ const SaveProfileSchema = z.object({
     }
   }
 
-  const connectionUrls = [value.baseUrl, ...(value.endpoints || []).map((endpoint) => endpoint.url)]
-  for (const [index, rawUrl] of connectionUrls.entries()) {
-    const url = new URL(rawUrl)
-    if (url.username || url.password || url.hash) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: index === 0 ? ['baseUrl'] : ['endpoints', index - 1, 'url'],
-        message: 'Endpoint URLs cannot contain credentials or fragments',
-      })
-    }
-  }
-
-  const normalizedEndpoints = (value.endpoints || [{ url: value.baseUrl }])
-    .map((endpoint) => normalizeHttpUrl(endpoint.url))
-  if (new Set(normalizedEndpoints).size !== normalizedEndpoints.length) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['endpoints'],
-      message: 'Endpoint URLs must be unique',
-    })
-  }
+  refineConnectionUrls(value, context)
 })
 
 const LegacyStoredProfileSchema = z.object({
@@ -358,6 +380,7 @@ module.exports = {
   HealthHistorySchema,
   StoredEndpointSchema,
   AutoSwitchSettingsSchema,
+  ProfileConnectionSchema,
   normalizeHttpUrl,
   SaveProfileSchema,
   StoredProfileSchema,

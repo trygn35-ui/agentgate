@@ -18,6 +18,17 @@ import type { BusyAction, ToastState } from "../ui-types";
 
 const DEFAULT_TOAST_DURATION_MS = 4_200;
 
+/** 用量事件只替换一个公开方案；找不到时交给调用方决定是否回退完整刷新。 */
+export function mergeProfileUsage(profiles: Profile[], updated: Profile): Profile[] {
+  let found = false;
+  const next = profiles.map((profile) => {
+    if (profile.id !== updated.id) return profile;
+    found = true;
+    return updated;
+  });
+  return found ? next : profiles;
+}
+
 export interface AgentGateController {
   data: BootstrapData;
   busy: BusyAction | null;
@@ -31,6 +42,7 @@ export interface AgentGateController {
   reorderProfiles: (ids: string[]) => Promise<void>;
   applyProfile: (id: string, targets?: ClientTarget[]) => Promise<void>;
   testProfile: (id: string) => Promise<string[] | undefined>;
+  testProfileDraft: (input: SaveProfileInput) => Promise<string[] | undefined>;
   checkProfileHealth: (id: string) => Promise<void>;
   checkAllProfilesHealth: () => Promise<void>;
   /** 正在后台检测端点的方案 ID 集合；检测不锁定其他操作。 */
@@ -69,12 +81,25 @@ export function useAgentGateController(): AgentGateController {
 
   /** 应用完整快照；缺失的可选字段沿用当前值，避免请求记录和设置被清空。 */
   const mergeBootstrap = useCallback((next: BootstrapData): void => {
-    setData((current) => ({
-      ...next,
-      settings: next.settings ?? current.settings,
-      activeRequests: next.activeRequests ?? current.activeRequests,
-      update: next.update ?? current.update,
-    }));
+    setData((current) => {
+      const nextRevision = next.activeRequestsRevision;
+      const currentRevision = current.activeRequestsRevision;
+      const acceptsRequestSnapshot = next.activeRequests !== undefined
+        && (nextRevision === undefined
+          || currentRevision === undefined
+          || nextRevision >= currentRevision);
+      return {
+        ...next,
+        settings: next.settings ?? current.settings,
+        activeRequests: acceptsRequestSnapshot
+          ? next.activeRequests
+          : current.activeRequests,
+        activeRequestsRevision: acceptsRequestSnapshot
+          ? (nextRevision ?? currentRevision)
+          : currentRevision,
+        update: next.update ?? current.update,
+      };
+    });
   }, []);
   const [busy, setBusy] = useState<BusyAction | null>("load");
   const [busyId, setBusyId] = useState<string>();
@@ -139,20 +164,39 @@ export function useAgentGateController(): AgentGateController {
   useEffect(() => api.onStateChanged((event: StateChangedEvent) => {
     if (event.type === "active-requests-changed") {
       /*
-       * patch = 只带了还在跑的那几条的最新状态。
+       * patch = 只带了变动记录的最新状态，可能包含刚结束的行和过期删除 ID。
        *
-       * 传输途中每 200ms 一次的进度通知，原本推的是整部历史（最多 2000 条）。那部分
+       * 传输途中每 200ms 一次的进度通知，原本推的是整部三天历史。那部分
        * 根本没变，白白序列化过来——主进程那边实测吃掉了转发路径八成六的 CPU。
-       * 现在只推活跃的那几条，这里按 id 就地更新。
-       */
+       * 现在只推变动记录，这里按 id 做 upsert，并移除明确淘汰的历史行。
+      */
       if (event.patch) {
-        setData((current) => ({
-          ...current,
-          activeRequests: mergeActiveRequests(current.activeRequests ?? [], event.activeRequests),
-        }));
+        setData((current) => {
+          if (event.revision !== undefined
+            && current.activeRequestsRevision !== undefined
+            && event.revision <= current.activeRequestsRevision) return current;
+          return {
+            ...current,
+            activeRequests: mergeActiveRequests(
+              current.activeRequests ?? [],
+              event.activeRequests,
+              event.removedRequestIds,
+            ),
+            activeRequestsRevision: event.revision ?? current.activeRequestsRevision,
+          };
+        });
         return;
       }
-      setData((current) => ({ ...current, activeRequests: event.activeRequests }));
+      setData((current) => {
+        if (event.revision !== undefined
+          && current.activeRequestsRevision !== undefined
+          && event.revision <= current.activeRequestsRevision) return current;
+        return {
+          ...current,
+          activeRequests: event.activeRequests,
+          activeRequestsRevision: event.revision ?? current.activeRequestsRevision,
+        };
+      });
       return;
     }
     if (event.type === "settings-changed") {
@@ -161,6 +205,19 @@ export function useAgentGateController(): AgentGateController {
     }
     if (event.type === "update-state-changed") {
       setData((current) => ({ ...current, update: event.update }));
+      return;
+    }
+    if ((event as { type: string }).type === "profile-usage-changed") {
+      const profile = (event as { type: string; profile?: Profile }).profile;
+      if (!profile) {
+        void refreshSilently();
+        return;
+      }
+      setData((current) => {
+        const profiles = mergeProfileUsage(current.profiles, profile);
+        if (profiles === current.profiles) return current;
+        return { ...current, profiles };
+      });
       return;
     }
     void refreshSilently();
@@ -232,6 +289,7 @@ export function useAgentGateController(): AgentGateController {
       setToast({ kind: "error", message: m.current.toast.orderFailed });
       return;
     }
+    commandLock.current = true;
     const previous = data.profiles;
     const byId = new Map(previous.map((profile) => [profile.id, profile]));
     const optimistic = [
@@ -245,6 +303,8 @@ export function useAgentGateController(): AgentGateController {
     } catch (error) {
       setData((current) => ({ ...current, profiles: previous }));
       setToast({ kind: "error", message: describeError(error) });
+    } finally {
+      commandLock.current = false;
     }
   }
 
@@ -299,6 +359,34 @@ export function useAgentGateController(): AgentGateController {
         setToast({ kind: "info", message: m.current.toast.noModels });
       }
       return tested.availableModels;
+    } catch (error) {
+      setToast({ kind: "error", message: describeError(error) });
+      return undefined;
+    } finally {
+      commandLock.current = false;
+      setBusy(null);
+      setBusyId(undefined);
+    }
+  }
+
+  async function testProfileDraft(input: SaveProfileInput): Promise<string[] | undefined> {
+    if (commandLock.current) return undefined;
+    if (!api.testProfileDraft) {
+      setToast({ kind: "error", message: m.current.toast.unsupported });
+      return undefined;
+    }
+    commandLock.current = true;
+    setBusy("test");
+    setBusyId(input.id);
+    try {
+      const models = await api.testProfileDraft(input);
+      setToast(models.length > 0
+        ? {
+            kind: "success",
+            message: fill(m.current.toast.modelsFound, { count: models.length }),
+          }
+        : { kind: "info", message: m.current.toast.noModels });
+      return models;
     } catch (error) {
       setToast({ kind: "error", message: describeError(error) });
       return undefined;
@@ -461,9 +549,11 @@ export function useAgentGateController(): AgentGateController {
     commandLock.current = true;
     setBusy("gateway-start");
     try {
-      const requestId = ++requestSequence.current;
+      // 命令前后都作废一次旧刷新：state-changed 可能在 await 期间启动一次全量读取。
+      requestSequence.current += 1;
       const next = await api.startGateway(settings);
-      if (requestId === requestSequence.current) mergeBootstrap(next);
+      requestSequence.current += 1;
+      mergeBootstrap(next);
       setToast({ kind: "success", message: m.current.toast.gatewayStarted });
     } catch (error) {
       setToast({ kind: "error", message: describeError(error) });
@@ -479,7 +569,11 @@ export function useAgentGateController(): AgentGateController {
     commandLock.current = true;
     setBusy("gateway-start");
     try {
+      // 端口重分配和启动/停止一样会触发 state-changed；命令返回的最终快照
+      // 必须覆盖执行期间发起的旧全量读取。
+      requestSequence.current += 1;
       const next = await api.reassignPort();
+      requestSequence.current += 1;
       mergeBootstrap(next);
       setToast({
         kind: "success",
@@ -498,9 +592,11 @@ export function useAgentGateController(): AgentGateController {
     commandLock.current = true;
     setBusy("gateway-stop");
     try {
-      const requestId = ++requestSequence.current;
+      // 与启动相同，命令返回的最终快照应覆盖执行期间取得的中间状态。
+      requestSequence.current += 1;
       const next = await api.stopGateway(settings);
-      if (requestId === requestSequence.current) mergeBootstrap(next);
+      requestSequence.current += 1;
+      mergeBootstrap(next);
       const skipped = next.gatewayRecovery?.skippedTargets ?? [];
       const targets = skipped.map((target) => CLIENT_META[target].short).join(", ");
       setToast({
@@ -598,6 +694,7 @@ export function useAgentGateController(): AgentGateController {
     reorderProfiles,
     applyProfile,
     testProfile,
+    testProfileDraft,
     checkProfileHealth,
     checkAllProfilesHealth,
     testingIds,

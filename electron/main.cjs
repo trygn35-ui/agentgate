@@ -1,4 +1,5 @@
 const path = require('node:path')
+const { pathToFileURL } = require('node:url')
 const { z } = require('zod')
 const {
   app,
@@ -70,6 +71,10 @@ const WINDOW_OPTIONS = Object.freeze({
   useContentSize: true,
   frame: false,
 })
+const DEV_SERVER_URL = app.isPackaged ? undefined : process.env.VITE_DEV_SERVER_URL
+const PRODUCTION_RENDERER_URL = pathToFileURL(
+  path.join(__dirname, '..', 'dist', 'index.html'),
+).href
 
 const WindowStateSchema = z.object({
   version: z.literal(1),
@@ -93,6 +98,7 @@ let quitBarrierPromise
 let quitting = false
 /** 退出屏障完成后是否改为安装更新，而不是普通退出。 */
 let installUpdateOnQuit = false
+let installFallbackTimer
 /** 开机自启拉起的实例带 --silent：直接驻留托盘，不显示窗口。 */
 const silentLaunch = process.argv.includes(SILENT_LAUNCH_FLAG)
 
@@ -148,7 +154,17 @@ function createServices() {
     },
     onRequestEnded: (entry) => {
       if (!entry.profileId || !entry.tokenUsage) return
-      void profileService.addTokenUsage(entry.profileId, entry.tokenUsage).catch(() => {})
+      void profileService.addTokenUsage(entry.profileId, entry.tokenUsage).then(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        return profileService.list().then((profiles) => {
+          const profile = profiles.find((item) => item.id === entry.profileId)
+          if (!profile || !mainWindow || mainWindow.isDestroyed()) return
+          mainWindow.webContents.send(CHANNELS.stateChanged, {
+            type: 'profile-usage-changed',
+            profile,
+          })
+        })
+      }).catch(() => {})
     },
     store: requestLogStore,
   })
@@ -235,8 +251,7 @@ function createServices() {
  * @returns 无返回值；会注册导航和新窗口拦截器。
  */
 function secureWindowNavigation(window) {
-  const devUrl = process.env.VITE_DEV_SERVER_URL
-  const allowedOrigin = devUrl ? new URL(devUrl).origin : undefined
+  const allowedOrigin = DEV_SERVER_URL ? new URL(DEV_SERVER_URL).origin : undefined
 
   window.webContents.on('will-navigate', (event, destination) => {
     if (allowedOrigin && new URL(destination).origin === allowedOrigin) return
@@ -246,6 +261,21 @@ function secureWindowNavigation(window) {
     if (url.startsWith('https://')) void shell.openExternal(url)
     return { action: 'deny' }
   })
+}
+
+function isTrustedIpcSender(event) {
+  if (!mainWindow || mainWindow.isDestroyed()) return false
+  if (event?.sender !== mainWindow.webContents) return false
+  if (!event.senderFrame || event.senderFrame !== mainWindow.webContents.mainFrame) return false
+  try {
+    const senderUrl = new URL(event.senderFrame.url)
+    if (DEV_SERVER_URL) return senderUrl.origin === new URL(DEV_SERVER_URL).origin
+    senderUrl.hash = ''
+    senderUrl.search = ''
+    return senderUrl.href === PRODUCTION_RENDERER_URL
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -343,8 +373,8 @@ async function createWindow({ silent = false } = {}) {
     mainWindow = undefined
   })
 
-  if (process.env.VITE_DEV_SERVER_URL) {
-    await mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
+  if (DEV_SERVER_URL) {
+    await mainWindow.loadURL(DEV_SERVER_URL)
   } else {
     await mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
@@ -387,7 +417,7 @@ function createTray() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: `打开 ${APP_DISPLAY_NAME}`, click: showMainWindow },
     { type: 'separator' },
-    { label: `退出 ${APP_DISPLAY_NAME}（暂停网关）`, click: () => app.quit() },
+    { label: `退出 ${APP_DISPLAY_NAME}（关闭网关）`, click: () => app.quit() },
   ]))
   tray.on('double-click', showMainWindow)
   refreshTray()
@@ -411,10 +441,21 @@ if (!hasSingleInstanceLock) {
     const settings = await services.settingsService.initialize()
     await services.requestMonitor.initialize()
     services.gatewayService.setExperimentalToolBridgeEnabled?.(settings.experimentalToolBridge)
-    await services.gatewayService.initialize({ start: settings.startGatewayOnLaunch })
+    await services.gatewayService.initialize({ start: false })
+    let launchGatewayError
+    try {
+      await services.applyService.reconcileGatewayOnLaunch({
+        start: settings.startGatewayOnLaunch,
+      })
+    } catch (error) {
+      // 配置冲突时仍需启动窗口和托盘，让用户能看到并修复问题。
+      launchGatewayError = error instanceof Error ? error.message : String(error)
+    }
     registerIpcHandlers({
       ipcMain,
       clipboard,
+      isTrustedSender: isTrustedIpcSender,
+      isShuttingDown: () => quitting,
       ...services,
       requestUpdateInstall: () => {
         installUpdateOnQuit = true
@@ -422,7 +463,9 @@ if (!hasSingleInstanceLock) {
       },
     })
     // 无边框窗口的最小化/最大化/关闭；关闭沿用 close 事件里的托盘驻留判断。
-    ipcMain.handle('agentgate:window-control', (_event, action) => {
+    ipcMain.handle('agentgate:window-control', (event, action) => {
+      if (!isTrustedIpcSender(event)) throw new Error('Unauthorized IPC sender')
+      if (quitting) throw new Error('Application is shutting down')
       if (!mainWindow || mainWindow.isDestroyed()) return
       if (action === 'minimize') mainWindow.minimize()
       else if (action === 'maximize') {
@@ -432,6 +475,12 @@ if (!hasSingleInstanceLock) {
     })
     await createWindow({ silent: silentLaunch })
     createTray()
+    if (launchGatewayError && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(CHANNELS.stateChanged, {
+        type: 'auto-switch-error',
+        message: `Agent;Gate could not restore the gateway on launch: ${launchGatewayError}`,
+      })
+    }
     services.autoSwitchService.start((event) => {
       if (!mainWindow || mainWindow.isDestroyed()) return
       mainWindow.webContents.send(CHANNELS.stateChanged, event)
@@ -449,20 +498,56 @@ app.on('before-quit', (event) => {
   event.preventDefault()
   if (quitBarrierPromise) return
 
+  const installingUpdate = installUpdateOnQuit
   quitBarrierPromise = (async () => {
+    let cleanupStep = 'stop automatic switching'
     try {
       await services?.autoSwitchService.stopAndWait()
+      cleanupStep = 'restore client configuration'
+      await services?.applyService.stopGateway({ preserveResumeIntent: true })
+      cleanupStep = 'stop the local gateway'
       await services?.gatewayService.shutdown()
+      cleanupStep = 'flush request history'
       await services?.requestMonitor.flush()
-    } finally {
-      tray?.destroy()
-      tray = undefined
-      quitBarrierComplete = true
-      // 网关已停止、客户端配置已恢复，此时安装更新才不会把客户端留在死掉的本地地址上。
-      if (installUpdateOnQuit && services?.updateService.quitAndInstall()) return
-      app.quit()
+    } catch (error) {
+      quitting = false
+      installUpdateOnQuit = false
+      const message = error instanceof Error ? error.message : String(error)
+      showMainWindow()
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(CHANNELS.stateChanged, {
+          type: 'auto-switch-error',
+          message: installingUpdate
+            ? `Update cancelled because Agent;Gate could not ${cleanupStep}: ${message}`
+            : `Quit cancelled because Agent;Gate could not ${cleanupStep}: ${message}`,
+        })
+      }
+      return
     }
-  })()
+    tray?.destroy()
+    tray = undefined
+    quitBarrierComplete = true
+    if (installingUpdate) {
+      let installStarted = false
+      try {
+        installStarted = Boolean(services?.updateService.quitAndInstall())
+      } catch {
+        installStarted = false
+      }
+      if (installStarted) {
+        // electron-updater 通常会自行触发 app.quit；若它只返回不退出，避免应用卡在托盘。
+        installFallbackTimer = setTimeout(() => {
+          installFallbackTimer = undefined
+          app.quit()
+        }, 5_000)
+        installFallbackTimer.unref?.()
+        return
+      }
+    }
+    app.quit()
+  })().finally(() => {
+    if (!quitBarrierComplete) quitBarrierPromise = undefined
+  })
 })
 
 app.on('window-all-closed', () => {

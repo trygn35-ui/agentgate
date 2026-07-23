@@ -9,6 +9,7 @@ const CHANNELS = Object.freeze({
   deleteProfile: 'agentgate:delete-profile',
   copyProfileKey: 'agentgate:copy-profile-key',
   testProfile: 'agentgate:test-profile',
+  testProfileDraft: 'agentgate:test-profile-draft',
   checkProfileHealth: 'agentgate:check-profile-health',
   probeProfile: 'agentgate:probe-profile',
   applyProfile: 'agentgate:apply-profile',
@@ -70,6 +71,8 @@ function routedProfileChangeError(fields) {
 function registerIpcHandlers({
   ipcMain,
   clipboard,
+  isTrustedSender,
+  isShuttingDown = () => false,
   profileService,
   clientService,
   healthService,
@@ -77,9 +80,32 @@ function registerIpcHandlers({
   gatewayService,
   settingsService,
   updateService,
+  requestMonitor,
   sessionService,
   requestUpdateInstall,
 }) {
+  if (typeof isTrustedSender !== 'function') {
+    throw new Error('IPC sender validation is required')
+  }
+  if (typeof isShuttingDown !== 'function') {
+    throw new Error('IPC shutdown state callback is required')
+  }
+  const readOnlyChannels = new Set([
+    CHANNELS.bootstrap,
+    CHANNELS.listSessions,
+    CHANNELS.readSessionMessages,
+    CHANNELS.countSessionMessages,
+    CHANNELS.planSessionRemoval,
+  ])
+  const handle = (channel, handler) => {
+    ipcMain.handle(channel, async (event, ...args) => {
+      if (!isTrustedSender(event)) throw new Error('Unauthorized IPC sender')
+      if (isShuttingDown() && !readOnlyChannels.has(channel)) {
+        throw new Error('Application is shutting down')
+      }
+      return handler(event, ...args)
+    })
+  }
   const getBootstrap = async () => {
     const [profiles, history] = await Promise.all([
       profileService.list(),
@@ -123,20 +149,28 @@ function registerIpcHandlers({
         }
       }),
     }
+    const requestSnapshot = typeof requestMonitor?.getActiveRequestsSnapshot === 'function'
+      ? requestMonitor.getActiveRequestsSnapshot()
+      : {
+        activeRequests: gatewayService.getActiveRequests ? gatewayService.getActiveRequests() : undefined,
+      }
     return {
       profiles,
       clients,
       history,
       gateway,
       ...(settingsService ? { settings: settingsService.getPublicSettings() } : {}),
-      ...(gatewayService.getActiveRequests ? { activeRequests: gatewayService.getActiveRequests() } : {}),
+      ...(requestSnapshot.activeRequests ? { activeRequests: requestSnapshot.activeRequests } : {}),
+      ...(Number.isFinite(requestSnapshot.activeRequestsRevision)
+        ? { activeRequestsRevision: requestSnapshot.activeRequestsRevision }
+        : {}),
       ...(updateService ? { update: updateService.getPublicState() } : {}),
     }
   }
 
-  ipcMain.handle(CHANNELS.bootstrap, getBootstrap)
+  handle(CHANNELS.bootstrap, getBootstrap)
 
-  ipcMain.handle(CHANNELS.saveProfile, async (_event, input) => {
+  handle(CHANNELS.saveProfile, async (_event, input) => {
     const parsed = SaveProfileSchema.safeParse(input)
     if (!parsed.success) throw new Error(validationMessage(parsed.error))
     const nextProfile = parsed.data
@@ -158,9 +192,9 @@ function registerIpcHandlers({
       return saved
     })
   })
-  ipcMain.handle(CHANNELS.duplicateProfile, (_event, id) => profileService.duplicate(id))
-  ipcMain.handle(CHANNELS.reorderProfiles, (_event, ids) => profileService.reorder(ids))
-  ipcMain.handle(CHANNELS.deleteProfile, (_event, id) => {
+  handle(CHANNELS.duplicateProfile, (_event, id) => profileService.duplicate(id))
+  handle(CHANNELS.reorderProfiles, (_event, ids) => profileService.reorder(ids))
+  handle(CHANNELS.deleteProfile, (_event, id) => {
     return applyService.withLifecycleLock(async () => {
       const gatewayState = gatewayService.getPublicState()
       const routedTargets = gatewayState.routes
@@ -179,21 +213,24 @@ function registerIpcHandlers({
       }
     })
   })
-  ipcMain.handle(CHANNELS.copyProfileKey, async (_event, id) => {
+  handle(CHANNELS.copyProfileKey, async (_event, id) => {
     const apiKey = await profileService.getSecret(id)
     clipboard.writeText(apiKey)
     return { ok: true }
   })
-  ipcMain.handle(CHANNELS.testProfile, async (_event, id) => {
+  handle(CHANNELS.testProfile, async (_event, id) => {
     return healthService.test(id)
   })
-  ipcMain.handle(CHANNELS.checkProfileHealth, async (_event, id) => {
+  handle(CHANNELS.testProfileDraft, async (_event, input) => {
+    return healthService.discoverDraftModels(input)
+  })
+  handle(CHANNELS.checkProfileHealth, async (_event, id) => {
     return healthService.testHealth(id)
   })
-  ipcMain.handle(CHANNELS.probeProfile, async (_event, id) => {
+  handle(CHANNELS.probeProfile, async (_event, id) => {
     return healthService.probeProfile(id)
   })
-  ipcMain.handle(CHANNELS.applyProfile, async (_event, id, targets) => {
+  handle(CHANNELS.applyProfile, async (_event, id, targets) => {
     const result = await applyService.assignProfile(id, targets)
     const profiles = await profileService.list()
     const clients = await clientService.scan(profiles)
@@ -218,18 +255,18 @@ function registerIpcHandlers({
       ...(result.history ? { historyEntry: result.history } : {}),
     }
   })
-  ipcMain.handle(CHANNELS.undoHistory, async (_event, id) => {
+  handle(CHANNELS.undoHistory, async (_event, id) => {
     await applyService.undo(id)
     return getBootstrap()
   })
-  ipcMain.handle(CHANNELS.openConfig, (_event, target) => clientService.openConfig(target))
-  ipcMain.handle(CHANNELS.startGateway, async (_event, rawSettings) => {
+  handle(CHANNELS.openConfig, (_event, target) => clientService.openConfig(target))
+  handle(CHANNELS.startGateway, async (_event, rawSettings) => {
     const result = GatewayStartSchema.safeParse(rawSettings)
     if (!result.success) throw new Error(validationMessage(result.error))
     await applyService.startGateway(result.data)
     return getBootstrap()
   })
-  ipcMain.handle(CHANNELS.stopGateway, async (_event, rawSettings) => {
+  handle(CHANNELS.stopGateway, async (_event, rawSettings) => {
     const parsed = GatewayStopSchema.safeParse(rawSettings)
     if (!parsed.success) throw new Error(validationMessage(parsed.error))
     const recovery = await applyService.stopGateway(parsed.data || {})
@@ -240,12 +277,12 @@ function registerIpcHandlers({
       },
     }
   })
-  ipcMain.handle(CHANNELS.reassignPort, async () => {
+  handle(CHANNELS.reassignPort, async () => {
     if (!gatewayService) throw new Error('Local gateway is unavailable')
     await gatewayService.reassignPort()
     return getBootstrap()
   })
-  ipcMain.handle(CHANNELS.updateSettings, async (_event, patch) => {
+  handle(CHANNELS.updateSettings, async (_event, patch) => {
     if (!settingsService) throw new Error('Application settings are unavailable')
     return settingsService.update(patch)
   })
@@ -253,35 +290,37 @@ function registerIpcHandlers({
    * 会话管理。删除是不可逆的，所以渲染进程只能递会话 id，删什么由主进程按各家的
    * 真实牵连面自己算——路径不从渲染进程来，免得被越权删到别处去。
    */
-  ipcMain.handle(CHANNELS.listSessions, async () => (
-    sessionService ? sessionService.list() : []
+  handle(CHANNELS.listSessions, async () => (
+    sessionService ? sessionService.listDetailed() : { sessions: [], errors: [] }
   ))
-  ipcMain.handle(CHANNELS.readSessionMessages, async (_event, id, limit) => (
+  handle(CHANNELS.readSessionMessages, async (_event, id, limit) => (
     sessionService
       ? sessionService.readMessages(SessionIdSchema.parse(id), { limit: MessageLimitSchema.parse(limit) })
       : { messages: [], truncated: false }
   ))
-  ipcMain.handle(CHANNELS.countSessionMessages, async (_event, ids) => (
+  handle(CHANNELS.countSessionMessages, async (_event, ids) => (
     sessionService ? sessionService.countMessages(SessionIdsSchema.parse(ids)) : {}
   ))
-  ipcMain.handle(CHANNELS.planSessionRemoval, async (_event, ids) => (
+  handle(CHANNELS.planSessionRemoval, async (_event, ids) => (
     sessionService ? sessionService.plan(SessionIdsSchema.parse(ids)) : []
   ))
-  ipcMain.handle(CHANNELS.removeSessions, async (_event, ids) => {
+  handle(CHANNELS.removeSessions, async (_event, ids) => {
     if (!sessionService) return { removed: [], failed: [] }
     return sessionService.remove(SessionIdsSchema.parse(ids))
   })
 
-  ipcMain.handle(CHANNELS.checkForUpdate, async () => {
+  handle(CHANNELS.checkForUpdate, async () => {
     if (!updateService) throw new Error('Update service is unavailable')
     return updateService.check()
   })
-  ipcMain.handle(CHANNELS.downloadUpdate, async () => {
+  handle(CHANNELS.downloadUpdate, async () => {
     if (!updateService) throw new Error('Update service is unavailable')
     return updateService.download()
   })
-  ipcMain.handle(CHANNELS.installUpdate, async () => {
+  handle(CHANNELS.installUpdate, async () => {
     if (!updateService) throw new Error('Update service is unavailable')
+    const state = updateService.getPublicState()
+    if (state.portable || state.state !== 'ready') throw new Error('Update is not ready to install')
     // 由主进程的退出屏障先停网关、恢复客户端配置，再安装。
     requestUpdateInstall()
     return { ok: true }

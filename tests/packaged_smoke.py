@@ -79,15 +79,15 @@ with sync_playwright() as playwright:
           };
           const urlA = `${upstreamOrigin}/a/v1`;
           const urlB = `${upstreamOrigin}/b/v1`;
-          const profileA = await window.keydeck.saveProfile({
+          const profileA = await window.agentgate.saveProfile({
             ...common, name: '打包方案 A', baseUrl: urlA,
             endpoints: [{url: urlA}], apiKey: secretA
           });
-          const profileB = await window.keydeck.saveProfile({
+          const profileB = await window.agentgate.saveProfile({
             ...common, name: '打包方案 B', baseUrl: urlB,
             endpoints: [{url: urlB}], apiKey: secretB
           });
-          const assigned = await window.keydeck.applyProfile(profileA.id, ['codex']);
+          const assigned = await window.agentgate.applyProfile(profileA.id, ['codex']);
           return {profileA, profileB, assigned};
         }
         """,
@@ -98,7 +98,7 @@ with sync_playwright() as playwright:
     assert created["assigned"]["gateway"]["status"] == "stopped"
     assert codex_config.read_text(encoding="utf-8") == original
 
-    page.evaluate("port => window.keydeck.startGateway({port})", gateway_port)
+    page.evaluate("port => window.agentgate.startGateway({port})", gateway_port)
     taken_over = codex_config.read_text(encoding="utf-8")
     parsed = tomllib.loads(taken_over)
     local_base_url = parsed["model_providers"]["custom"]["base_url"]
@@ -119,7 +119,7 @@ with sync_playwright() as playwright:
     codex_config.write_text(runtime_edit, encoding="utf-8")
     before_hot_switch = codex_config.read_bytes()
     page.evaluate(
-        "id => window.keydeck.applyProfile(id, ['codex'])",
+        "id => window.agentgate.applyProfile(id, ['codex'])",
         created["profileB"]["id"],
     )
     assert codex_config.read_bytes() == before_hot_switch
@@ -130,7 +130,7 @@ with sync_playwright() as playwright:
     assert "https://user-original.example" not in recovery_text
     assert "user-owned-auth" not in recovery_text
 
-    stopped = page.evaluate("() => window.keydeck.stopGateway()")
+    stopped = page.evaluate("() => window.agentgate.stopGateway()")
     assert stopped["gateway"]["status"] == "stopped"
     restored = tomllib.loads(codex_config.read_text(encoding="utf-8"))
     assert restored["model_provider"] == "custom"

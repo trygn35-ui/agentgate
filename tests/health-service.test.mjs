@@ -160,6 +160,28 @@ describe("端点探测边界", () => {
 });
 
 describe("健康检测结果提交", () => {
+  it("草稿识别使用表单里的新 URL，并为已有方案复用保存的 Key", async () => {
+    const profileService = {
+      getSecret: vi.fn().mockResolvedValue(API_KEY),
+    };
+    const fetchMock = vi.fn(async () => jsonResponse({ data: [{ id: "gpt-draft" }] }));
+    const service = new HealthService(profileService, fetchMock);
+    const id = "11111111-1111-4111-8111-111111111111";
+
+    const models = await service.discoverDraftModels({
+      id,
+      protocol: "openai-responses",
+      baseUrl: SECONDARY_URL,
+      endpoints: [{ url: SECONDARY_URL }],
+      apiKey: "",
+      authMode: "bearer",
+    });
+
+    expect(models).toEqual(["gpt-draft"]);
+    expect(profileService.getSecret).toHaveBeenCalledWith(id);
+    expect(String(fetchMock.mock.calls[0][0])).toBe(`${SECONDARY_URL}/v1/models`);
+  });
+
   it("检测全部端点并分别写入可用模型", async () => {
     const { profileStore } = createTestStores(root);
     const profileService = new ProfileService(profileStore, testVault);

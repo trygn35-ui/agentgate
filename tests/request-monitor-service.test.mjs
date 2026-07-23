@@ -3,8 +3,12 @@ import { describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
 const {
-  MAX_RECENT_REQUESTS,
+  MAX_DETECTION_BUFFER_BYTES,
+  MAX_LINE_BYTES,
+  RETENTION_WINDOW_MS,
+  RequestLogStoreSchema,
   RequestMonitorService,
+  StreamScanner,
   extractRequestMetadata,
   extractTokenUsage,
   extractTokenUsageFromSource,
@@ -45,36 +49,66 @@ describe("活动请求监视", () => {
     expect(onChange).toHaveBeenLastCalledWith({
       type: "active-requests-changed",
       activeRequests: [
-        expect.objectContaining({ id: second }),
         expect.objectContaining({ id: first, state: "completed" }),
       ],
+      patch: true,
+      revision: expect.any(Number),
     });
   });
 
-  it("按一小时窗口保留完成记录，超时的丢弃", () => {
+  it("按三天窗口保留完成记录，超时的丢弃", () => {
     let now = Date.parse("2026-07-13T12:00:00.000Z");
     const monitor = new RequestMonitorService({ now: () => now });
 
-    const stale = monitor.start({ profileName: "两小时前" });
-    monitor.end(stale);
+    const retained = monitor.start({ profileName: "两天前" });
+    monitor.end(retained);
 
-    now += 90 * 60_000; // 推进 90 分钟：上一条已超出保留窗口
+    now += 2 * 24 * 60 * 60_000;
     const fresh = monitor.start({ profileName: "刚刚" });
     monitor.end(fresh);
+    expect(monitor.list().map((entry) => entry.profileName)).toEqual(["刚刚", "两天前"]);
+
+    now += RETENTION_WINDOW_MS + 1;
+    const newest = monitor.start({ profileName: "三天后" });
+    monitor.end(newest);
 
     const records = monitor.list();
-    expect(records.map((entry) => entry.profileName)).toEqual(["刚刚"]);
+    expect(records.map((entry) => entry.profileName)).toEqual(["三天后"]);
   });
 
-  it("硬上限兜底：极端高频下不超过 MAX_RECENT_REQUESTS", () => {
+  it("没有新请求时 list 也会淘汰过期记录并持久化", async () => {
+    let now = Date.parse("2026-07-13T12:00:00.000Z");
+    const writes = [];
+    const monitor = new RequestMonitorService({
+      now: () => now,
+      store: {
+        write: async (value) => {
+          writes.push(value);
+          return value;
+        },
+      },
+    });
+    const id = monitor.start({ profileName: "将过期" });
+    monitor.end(id);
+
+    now += RETENTION_WINDOW_MS + 1;
+    expect(monitor.list()).toEqual([]);
+    await monitor.flush();
+    expect(writes.at(-1).entries).toEqual([]);
+  });
+
+  it("同一保留窗口内超过旧上限也不截断", () => {
     let now = Date.parse("2026-07-13T12:00:00.000Z");
     const monitor = new RequestMonitorService({ now: () => now });
-    for (let index = 0; index < MAX_RECENT_REQUESTS + 10; index += 1) {
+    const count = 2_010;
+    for (let index = 0; index < count; index += 1) {
       const id = monitor.start({ profileName: `方案 ${index}` });
       now += 1; // 全部落在同一小时内
       monitor.end(id);
     }
-    expect(monitor.list()).toHaveLength(MAX_RECENT_REQUESTS);
+    const records = monitor.list();
+    expect(records).toHaveLength(count);
+    expect(RequestLogStoreSchema.safeParse({ version: 1, entries: records }).success).toBe(true);
   });
 
   it.each([
@@ -84,24 +118,9 @@ describe("活动请求监视", () => {
       'data: {"type":"response.output_text.delta","delta":"你"}\n\n',
     ],
     [
-      "Responses 推理",
-      "openai-responses",
-      'event: response.reasoning_summary_text.delta\ndata: {"delta":"分析"}\n\n',
-    ],
-    [
-      "Responses 原始推理",
-      "openai-responses",
-      'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"思考"}\n\n',
-    ],
-    [
       "Responses 通用事件名",
       "openai-responses",
       'event: message\ndata: {"type":"response.output_text.delta","delta":"你"}\n\n',
-    ],
-    [
-      "Responses 工具参数",
-      "openai-responses",
-      'event: response.function_call_arguments.delta\ndata: {"delta":"{\\"path\\":"}\n\n',
     ],
     [
       "Chat",
@@ -147,7 +166,122 @@ describe("活动请求监视", () => {
     });
   });
 
-  it("非流式结构化响应识别首字且不公开正文", () => {
+  it.each([
+    [
+      "Responses content part 完整正文",
+      "openai-responses",
+      'event: response.content_part.done\ndata: {"type":"response.content_part.done","part":{"type":"output_text","text":"你好"}}\n\n',
+    ],
+    [
+      "Responses output item 完整正文",
+      "openai-responses",
+      'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"你好"}]}}\n\n',
+    ],
+    [
+      "Anthropic content block 完整正文",
+      "anthropic",
+      'event: content_block_start\ndata: {"type":"content_block_start","content_block":{"type":"text","text":"你好"}}\n\n',
+    ],
+  ])("%s 是首个实际可见文本时仍能记录", (_name, protocol, payload) => {
+    let now = 2_500;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const id = monitor.start({ profileName: "完整正文事件", protocol, streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+
+    now += 45;
+    expect(monitor.observeChunk(id, payload)).toBe(true);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBe(45);
+  });
+
+  it("Responses 完整 reasoning 输出不冒充可见正文", () => {
+    let now = 2_800;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const id = monitor.start({
+      profileName: "推理与正文",
+      protocol: "openai-responses",
+      streaming: true,
+    });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+
+    now += 20;
+    monitor.observeChunk(id,
+      'data: {"type":"response.completed","response":{"output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"内部分析"}]}]}}\n\n');
+    expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
+
+    now += 30;
+    expect(monitor.observeChunk(
+      id,
+      'data: {"type":"response.output_text.delta","delta":"对用户可见"}\n\n',
+    )).toBe(true);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBe(50);
+  });
+
+  it.each([
+    [
+      "Responses 推理",
+      "openai-responses",
+      'event: response.reasoning_summary_text.delta\ndata: {"delta":"分析"}\n\n',
+    ],
+    [
+      "Responses 工具参数",
+      "openai-responses",
+      'event: response.function_call_arguments.delta\ndata: {"delta":"{\\"path\\":"}\n\n',
+    ],
+    [
+      "Chat 工具参数",
+      "openai-chat",
+      'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{}"}}]}}]}\n\n',
+    ],
+    [
+      "Anthropic thinking",
+      "anthropic",
+      'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"thinking":"分析"}}\n\n',
+    ],
+    [
+      "Gemini thought",
+      "gemini",
+      '{"candidates":[{"content":{"parts":[{"text":"分析","thought":true}]}}]}\n',
+    ],
+  ])("%s 不冒充首个可见文本", (_name, protocol, payload) => {
+    let now = 3_000;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const id = monitor.start({ profileName: "可见文本", protocol, streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+
+    now += 25;
+    monitor.observeChunk(id, payload);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
+
+    now += 40;
+    const visible = protocol === "openai-chat"
+      ? 'data: {"choices":[{"delta":{"content":"你好"}}]}\n\n'
+      : protocol === "anthropic"
+        ? 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"你好"}}\n\n'
+        : protocol === "gemini"
+          ? '{"candidates":[{"content":{"parts":[{"text":"你好"}]}}]}\n'
+          : 'data: {"type":"response.output_text.delta","delta":"你好"}\n\n';
+    monitor.observeChunk(id, visible);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBe(65);
+  });
+
+  it("同一响应 chunk 的首包和首字共用到达时间，不计入解析开销", () => {
+    const times = [1_000, 1_040];
+    let nowCalls = 0;
+    const monitor = new RequestMonitorService({
+      now: () => times[Math.min(nowCalls++, times.length - 1)],
+    });
+    const id = monitor.start({ profileName: "计时", protocol: "openai-responses", streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+    monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"首"}\n\n');
+
+    expect(nowCalls).toBe(2);
+    expect(monitor.list()[0]).toMatchObject({
+      firstByteLatencyMs: 40,
+      firstTokenLatencyMs: 40,
+    });
+  });
+
+  it("非流式结构化响应只记录首包，不把完整正文到达误报成 TTFT", () => {
     let now = 5_000;
     const monitor = new RequestMonitorService({ now: () => now });
     const id = monitor.start({
@@ -166,9 +300,55 @@ describe("活动请求监视", () => {
     }), "utf8"));
 
     const publicRequest = monitor.list()[0];
-    expect(publicRequest.firstTokenLatencyMs).toBe(12);
+    expect(publicRequest.firstByteLatencyMs).toBe(12);
+    expect(publicRequest.firstTokenLatencyMs).toBeUndefined();
+    expect(publicRequest.state).toBe("streaming");
     expect(JSON.stringify(publicRequest)).not.toContain("private response body");
     expect(Object.keys(publicRequest)).not.toContain("detectionBuffer");
+  });
+
+  it("请求虽声明流式，但上游实际返回 JSON 整包时只记录 TTFB", () => {
+    let now = 5_500;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const id = monitor.start({
+      client: "codex",
+      profileName: "忽略 stream 的中转",
+      protocol: "openai-responses",
+      streaming: true,
+    });
+    monitor.responseStarted(id, {
+      statusCode: 200,
+      contentType: "application/json; charset=utf-8",
+    });
+    now += 18;
+    monitor.observeChunk(id, JSON.stringify({
+      output: [{ type: "message", content: [{ type: "output_text", text: "完整响应" }] }],
+    }));
+
+    expect(monitor.list()[0]).toMatchObject({
+      streaming: false,
+      firstByteLatencyMs: 18,
+    });
+    expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
+  });
+
+  it("响应头锁定 JSON 后，晚到的请求 stream 元数据不能改回 TTFT", () => {
+    let now = 5_700;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const id = monitor.start({
+      profileName: "响应先到",
+      protocol: "openai-responses",
+      streaming: true,
+    });
+    monitor.responseStarted(id, { statusCode: 200, contentType: "application/json" });
+    monitor.updateMetadata(id, { streaming: true });
+    now += 9;
+    monitor.observeChunk(id, JSON.stringify({
+      output: [{ type: "message", content: [{ type: "output_text", text: "整包" }] }],
+    }));
+
+    expect(monitor.list()[0]).toMatchObject({ streaming: false, firstByteLatencyMs: 9 });
+    expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
   });
 
   it("非流式未知响应只记录首包", () => {
@@ -212,11 +392,22 @@ describe("活动请求监视", () => {
     expect(monitor.list()[0]).toMatchObject({ state: "failed", outcome: "failed" });
   });
 
+  it("先产出正文再收到 response.failed 的 200 流仍记为 failed", () => {
+    const monitor = new RequestMonitorService({ now: () => 1_000 });
+    const id = monitor.start({ profileName: "中转", protocol: "openai-responses", streaming: true });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+    monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"部分正文"}\n\n');
+    monitor.observeChunk(id, 'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"upstream_failed"}}}\n\n');
+    monitor.end(id);
+
+    expect(monitor.list()[0]).toMatchObject({ state: "failed", outcome: "failed" });
+  });
+
   it("正文里出现 error 字样但已产出内容的流仍是 completed", () => {
     const monitor = new RequestMonitorService({ now: () => 1_000 });
     const id = monitor.start({ profileName: "中转", protocol: "openai-responses", streaming: true });
     monitor.responseStarted(id, { statusCode: 200, streaming: true });
-    monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"讲讲 \\"type\\":\\"error\\" 事件"}\n\n');
+    monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"讲讲 event: response.failed 和 \\"type\\":\\"error\\" 事件"}\n\n');
     monitor.observeChunk(id, 'data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}\n\n');
     monitor.end(id);
     expect(monitor.list()[0]).toMatchObject({ state: "completed", outcome: "completed" });
@@ -327,7 +518,7 @@ describe("活动请求监视", () => {
     });
   });
 
-  it("Gemini 工具调用参数可作为首个有效增量", () => {
+  it("Gemini 工具调用参数不算首个可见文本", () => {
     let now = 12_000;
     const monitor = new RequestMonitorService({ now: () => now });
     const id = monitor.start({ profileName: "Gemini", protocol: "gemini", streaming: true });
@@ -336,7 +527,7 @@ describe("活动请求监视", () => {
     monitor.observeChunk(id, JSON.stringify({
       candidates: [{ content: { parts: [{ functionCall: { name: "search", args: { query: "x" } } }] } }],
     }));
-    expect(monitor.list()[0].firstTokenLatencyMs).toBe(24);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
   });
 
   it("大事件截断正文后仍从尾部提取 usage", () => {
@@ -519,8 +710,54 @@ describe("中止归类", () => {
     now += 300;
     monitor.end(id);
     const final = events.at(-1);
-    expect(final.patch).toBeUndefined();
-    expect(final.activeRequests).toHaveLength(6);
+    expect(final.patch).toBe(true);
+    expect(final.activeRequests).toHaveLength(1);
+    expect(final.activeRequests[0].id).toBe(id);
+  });
+
+  it("所有请求状态事件都只传变动行，并用 revision 对齐 bootstrap", () => {
+    let now = Date.parse("2026-07-14T10:00:00.000Z");
+    const events = [];
+    const monitor = new RequestMonitorService({
+      now: () => now,
+      onChange: (event) => events.push(event),
+    });
+
+    for (let index = 0; index < 120; index += 1) {
+      const old = monitor.start({ profileName: `历史 ${index}` });
+      monitor.end(old);
+    }
+    events.length = 0;
+
+    const id = monitor.start({ profileName: "活跃" });
+    monitor.updateMetadata(id, { model: "gpt-5.2" });
+    expect(events.every((event) => event.patch === true)).toBe(true);
+    expect(events.every((event) => event.activeRequests.length === 1)).toBe(true);
+    expect(events.every((event) => event.activeRequests[0].id === id)).toBe(true);
+    expect(events.map((event) => event.revision)).toEqual([expect.any(Number), expect.any(Number)]);
+
+    const snapshot = monitor.getActiveRequestsSnapshot();
+    expect(snapshot.activeRequests).toHaveLength(121);
+    expect(snapshot.activeRequestsRevision).toBe(events.at(-1).revision);
+  });
+
+  it("过期记录通过 removedRequestIds 增量淘汰", () => {
+    let now = Date.parse("2026-07-14T10:00:00.000Z");
+    const events = [];
+    const monitor = new RequestMonitorService({
+      now: () => now,
+      onChange: (event) => events.push(event),
+    });
+    const stale = monitor.start({ profileName: "过期" });
+    monitor.end(stale);
+
+    now += RETENTION_WINDOW_MS + 1;
+    const fresh = monitor.start({ profileName: "新记录" });
+    monitor.end(fresh);
+    const event = events.at(-1);
+    expect(event.patch).toBe(true);
+    expect(event.activeRequests.map((entry) => entry.id)).toEqual([fresh]);
+    expect(event.removedRequestIds).toEqual([stale]);
   });
 
   it("首字前的大量事件不会拖慢转发（增量解析，不重扫缓冲区）", () => {
@@ -552,5 +789,94 @@ describe("中止归类", () => {
     expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
     expect(monitor.observeChunk(id, 'data: {"type":"response.output_text.delta","delta":"来"}\n\n')).toBe(true);
     expect(elapsed).toBeLessThan(2_000);
+  });
+
+  it("单字节碎片按线性成本解析，超长行丢弃到换行后可恢复", () => {
+    const scanner = new StreamScanner();
+    const payload = Buffer.from(JSON.stringify({
+      choices: [{ delta: { content: "ok" } }],
+      padding: "x".repeat(96_000),
+    }), "utf8");
+    const parsed = [];
+    const started = performance.now();
+    for (let index = 0; index < payload.length; index += 1) {
+      parsed.push(...scanner.push(payload.subarray(index, index + 1)));
+    }
+    parsed.push(...scanner.end());
+    expect(performance.now() - started).toBeLessThan(3_000);
+    expect(parsed).toHaveLength(1);
+
+    const recovered = new StreamScanner();
+    recovered.push(Buffer.alloc(MAX_LINE_BYTES + 1, 0x78));
+    const events = recovered.push(Buffer.from(
+      '\n\ndata: {"type":"response.output_text.delta","delta":"恢复"}\n\n',
+      "utf8",
+    ));
+    expect(events).toEqual([expect.objectContaining({
+      payload: expect.objectContaining({ delta: "恢复" }),
+    })]);
+  });
+
+  it("超长 SSE data 行丢弃整个 frame，且下一 frame 可恢复", () => {
+    let now = 80_000;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const id = monitor.start({
+      profileName: "超长 frame",
+      protocol: "openai-responses",
+      streaming: true,
+    });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+
+    monitor.observeChunk(
+      id,
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"不应记为首字"}\n',
+    );
+    monitor.observeChunk(id, `data: ${"x".repeat(MAX_LINE_BYTES + 1)}\n\n`);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
+
+    now += 25;
+    expect(monitor.observeChunk(
+      id,
+      'data: {"type":"response.output_text.delta","delta":"恢复"}\n\n',
+    )).toBe(true);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBe(25);
+  });
+
+  it("单个超大 chunk 的尾部窗口仍受 UTF-8 字节上限约束", () => {
+    const scanner = new StreamScanner();
+    const suffix = JSON.stringify({ usage: { input_tokens: 7, output_tokens: 3 } });
+    scanner.push(Buffer.from(`${"中".repeat(MAX_DETECTION_BUFFER_BYTES)}${suffix}`, "utf8"));
+    scanner.push(Buffer.from("z".repeat(3_000), "utf8"));
+
+    const tail = scanner.tailSource();
+    expect(Buffer.byteLength(tail, "utf8")).toBeLessThanOrEqual(MAX_DETECTION_BUFFER_BYTES);
+    expect(tail).toContain('"usage"');
+    expect(tail).toContain("z");
+  });
+
+  it("SSE data 聚合按 UTF-8 字节限额，超限 frame 不误认前半段首字", () => {
+    let now = 90_000;
+    const monitor = new RequestMonitorService({ now: () => now });
+    const id = monitor.start({
+      profileName: "多字节 data frame",
+      protocol: "openai-responses",
+      streaming: true,
+    });
+    monitor.responseStarted(id, { statusCode: 200, streaming: true });
+    const paddingA = "é".repeat(280_000);
+    const paddingB = "é".repeat(280_000);
+    monitor.observeChunk(
+      id,
+      `data: [{"type":"response.output_text.delta","delta":"不应记为首字"},{"padding":"${paddingA}"},\n`,
+    );
+    monitor.observeChunk(id, `data: {"padding":"${paddingB}"}]\n\n`);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBeUndefined();
+
+    now += 15;
+    expect(monitor.observeChunk(
+      id,
+      'data: {"type":"response.output_text.delta","delta":"恢复"}\n\n',
+    )).toBe(true);
+    expect(monitor.list()[0].firstTokenLatencyMs).toBe(15);
   });
 });

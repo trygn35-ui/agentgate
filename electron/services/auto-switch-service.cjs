@@ -1,4 +1,4 @@
-const SCHEDULER_TICK_MS = 2 * 60_000
+const SCHEDULER_TICK_MS = 60_000
 const MINIMUM_IMPROVEMENT_MS = 25
 const REQUIRED_CONSECUTIVE_WINS = 2
 const HEALTH_HISTORY_WINDOW_MS = 60 * 60_000
@@ -56,6 +56,8 @@ function candidateEndpoints(profile, options = {}) {
   const allowCold = options.allowCold === true
   return profile.endpoints
     .filter((endpoint) => healthIsReachable(endpoint.health))
+    .filter((endpoint) => !profile.model
+      || (Array.isArray(endpoint.models) && endpoint.models.includes(profile.model)))
     .map((endpoint) => ({ endpoint, metrics: endpointMetrics(endpoint, now) }))
     .filter(({ endpoint, metrics }) => (
       endpoint.url === profile.baseUrl
@@ -181,7 +183,8 @@ class AutoSwitchService {
       checkedAtTimestamp(profile),
       this.lastRuns.get(profile.id) || 0,
     )
-    return this.now() - lastRun >= SCHEDULER_TICK_MS
+    const intervalMs = profile.autoSwitch.intervalMinutes * 60_000
+    return this.now() - lastRun >= intervalMs
   }
 
   /**
@@ -216,15 +219,14 @@ class AutoSwitchService {
     try {
       const profiles = await this.profileService.list()
       this.assertGeneration(generation, controller.signal)
-      const enabledIds = new Set(
-        profiles.filter((profile) => profile.autoSwitch.enabled).map((profile) => profile.id),
-      )
+      const enabledProfiles = profiles.filter((profile) => profile.autoSwitch.enabled)
+      const enabledIds = new Set(enabledProfiles.map((profile) => profile.id))
       for (const id of this.candidates.keys()) {
         if (!enabledIds.has(id)) this.candidates.delete(id)
       }
 
-      for (const profile of profiles) {
-        if (!profile.autoSwitch.enabled || !this.isDue(profile)) continue
+      for (const profile of enabledProfiles) {
+        if (!this.isDue(profile)) continue
         this.lastRuns.set(profile.id, this.now())
         try {
           const event = await this.runProfile(profile.id, {

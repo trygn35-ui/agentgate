@@ -3,18 +3,15 @@ import type { CSSProperties, ReactElement } from "react";
 
 const DIGITS = "0123456789";
 
-/**
- * 两次变化间隔小于这个值时走快速单步（里程表式）。
- *
- * 高频小步快滚，低频变化才配整卷慢滚。窗口必须盖住整卷慢滚的最长时长
- * （延迟 ~320 + 时长 ~3300ms），否则周期性变化的值会在慢滚滚到一半时
- * 又触发下一卷，永远停不下来。
- */
-const QUICK_WINDOW_MS = 4000;
-
 /** 慢滚要滚过的随机数字位数。位数随机，于是每一位的滚动时长天然不同。 */
 const SPIN_MIN = 6;
 const SPIN_MAX = 14;
+
+/**
+ * 终点格已经接近窗口时不再当帧改字。360ms 略高于动态读数约 300ms 的
+ * 更新周期，足够让当前纸带落位后无停顿地接上下一卷。
+ */
+export const MIN_REEL_REMAINING_MS = 360;
 
 function isDigit(char: string): boolean {
   return char >= "0" && char <= "9";
@@ -35,7 +32,7 @@ function randomDigit(): string {
   return DIGITS[Math.floor(Math.random() * 10)];
 }
 
-interface Reel {
+export interface Reel {
   /** 纸带上的字符，自上而下。 */
   frames: string[];
   /** 窗口的起始格与最终停靠格。 */
@@ -45,8 +42,136 @@ interface Reel {
   spin: boolean;
   duration: number;
   delay: number;
-  /** 每次变化自增，用来丢弃过期动画的收尾回调。 */
+  /** 每次新建动画自增，用来丢弃过期动画的收尾回调。 */
   token: number;
+}
+
+export interface ReelState {
+  reel: Reel;
+  /** 外部最后一次要求停靠的字符。 */
+  desired: string;
+}
+
+export function getReelRemainingMs(
+  reel: Reel,
+  currentTime: number | null | undefined,
+): number | undefined {
+  if (currentTime === null || currentTime === undefined || !Number.isFinite(currentTime)) {
+    return undefined;
+  }
+  return Math.max(0, reel.delay + reel.duration - currentTime);
+}
+
+function createReel(
+  from: string,
+  char: string,
+  ticker: boolean | undefined,
+  token: number,
+  options: { delay?: number } = {},
+): Reel {
+  if (prefersReducedMotion()) {
+    return {
+      frames: [char],
+      fromIndex: 0,
+      targetIndex: 0,
+      spin: false,
+      duration: 0,
+      delay: 0,
+      token,
+    };
+  }
+
+  // 秒表类读数（ticker）连空位滚进都走快步——跳表跨过 1:00 时新冒出的分位
+  // 要是慢滚三秒，旁边的秒位早跳了十下。
+  const quick = ticker || !canSpin(from, char);
+
+  if (quick) {
+    // 里程表式单步。方向固定向上——高频跳动再随机方向就成抽搐了。
+    // 时长必须小于动态页 300ms 的跳动周期，否则每跳都把上一步掐断。
+    return {
+      frames: [from, char],
+      fromIndex: 0,
+      targetIndex: 1,
+      spin: false,
+      duration: 220 + Math.random() * 60,
+      delay: 0,
+      token,
+    };
+  }
+
+  const up = Math.random() < 0.5;
+  const steps = SPIN_MIN + Math.floor(Math.random() * (SPIN_MAX - SPIN_MIN + 1));
+  const mid = Array.from({ length: steps }, randomDigit);
+
+  return {
+    // 向上滚：新字从下方来，纸带顺排；向下滚：新字从上方来，纸带倒排
+    frames: up ? [from, ...mid, char] : [char, ...mid, from],
+    fromIndex: up ? 0 : steps + 1,
+    targetIndex: up ? steps + 1 : 0,
+    spin: true,
+    // 2.1–3.4s：这不是给赶时间的人看的仪表，慢滚本身就是内容
+    duration: 1400 + steps * 110 + Math.random() * 400,
+    delay: options.delay ?? Math.random() * 320,
+    token,
+  };
+}
+
+export function requestReelTarget(
+  state: ReelState,
+  char: string,
+  ticker: boolean | undefined,
+  token: number,
+  remainingMs?: number,
+): ReelState {
+  if (state.desired === char) return state;
+  if (state.reel.frames.length > 1) {
+    // 终点格已接近窗口时，改写它会让新字符在一帧内闪到终态。保留当前
+    // 纸带，等它自然落位后由 finishReelState 接上最新目标。
+    if (remainingMs !== undefined && remainingMs < MIN_REEL_REMAINING_MS) {
+      return { ...state, desired: char };
+    }
+    const frames = [...state.reel.frames];
+    frames[state.reel.targetIndex] = char;
+    return {
+      reel: { ...state.reel, frames },
+      desired: char,
+    };
+  }
+
+  return {
+    reel: createReel(state.reel.frames[state.reel.targetIndex], char, ticker, token),
+    desired: char,
+  };
+}
+
+export function finishReelState(
+  state: ReelState,
+  finishedToken: number,
+  ticker: boolean | undefined,
+  nextToken: number,
+): ReelState {
+  if (state.reel.token !== finishedToken) return state;
+
+  const landed = state.reel.frames[state.reel.targetIndex];
+  if (landed !== state.desired) {
+    return {
+      reel: createReel(landed, state.desired, ticker, nextToken, { delay: 0 }),
+      desired: state.desired,
+    };
+  }
+
+  return {
+    reel: {
+      frames: [landed],
+      fromIndex: 0,
+      targetIndex: 0,
+      spin: false,
+      duration: 0,
+      delay: 0,
+      token: nextToken,
+    },
+    desired: state.desired,
+  };
 }
 
 /**
@@ -65,71 +190,34 @@ export function RollingChar({ char, ticker, rollIn }: {
   rollIn?: boolean;
 }): ReactElement {
   const stripRef = useRef<HTMLSpanElement>(null);
-  const settled = useRef(rollIn ? " " : char);
-  const lastChange = useRef(0);
+  const animationRef = useRef<Animation | null>(null);
   const counter = useRef(0);
-  const [reel, setReel] = useState<Reel>({
-    // rollIn 时首帧画空位，随后 effect 把字滚进来；直接画 char 会先闪一下终态
-    frames: [rollIn ? " " : char],
-    fromIndex: 0,
-    targetIndex: 0,
-    spin: false,
-    duration: 0,
-    delay: 0,
-    token: 0,
+  const tickerRef = useRef(ticker);
+  tickerRef.current = ticker;
+  const initial = rollIn ? " " : char;
+  const [state, setState] = useState<ReelState>({
+    reel: {
+      // rollIn 时首帧画空位，随后 effect 把字滚进来；直接画 char 会先闪一下终态
+      frames: [initial],
+      fromIndex: 0,
+      targetIndex: 0,
+      spin: false,
+      duration: 0,
+      delay: 0,
+      token: 0,
+    },
+    desired: initial,
   });
+  const { reel } = state;
 
   useEffect(() => {
-    const from = settled.current;
-    if (from === char) return;
-    settled.current = char;
     counter.current += 1;
     const token = counter.current;
-
-    if (prefersReducedMotion()) {
-      setReel({ frames: [char], fromIndex: 0, targetIndex: 0, spin: false, duration: 0, delay: 0, token });
-      return;
-    }
-
-    const now = Date.now();
-    // 空位 ↔ 数字只发生在网关开关这类用户亲手扳的动作上，永远值得整卷慢滚；
-    // 否则快速开关时第二次变化会落进快滚窗口，动画被降级成一步小滑。
-    const blankShift = (from === " " || char === " ") && canSpin(from, char);
-    // 秒表类读数（ticker）连空位滚进都走快步——跳表跨过 1:00 时新冒出的分位
-    // 要是慢滚三秒，旁边的秒位早跳了十下。
-    const quick = ticker
-      || (!blankShift && (now - lastChange.current < QUICK_WINDOW_MS || !canSpin(from, char)));
-    lastChange.current = now;
-
-    if (quick) {
-      // 里程表式单步。方向固定向上——高频跳动再随机方向就成抽搐了。
-      // 时长必须小于动态页 300ms 的跳动周期，否则每跳都把上一步掐断。
-      setReel({
-        frames: [from, char],
-        fromIndex: 0,
-        targetIndex: 1,
-        spin: false,
-        duration: 220 + Math.random() * 60,
-        delay: 0,
-        token,
-      });
-      return;
-    }
-
-    const up = Math.random() < 0.5;
-    const steps = SPIN_MIN + Math.floor(Math.random() * (SPIN_MAX - SPIN_MIN + 1));
-    const mid = Array.from({ length: steps }, randomDigit);
-
-    setReel({
-      // 向上滚：新字从下方来，纸带顺排；向下滚：新字从上方来，纸带倒排
-      frames: up ? [from, ...mid, char] : [char, ...mid, from],
-      fromIndex: up ? 0 : steps + 1,
-      targetIndex: up ? steps + 1 : 0,
-      spin: true,
-      // 2.1–3.4s：这不是给赶时间的人看的仪表，慢滚本身就是内容
-      duration: 1400 + steps * 110 + Math.random() * 400,
-      delay: Math.random() * 320,
-      token,
+    setState((current) => {
+      const remainingMs = animationRef.current && current.reel.frames.length > 1
+        ? getReelRemainingMs(current.reel, Number(animationRef.current.currentTime))
+        : undefined;
+      return requestReelTarget(current, char, ticker, token, remainingMs);
     });
   }, [char, ticker]);
 
@@ -153,6 +241,7 @@ export function RollingChar({ char, ticker, rollIn }: {
       ],
       { duration: reel.duration, delay: reel.delay, fill: "both" },
     );
+    animationRef.current = move;
 
     // 动态模糊只给慢滚：起步最快时最糊，随减速一路变清
     const blur = reel.spin
@@ -171,15 +260,22 @@ export function RollingChar({ char, ticker, rollIn }: {
     // 收回单帧。cancel 交给下一轮 effect 的清理——它和收帧的 DOM 变更在同一次
     // 提交里同步发生，纸带归零与节点减少同时生效，不会闪。
     move.onfinish = () => {
-      setReel((current) => (current.token === reel.token
-        ? { ...current, frames: [char], fromIndex: 0, targetIndex: 0, spin: false }
-        : current));
+      counter.current += 1;
+      const nextToken = counter.current;
+      setState((current) => finishReelState(
+        current,
+        reel.token,
+        tickerRef.current,
+        nextToken,
+      ));
     };
     return () => {
+      if (animationRef.current === move) animationRef.current = null;
+      move.onfinish = null;
       move.cancel();
       blur?.cancel();
     };
-  }, [reel, char]);
+  }, [reel.token]);
 
   const rolling = reel.frames.length > 1;
   // 辉光管的点火辉光跟滚动同长（见 CSS 的 --roll-ms）

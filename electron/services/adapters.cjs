@@ -1,3 +1,5 @@
+const fs = require('node:fs')
+const path = require('node:path')
 const {
   assertValidJsonc,
   assertValidToml,
@@ -20,8 +22,11 @@ const { AUTH_MODE, PROTOCOL, TARGET } = require('./schemas.cjs')
 const MANAGED_PROVIDER_ID = 'agentgate'
 const GATEWAY_PROVIDER_ID = 'agentgate_gateway'
 const GATEWAY_PROVIDER_NAME = 'Agent;Gate Local Gateway'
-/** 0.8.0 及更早版本写入的 provider id；停止网关时一并清理，避免留下孤儿配置。 */
-const LEGACY_PROVIDER_IDS = Object.freeze(['keydeck', 'keydeck_gateway'])
+const LEGACY_GATEWAY_PROVIDER_ID = 'keydeck_gateway'
+const LEGACY_GATEWAY_PROVIDER_NAME = 'Keydeck Local Gateway'
+const CONFIG_LIBRARY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+/** 0.8.0 及更早版本写入的 provider id，扫描时仍需识别。 */
+const LEGACY_PROVIDER_IDS = Object.freeze(['keydeck', LEGACY_GATEWAY_PROVIDER_ID])
 const GATEWAY_OWNERSHIP = Object.freeze({
   OWNED: 'owned',
   RELEASED: 'released',
@@ -39,6 +44,39 @@ const CLAUDE_ENV = Object.freeze({
   AUTH_TOKEN: 'ANTHROPIC_AUTH_TOKEN',
   MODEL: 'ANTHROPIC_MODEL',
   TOOL_SEARCH: 'ENABLE_TOOL_SEARCH',
+})
+const CLAUDE_VSCODE = Object.freeze({
+  ENVIRONMENT_VARIABLES: 'claudeCode.environmentVariables',
+  DISABLE_LOGIN_PROMPT: 'claudeCode.disableLoginPrompt',
+})
+const CLAUDE_VSCODE_STATE_KEYS = Object.freeze({
+  [CLAUDE_ENV.BASE_URL]: 'vscodeBaseUrl',
+  [CLAUDE_ENV.API_KEY]: 'vscodeApiKey',
+  [CLAUDE_ENV.AUTH_TOKEN]: 'vscodeAuthToken',
+  [CLAUDE_ENV.MODEL]: 'vscodeModel',
+  [CLAUDE_ENV.TOOL_SEARCH]: 'vscodeToolSearch',
+})
+const CLAUDE_DESKTOP = Object.freeze({
+  PROVIDER: 'inferenceProvider',
+  BASE_URL: 'inferenceGatewayBaseUrl',
+  CREDENTIAL_KIND: 'inferenceCredentialKind',
+  API_KEY: 'inferenceGatewayApiKey',
+  AUTH_SCHEME: 'inferenceGatewayAuthScheme',
+  OIDC: 'inferenceGatewayOidc',
+  MODEL_DISCOVERY: 'modelDiscoveryEnabled',
+  MODELS: 'inferenceModels',
+  DISABLE_MODE_CHOOSER: 'disableDeploymentModeChooser',
+})
+const CLAUDE_DESKTOP_STATE_KEYS = Object.freeze({
+  [CLAUDE_DESKTOP.PROVIDER]: 'desktopProvider',
+  [CLAUDE_DESKTOP.BASE_URL]: 'desktopBaseUrl',
+  [CLAUDE_DESKTOP.CREDENTIAL_KIND]: 'desktopCredentialKind',
+  [CLAUDE_DESKTOP.API_KEY]: 'desktopApiKey',
+  [CLAUDE_DESKTOP.AUTH_SCHEME]: 'desktopAuthScheme',
+  [CLAUDE_DESKTOP.OIDC]: 'desktopOidc',
+  [CLAUDE_DESKTOP.MODEL_DISCOVERY]: 'desktopModelDiscovery',
+  [CLAUDE_DESKTOP.MODELS]: 'desktopModels',
+  [CLAUDE_DESKTOP.DISABLE_MODE_CHOOSER]: 'desktopDisableModeChooser',
 })
 const GEMINI_ENV = Object.freeze({
   API_KEY: 'GEMINI_API_KEY',
@@ -139,6 +177,263 @@ function restoredValue(state) {
   return state.present ? state.value : undefined
 }
 
+function claudeEnvironment(profile, apiKey, modelState) {
+  const environment = {
+    [CLAUDE_ENV.BASE_URL]: profile.baseUrl,
+    [CLAUDE_ENV.API_KEY]: profile.authMode === AUTH_MODE.API_KEY ? apiKey : undefined,
+    [CLAUDE_ENV.AUTH_TOKEN]: profile.authMode === AUTH_MODE.BEARER ? apiKey : undefined,
+    [CLAUDE_ENV.TOOL_SEARCH]: profile.enableToolSearch ? 'true' : undefined,
+  }
+  if (profile.model) environment[CLAUDE_ENV.MODEL] = profile.model
+  else if (modelState) environment[CLAUDE_ENV.MODEL] = restoredValue(modelState)
+  return environment
+}
+
+function claudeVsCodeEnvironment(profile, apiKey, modelState) {
+  const environment = claudeEnvironment(profile, apiKey, modelState)
+  return {
+    ...environment,
+    [CLAUDE_ENV.API_KEY]: environment[CLAUDE_ENV.API_KEY] ?? '',
+    [CLAUDE_ENV.AUTH_TOKEN]: environment[CLAUDE_ENV.AUTH_TOKEN] ?? '',
+    [CLAUDE_ENV.TOOL_SEARCH]: environment[CLAUDE_ENV.TOOL_SEARCH] ?? '',
+  }
+}
+
+function claudeDesktopConfiguration(profile, apiKey, baseline) {
+  const configuration = {
+    [CLAUDE_DESKTOP.PROVIDER]: 'gateway',
+    [CLAUDE_DESKTOP.BASE_URL]: profile.baseUrl,
+    [CLAUDE_DESKTOP.CREDENTIAL_KIND]: 'static',
+    [CLAUDE_DESKTOP.API_KEY]: apiKey,
+    [CLAUDE_DESKTOP.AUTH_SCHEME]: profile.authMode === AUTH_MODE.API_KEY
+      ? 'x-api-key'
+      : 'bearer',
+    [CLAUDE_DESKTOP.OIDC]: undefined,
+    [CLAUDE_DESKTOP.DISABLE_MODE_CHOOSER]: true,
+  }
+  if (profile.model) {
+    configuration[CLAUDE_DESKTOP.MODEL_DISCOVERY] = true
+    configuration[CLAUDE_DESKTOP.MODELS] = [profile.model]
+  } else if (hasClaudeDesktopBaseline(baseline)) {
+    configuration[CLAUDE_DESKTOP.MODEL_DISCOVERY] = restoredValue(
+      baseline.desktopModelDiscovery,
+    )
+    configuration[CLAUDE_DESKTOP.MODELS] = restoredValue(baseline.desktopModels)
+  }
+  return configuration
+}
+
+function namedEnvironmentEntries(value) {
+  if (Array.isArray(value)) return value
+  if (value && typeof value === 'object') {
+    return Object.entries(value).map(([name, entryValue]) => ({ name, value: entryValue }))
+  }
+  return []
+}
+
+function namedEnvironmentState(value, name) {
+  let result = { present: false, value: null }
+  for (const entry of namedEnvironmentEntries(value)) {
+    if (entry && typeof entry === 'object' && entry.name === name) {
+      result = { present: true, value: entry.value ?? null }
+    }
+  }
+  return result
+}
+
+function mergeNamedEnvironment(value, replacements) {
+  const managed = new Set(Object.keys(replacements))
+  const result = namedEnvironmentEntries(value).filter((entry) => (
+    !entry || typeof entry !== 'object' || !managed.has(entry.name)
+  ))
+  for (const [name, entryValue] of Object.entries(replacements)) {
+    if (entryValue !== undefined) result.push({ name, value: entryValue })
+  }
+  return result
+}
+
+function namedEnvironmentPatchOperations(setting, value, replacements) {
+  if (!Array.isArray(value)) {
+    return [{ path: [setting], value: mergeNamedEnvironment(value, replacements) }]
+  }
+  const updates = []
+  const removals = []
+  let nextIndex = value.length
+  for (const [name, entryValue] of Object.entries(replacements)) {
+    const indexes = []
+    value.forEach((entry, index) => {
+      if (entry && typeof entry === 'object' && entry.name === name) indexes.push(index)
+    })
+    if (entryValue === undefined) {
+      for (const index of indexes.reverse()) removals.push({ path: [setting, index] })
+    } else if (indexes.length > 0) {
+      for (const index of indexes) {
+        updates.push({ path: [setting, index, 'value'], value: entryValue })
+      }
+    } else {
+      updates.push({ path: [setting, nextIndex], value: { name, value: entryValue } })
+      nextIndex += 1
+    }
+  }
+  removals.sort((left, right) => right.path[1] - left.path[1])
+  return [...updates, ...removals]
+}
+
+function captureClaudeVsCodeState(data) {
+  const value = data?.[CLAUDE_VSCODE.ENVIRONMENT_VARIABLES]
+  const state = {
+    vscodeEnvironmentVariables: {
+      present: Object.prototype.hasOwnProperty.call(
+        data || {},
+        CLAUDE_VSCODE.ENVIRONMENT_VARIABLES,
+      ),
+      value: null,
+    },
+    vscodeDisableLoginPrompt: fieldState(data, CLAUDE_VSCODE.DISABLE_LOGIN_PROMPT),
+  }
+  for (const [name, stateKey] of Object.entries(CLAUDE_VSCODE_STATE_KEYS)) {
+    state[stateKey] = namedEnvironmentState(value, name)
+  }
+  return state
+}
+
+function hasClaudeVsCodeBaseline(state) {
+  return state && Object.prototype.hasOwnProperty.call(state, 'vscodeEnvironmentVariables')
+}
+
+function claudeDesktopProfileFromId(claudePaths, profileId) {
+  if (!claudePaths.desktopLibrary || !CONFIG_LIBRARY_ID.test(profileId || '')) return undefined
+  return {
+    id: profileId,
+    path: path.join(claudePaths.desktopLibrary, `${profileId}.json`),
+    metaPath: path.join(claudePaths.desktopLibrary, '_meta.json'),
+  }
+}
+
+function activeClaudeDesktopProfile(claudePaths, sources, strict = true) {
+  if (!claudePaths.desktopLibrary) {
+    return claudePaths.desktopConfig
+      ? { id: null, path: claudePaths.desktopConfig, metaPath: null }
+      : undefined
+  }
+  const metaPath = path.join(claudePaths.desktopLibrary, '_meta.json')
+  try {
+    const source = sources?.has(metaPath)
+      ? sourceText(sources, metaPath, '{}')
+      : fs.readFileSync(metaPath, 'utf8')
+    const meta = parseJsoncValue(source, 'Claude Desktop config library')
+    const profile = claudeDesktopProfileFromId(claudePaths, meta?.appliedId)
+    if (!profile) throw new Error('Claude Desktop config library has an invalid appliedId')
+    return profile
+  } catch (error) {
+    if (strict) throw error
+    return { id: null, path: null, metaPath }
+  }
+}
+
+function managedClaudeDesktopProfile(claudePaths, baseline, sources) {
+  if (hasClaudeDesktopBaseline(baseline)
+    && typeof baseline.desktopProfileId === 'string') {
+    return claudeDesktopProfileFromId(claudePaths, baseline.desktopProfileId)
+  }
+  return activeClaudeDesktopProfile(claudePaths, sources, false)
+}
+
+async function claudeDesktopData(profile, sources) {
+  if (!profile?.path) return undefined
+  let source
+  if (sources) {
+    if (!sources.has(profile.path)) {
+      throw new Error('Claude Desktop profile is missing from the configuration snapshot')
+    }
+    source = sourceText(sources, profile.path, '{}')
+  } else {
+    source = (await readTextSnapshot(profile.path)).content || '{}'
+  }
+  return parseJsoncValue(source, 'Claude Desktop profile')
+}
+
+function captureClaudeDesktopState(data, profileId) {
+  const state = {
+    desktopConfig: { present: true, value: null },
+    desktopProfileId: profileId,
+  }
+  for (const [name, stateKey] of Object.entries(CLAUDE_DESKTOP_STATE_KEYS)) {
+    state[stateKey] = fieldState(data, name)
+  }
+  return state
+}
+
+function claudeDesktopInspection(data) {
+  const models = data?.[CLAUDE_DESKTOP.MODELS]
+  let model
+  if (Array.isArray(models)) {
+    for (const value of models) {
+      const normalized = normalizedDesktopModel(value)
+      if (typeof normalized?.name === 'string' && normalized.name.trim()) {
+        model = normalized.name.trim()
+        break
+      }
+    }
+  }
+  return {
+    baseUrl: data?.[CLAUDE_DESKTOP.BASE_URL],
+    model,
+  }
+}
+
+function hasClaudeDesktopBaseline(state) {
+  return state && Object.prototype.hasOwnProperty.call(state, 'desktopConfig')
+}
+
+function normalizedDesktopModel(value) {
+  if (typeof value === 'string') {
+    const extended = /^(.*?)\[1m\]$/i.exec(value.trim())
+    return { name: extended ? extended[1].trim() : value, supports1m: Boolean(extended) }
+  }
+  if (!value || typeof value !== 'object' || typeof value.name !== 'string') return value
+  return { name: value.name, supports1m: Boolean(value.supports1m) }
+}
+
+function claudeDesktopValueMatches(name, current, expected) {
+  if (name === CLAUDE_DESKTOP.MODELS && Array.isArray(current) && Array.isArray(expected)) {
+    return JSON.stringify(current.map(normalizedDesktopModel))
+      === JSON.stringify(expected.map(normalizedDesktopModel))
+  }
+  return current === expected || JSON.stringify(current) === JSON.stringify(expected)
+}
+
+function sameClaudeDesktopProfile(left, right) {
+  if (!left?.path || !right?.path) return false
+  return path.resolve(left.path).toLowerCase() === path.resolve(right.path).toLowerCase()
+}
+
+function claudeDesktopMatches(data, profile, apiKey, baseline, options = {}) {
+  return Object.entries(claudeDesktopConfiguration(profile, apiKey, baseline))
+    .every(([name, expected]) => (
+      expected === undefined
+        ? !Object.prototype.hasOwnProperty.call(data || {}, name)
+        : Object.prototype.hasOwnProperty.call(data || {}, name)
+          && (claudeDesktopValueMatches(name, data[name], expected)
+            || (options.allowLegacyModelDiscovery
+              && name === CLAUDE_DESKTOP.MODEL_DISCOVERY
+              && data[name] === false
+              && expected === true))
+    ))
+}
+
+function claudeVsCodeMatches(data, profile, apiKey, modelState) {
+  const value = data?.[CLAUDE_VSCODE.ENVIRONMENT_VARIABLES]
+  const matchesEnvironment = Object.entries(claudeVsCodeEnvironment(profile, apiKey, modelState))
+    .every(([name, expected]) => {
+      const current = namedEnvironmentState(value, name)
+      return expected === undefined
+        ? !current.present
+        : current.present && current.value === expected
+    })
+  return matchesEnvironment && data?.[CLAUDE_VSCODE.DISABLE_LOGIN_PROMPT] === true
+}
+
 /**
  * 为已解析的配置路径创建客户端适配器。
  *
@@ -155,39 +450,106 @@ function createAdapters(paths) {
       name: 'Claude Code',
       command: 'claude',
       primaryPath: paths.claude.config,
-      paths: [paths.claude.config],
-      async build(profile, apiKey, _options = {}) {
-        assertProtocol(profile, [PROTOCOL.ANTHROPIC], 'Claude Code')
-        const operations = [
-          { path: ['env', CLAUDE_ENV.BASE_URL], value: profile.baseUrl },
-          {
-            path: ['env', CLAUDE_ENV.API_KEY],
-            value: profile.authMode === AUTH_MODE.API_KEY ? apiKey : undefined,
-          },
-          {
-            path: ['env', CLAUDE_ENV.AUTH_TOKEN],
-            value: profile.authMode === AUTH_MODE.BEARER ? apiKey : undefined,
-          },
-          {
-            path: ['env', CLAUDE_ENV.TOOL_SEARCH],
-            value: profile.enableToolSearch ? 'true' : undefined,
-          },
-        ]
-        if (profile.model) {
-          operations.push({ path: ['env', CLAUDE_ENV.MODEL], value: profile.model })
-        }
-        return [await draft(TARGET.CLAUDE, paths.claude.config, (source) => (
-          patchJsonc(source, operations, 'Claude settings.json')
-        ))]
+      get paths() {
+        const desktopProfile = activeClaudeDesktopProfile(paths.claude, undefined, false)
+        return [...new Set([
+          paths.claude.config,
+          paths.claude.vscodeConfig,
+          desktopProfile?.metaPath,
+          desktopProfile?.path,
+        ].filter(Boolean))]
       },
-      validate(source) {
+      pathsForBaseline(baseline) {
+        const filePaths = this.paths
+        if (!hasClaudeDesktopBaseline(baseline)
+          || typeof baseline.desktopProfileId !== 'string') return filePaths
+        const desktopProfile = claudeDesktopProfileFromId(
+          paths.claude,
+          baseline.desktopProfileId,
+        )
+        return [...new Set([...filePaths, desktopProfile?.path].filter(Boolean))]
+      },
+      async build(profile, apiKey, options = {}) {
+        assertProtocol(profile, [PROTOCOL.ANTHROPIC], 'Claude Code')
+        const environment = claudeEnvironment(profile, apiKey, options.baseline?.model)
+        const operations = [
+          { path: ['env', CLAUDE_ENV.BASE_URL], value: environment[CLAUDE_ENV.BASE_URL] },
+          { path: ['env', CLAUDE_ENV.API_KEY], value: environment[CLAUDE_ENV.API_KEY] },
+          { path: ['env', CLAUDE_ENV.AUTH_TOKEN], value: environment[CLAUDE_ENV.AUTH_TOKEN] },
+          { path: ['env', CLAUDE_ENV.TOOL_SEARCH], value: environment[CLAUDE_ENV.TOOL_SEARCH] },
+        ]
+        if (profile.model || options.baseline?.model) {
+          operations.push({ path: ['env', CLAUDE_ENV.MODEL], value: environment[CLAUDE_ENV.MODEL] })
+        }
+        const drafts = [await restoreDraft(TARGET.CLAUDE, paths.claude.config, (source) => (
+          patchJsonc(source, operations, 'Claude settings.json')
+        ), options.sources)]
+        const manageVsCode = paths.claude.vscodeConfig
+          && (!options.baseline || hasClaudeVsCodeBaseline(options.baseline))
+        if (manageVsCode) {
+          drafts.push(await restoreDraft(TARGET.CLAUDE, paths.claude.vscodeConfig, (source) => {
+            const data = parseJsoncValue(source.trim() ? source : '{}', 'VS Code user settings')
+            const vscodeEnvironment = claudeVsCodeEnvironment(
+              profile,
+              apiKey,
+              options.baseline?.vscodeModel,
+            )
+            return patchJsonc(source, [
+              ...namedEnvironmentPatchOperations(
+                CLAUDE_VSCODE.ENVIRONMENT_VARIABLES,
+                data?.[CLAUDE_VSCODE.ENVIRONMENT_VARIABLES],
+                vscodeEnvironment,
+              ),
+              { path: [CLAUDE_VSCODE.DISABLE_LOGIN_PROMPT], value: true },
+            ], 'VS Code user settings')
+          }, options.sources))
+        }
+        const manageDesktop = !options.baseline || hasClaudeDesktopBaseline(options.baseline)
+        if (manageDesktop) {
+          const desktopProfile = managedClaudeDesktopProfile(
+            paths.claude,
+            options.baseline,
+          )
+          if (desktopProfile?.path) {
+            drafts.push(await restoreDraft(TARGET.CLAUDE, desktopProfile.path, (source) => (
+              patchJsonc(source, Object.entries(claudeDesktopConfiguration(
+                profile,
+                apiKey,
+                options.baseline,
+              ))
+                .map(([name, value]) => ({ path: [name], value })), 'Claude Desktop profile')
+            ), options.sources))
+          }
+        }
+        return drafts
+      },
+      validate(source, filePath) {
+        const desktopMetaPath = paths.claude.desktopLibrary
+          ? path.join(paths.claude.desktopLibrary, '_meta.json')
+          : undefined
+        if (desktopMetaPath && filePath === desktopMetaPath) return
         if (source.trim()) assertValidJsonc(source, 'Claude settings.json')
       },
       inspect(sources) {
-        const data = parseJsoncValue(sources.get(paths.claude.config) || '{}', 'Claude settings.json')
-        return {
+        const data = parseJsoncValue(
+          sourceText(sources, paths.claude.config, '{}'),
+          'Claude settings.json',
+        )
+        const native = {
           baseUrl: data?.env?.[CLAUDE_ENV.BASE_URL],
           model: data?.env?.[CLAUDE_ENV.MODEL],
+        }
+        if (native.baseUrl !== undefined) return native
+        const desktopProfile = activeClaudeDesktopProfile(paths.claude, sources, false)
+        if (!desktopProfile?.path || !sources.has(desktopProfile.path)) return native
+        const desktop = parseJsoncValue(
+          sourceText(sources, desktopProfile.path, '{}'),
+          'Claude Desktop profile',
+        )
+        const inspection = claudeDesktopInspection(desktop)
+        return {
+          ...inspection,
+          model: inspection.model ?? native.model,
         }
       },
       async captureManagedState(suppliedSources) {
@@ -197,16 +559,29 @@ function createAdapters(paths) {
           'Claude settings.json',
         )
         const env = data?.env
-        return {
+        const state = {
           baseUrl: fieldState(env, CLAUDE_ENV.BASE_URL),
           apiKey: fieldState(env, CLAUDE_ENV.API_KEY),
           authToken: fieldState(env, CLAUDE_ENV.AUTH_TOKEN),
           model: fieldState(env, CLAUDE_ENV.MODEL),
           toolSearch: fieldState(env, CLAUDE_ENV.TOOL_SEARCH),
         }
+        if (paths.claude.vscodeConfig) {
+          const vscode = parseJsoncValue(
+            sourceText(sources, paths.claude.vscodeConfig, '{}'),
+            'VS Code user settings',
+          )
+          Object.assign(state, captureClaudeVsCodeState(vscode))
+        }
+        const desktopProfile = activeClaudeDesktopProfile(paths.claude, sources, false)
+        if (desktopProfile?.path) {
+          const desktop = await claudeDesktopData(desktopProfile, sources)
+          Object.assign(state, captureClaudeDesktopState(desktop, desktopProfile.id))
+        }
+        return state
       },
       async buildRestore(state, suppliedSources) {
-        return [await restoreDraft(TARGET.CLAUDE, paths.claude.config, (source) => (
+        const drafts = [await restoreDraft(TARGET.CLAUDE, paths.claude.config, (source) => (
           patchJsonc(source, [
             { path: ['env', CLAUDE_ENV.BASE_URL], value: restoredValue(state.baseUrl) },
             { path: ['env', CLAUDE_ENV.API_KEY], value: restoredValue(state.apiKey) },
@@ -215,22 +590,118 @@ function createAdapters(paths) {
             { path: ['env', CLAUDE_ENV.TOOL_SEARCH], value: restoredValue(state.toolSearch) },
           ], 'Claude settings.json')
         ), suppliedSources)]
+        if (paths.claude.vscodeConfig && hasClaudeVsCodeBaseline(state)) {
+          drafts.push(await restoreDraft(
+            TARGET.CLAUDE,
+            paths.claude.vscodeConfig,
+            (source) => {
+              const data = parseJsoncValue(source.trim() ? source : '{}', 'VS Code user settings')
+              const replacements = {}
+              for (const [name, stateKey] of Object.entries(CLAUDE_VSCODE_STATE_KEYS)) {
+                if (state[stateKey] !== undefined) {
+                  replacements[name] = restoredValue(state[stateKey])
+                }
+              }
+              const environment = mergeNamedEnvironment(
+                data?.[CLAUDE_VSCODE.ENVIRONMENT_VARIABLES],
+                replacements,
+              )
+              const restoreEnvironment = environment.length > 0
+                || state.vscodeEnvironmentVariables.present
+                ? namedEnvironmentPatchOperations(
+                    CLAUDE_VSCODE.ENVIRONMENT_VARIABLES,
+                    data?.[CLAUDE_VSCODE.ENVIRONMENT_VARIABLES],
+                    replacements,
+                  )
+                : [{ path: [CLAUDE_VSCODE.ENVIRONMENT_VARIABLES], value: undefined }]
+              return patchJsonc(source, [
+                ...restoreEnvironment,
+                {
+                  path: [CLAUDE_VSCODE.DISABLE_LOGIN_PROMPT],
+                  value: restoredValue(state.vscodeDisableLoginPrompt),
+                },
+              ], 'VS Code user settings')
+            },
+            suppliedSources,
+          ))
+        }
+        if (hasClaudeDesktopBaseline(state)) {
+          const desktopProfile = managedClaudeDesktopProfile(paths.claude, state, suppliedSources)
+          if (desktopProfile?.path) {
+            drafts.push(await restoreDraft(
+              TARGET.CLAUDE,
+              desktopProfile.path,
+              (source) => patchJsonc(source, Object.entries(CLAUDE_DESKTOP_STATE_KEYS)
+                .map(([name, stateKey]) => ({
+                  path: [name],
+                  value: restoredValue(state[stateKey]),
+                })), 'Claude Desktop profile'),
+              suppliedSources,
+            ))
+          }
+        }
+        return drafts
       },
-      async gatewayOwnership(profile, apiKey, suppliedSources) {
-        const sources = await adapterSources(this.paths, suppliedSources)
+      async gatewayOwnership(profile, apiKey, suppliedSources, options = {}) {
+        const sourcePaths = options.baseline
+          ? this.pathsForBaseline(options.baseline)
+          : this.paths
+        const sources = await adapterSources(sourcePaths, suppliedSources)
         const data = parseJsoncValue(
           sourceText(sources, paths.claude.config, '{}'),
           'Claude settings.json',
         )
         const env = data?.env || {}
-        const selected = env[CLAUDE_ENV.BASE_URL] === profile.baseUrl
-        const expectedApiKey = profile.authMode === AUTH_MODE.API_KEY ? apiKey : undefined
-        const expectedAuthToken = profile.authMode === AUTH_MODE.BEARER ? apiKey : undefined
+        const nativeSelected = env[CLAUDE_ENV.BASE_URL] === profile.baseUrl
+        let selected = nativeSelected
+        const nativeMatches = Object.entries(claudeEnvironment(
+          profile,
+          apiKey,
+          options.baseline?.model,
+        )).every(([name, expected]) => env[name] === expected)
+        let vscodeMatches = true
+        if (paths.claude.vscodeConfig
+          && (!options.baseline || hasClaudeVsCodeBaseline(options.baseline))) {
+          const vscode = parseJsoncValue(
+            sourceText(sources, paths.claude.vscodeConfig, '{}'),
+            'VS Code user settings',
+          )
+          selected = selected || namedEnvironmentState(
+            vscode?.[CLAUDE_VSCODE.ENVIRONMENT_VARIABLES],
+            CLAUDE_ENV.BASE_URL,
+          ).value === profile.baseUrl
+          vscodeMatches = claudeVsCodeMatches(
+            vscode,
+            profile,
+            apiKey,
+            options.baseline?.vscodeModel,
+          )
+        }
+        let desktopMatches = true
+        const manageDesktop = !options.baseline || hasClaudeDesktopBaseline(options.baseline)
+        if (manageDesktop) {
+          const desktopProfile = managedClaudeDesktopProfile(
+            paths.claude,
+            options.baseline,
+            sources,
+          )
+          const desktop = await claudeDesktopData(desktopProfile, sources)
+          selected = selected || desktop?.[CLAUDE_DESKTOP.BASE_URL] === profile.baseUrl
+          desktopMatches = !desktopProfile?.path
+            || claudeDesktopMatches(desktop, profile, apiKey, options.baseline, options)
+
+          const activeProfile = activeClaudeDesktopProfile(paths.claude, sources, false)
+          if (activeProfile?.path && !sameClaudeDesktopProfile(activeProfile, desktopProfile)) {
+            const activeDesktop = await claudeDesktopData(activeProfile, sources)
+            if (activeDesktop?.[CLAUDE_DESKTOP.BASE_URL] === profile.baseUrl) {
+              return GATEWAY_OWNERSHIP.CONFLICT
+            }
+          }
+        }
         return ownership(selected,
-          env[CLAUDE_ENV.API_KEY] === expectedApiKey
-          && env[CLAUDE_ENV.AUTH_TOKEN] === expectedAuthToken
-          && (!profile.model || env[CLAUDE_ENV.MODEL] === profile.model)
-          && env[CLAUDE_ENV.TOOL_SEARCH] === (profile.enableToolSearch ? 'true' : undefined))
+          nativeMatches
+          && vscodeMatches
+          && desktopMatches)
       },
     },
 
@@ -412,23 +883,47 @@ function createAdapters(paths) {
           sourceText(sources, paths.opencode.auth, '{}'),
           'OpenCode auth.json',
         )
+        const activeGatewayProviderId = [GATEWAY_PROVIDER_ID, LEGACY_GATEWAY_PROVIDER_ID]
+          .find((providerId) => typeof data?.model === 'string'
+            && data.model.startsWith(`${providerId}/`)) || GATEWAY_PROVIDER_ID
         return {
+          providerId: activeGatewayProviderId,
           model: fieldState(data, 'model'),
-          provider: fieldState(data?.provider, GATEWAY_PROVIDER_ID),
-          auth: fieldState(auth, GATEWAY_PROVIDER_ID),
+          provider: fieldState(data?.provider, activeGatewayProviderId),
+          auth: fieldState(auth, activeGatewayProviderId),
         }
       },
       async buildRestore(state, suppliedSources) {
+        const sources = await adapterSources(this.paths, suppliedSources)
+        const data = parseJsoncValue(
+          sourceText(sources, paths.opencode.config, '{}'),
+          'OpenCode configuration',
+        )
+        const baselineProviderId = [GATEWAY_PROVIDER_ID, LEGACY_GATEWAY_PROVIDER_ID]
+          .find((providerId) => state?.providerId === providerId)
+        const activeGatewayProviderId = baselineProviderId || [
+          GATEWAY_PROVIDER_ID,
+          LEGACY_GATEWAY_PROVIDER_ID,
+        ].find((providerId) => typeof data?.model === 'string'
+          && data.model.startsWith(`${providerId}/`)) || GATEWAY_PROVIDER_ID
+        const gatewayProviderIds = [GATEWAY_PROVIDER_ID, LEGACY_GATEWAY_PROVIDER_ID]
         return Promise.all([
           restoreDraft(TARGET.OPENCODE, paths.opencode.config, (source) => patchJsonc(source, [
             { path: ['model'], value: restoredValue(state.model) },
-            {
-              path: ['provider', GATEWAY_PROVIDER_ID],
-              value: restoredValue(state.provider),
-            },
+            ...gatewayProviderIds.map((providerId) => ({
+              path: ['provider', providerId],
+              value: providerId === activeGatewayProviderId
+                ? restoredValue(state.provider)
+                : undefined,
+            })),
           ], 'OpenCode configuration'), suppliedSources),
           restoreDraft(TARGET.OPENCODE, paths.opencode.auth, (source) => patchJsonc(source, [
-            { path: [GATEWAY_PROVIDER_ID], value: restoredValue(state.auth) },
+            ...gatewayProviderIds.map((providerId) => ({
+              path: [providerId],
+              value: providerId === activeGatewayProviderId
+                ? restoredValue(state.auth)
+                : undefined,
+            })),
           ], 'OpenCode auth.json'), suppliedSources),
         ])
       },
@@ -442,17 +937,24 @@ function createAdapters(paths) {
           sourceText(sources, paths.opencode.auth, '{}'),
           'OpenCode auth.json',
         )
-        const provider = data?.provider?.[GATEWAY_PROVIDER_ID]
-        const selected = typeof data?.model === 'string'
-          && data.model.startsWith(`${GATEWAY_PROVIDER_ID}/`)
+        const providerId = [GATEWAY_PROVIDER_ID, LEGACY_GATEWAY_PROVIDER_ID].find((candidate) => (
+          typeof data?.model === 'string'
+          && data.model.startsWith(`${candidate}/`)
+          && data?.provider?.[candidate]?.options?.baseURL === profile.baseUrl
+        ))
+        const provider = providerId ? data?.provider?.[providerId] : undefined
+        const providerName = providerId === LEGACY_GATEWAY_PROVIDER_ID
+          ? LEGACY_GATEWAY_PROVIDER_NAME
+          : GATEWAY_PROVIDER_NAME
+        const selected = Boolean(providerId)
           && provider?.options?.baseURL === profile.baseUrl
         return ownership(selected,
-          data.model === `${GATEWAY_PROVIDER_ID}/${profile.model}`
+          data.model === `${providerId}/${profile.model}`
           && provider?.npm === openCodePackage(profile.protocol)
-          && provider?.name === GATEWAY_PROVIDER_NAME
+          && provider?.name === providerName
           && provider?.models?.[profile.model]?.name === profile.model
-          && auth?.[GATEWAY_PROVIDER_ID]?.type === 'api'
-          && auth?.[GATEWAY_PROVIDER_ID]?.key === apiKey)
+          && auth?.[providerId]?.type === 'api'
+          && auth?.[providerId]?.key === apiKey)
       },
     },
 
